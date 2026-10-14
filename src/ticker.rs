@@ -552,7 +552,7 @@ fn part(ctx: &Ctx, project: &Project, record: &project::Coordinator, coordinator
             spaces.push(id);
         }
     }
-    crate::grouping::ProjectPart { panes, home: record.workspace_id.clone(), spaces }
+    crate::grouping::ProjectPart { panes, root: project.canonical_dir().to_string_lossy().into_owned(), home: record.workspace_id.clone(), spaces }
 }
 
 #[cfg(test)]
