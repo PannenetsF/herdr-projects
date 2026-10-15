@@ -300,15 +300,25 @@ impl Agent {
         self.ready() || (self.agent_status == "unknown" && self.interactive_ready && crate::prompt_box::knows(kind))
     }
 
-    /// True when the agent works in `dir`: its shell's directory, or its own
-    /// when it runs as a child of `open` in a shell elsewhere.
+    /// True when the agent works in `dir`, judged by [`own_dir`].
     pub fn works_in(&self, dir: &str) -> bool {
-        !dir.is_empty() && (self.cwd == dir || self.foreground_cwd == dir)
+        !dir.is_empty() && own_dir(&self.cwd, &self.foreground_cwd) == dir
     }
 
     pub fn session_id(&self) -> &str {
         self.agent_session.as_ref().map(|s| s.value.as_str()).unwrap_or("")
     }
+}
+
+/// The directory a pane's agent works in: its foreground process's when Herdr
+/// reports one, else the shell's. `open` runs a coordinator as a child in a
+/// shell pane elsewhere, so the shell's directory may be another project's
+/// home: deciding by either would make the pane a coordinator of both (#97).
+/// The foreground directory is the group leader's and stays put while the
+/// agent runs a tool in another folder (checked with Claude Code 2.1.300 and
+/// Codex 0.162.1 on Herdr 0.9.3).
+pub fn own_dir<'a>(cwd: &'a str, foreground_cwd: &'a str) -> &'a str {
+    if foreground_cwd.is_empty() { cwd } else { foreground_cwd }
 }
 
 pub fn ready_state(state: &str) -> bool {

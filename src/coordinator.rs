@@ -42,20 +42,22 @@ pub fn current_prefix(root: &Path) -> Result<String> {
 }
 
 /// True when `pane` is the pane the record describes: same workspace, tab and
-/// working directory. Ids are only unique within one server, so callers only
-/// ever compare panes listed through the project's recorded socket.
+/// working directory (see `herdr::own_dir`). Ids are only unique within one
+/// server, so callers only ever compare panes listed through the project's
+/// recorded socket.
 pub fn pane_matches(record: &Coordinator, pane: &Pane) -> bool {
     pane.pane_id == record.pane_id
         && pane.workspace_id == record.workspace_id
         && pane.tab_id == record.tab_id
-        && (pane.cwd == record.cwd || pane.foreground_cwd == record.cwd)
+        && crate::herdr::own_dir(&pane.cwd, &pane.foreground_cwd) == record.cwd
 }
 
 /// A coordinator of `slug`: an agent carrying one of this project's
 /// registered coordinator names AND working in the project home (the
 /// canonical path the record stores, incl. an `open --here` foreground
-/// agent). The name is the identity; cwd is the confirmation, so a
-/// hand-started or resumed session that merely sits in the folder is not one.
+/// agent). The name is the identity; the agent's own directory is the
+/// confirmation, so a hand-started or resumed session that merely sits in
+/// the folder is not one, and a pane belongs to one project home at most.
 pub fn is_coordinator(slug: &str, dir: &str, agent: &Agent) -> bool {
     names::is_coordinator_name(slug, &agent.name) && agent.works_in(dir)
 }
@@ -1235,6 +1237,16 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_pane_is_matched_by_its_agent_s_own_directory() {
+        let record = Coordinator { cwd: "/r/demo".into(), workspace_id: "w1".into(), tab_id: "w1:t1".into(), pane_id: "w1:p1".into(), ..Coordinator::default() };
+        let pane = |cwd: &str, foreground_cwd: &str| Pane { pane_id: "w1:p1".into(), tab_id: "w1:t1".into(), workspace_id: "w1".into(), cwd: cwd.into(), foreground_cwd: foreground_cwd.into(), ..Pane::default() };
+        assert!(pane_matches(&record, &pane("/r/demo", "")));
+        assert!(pane_matches(&record, &pane("/r/demo", "/r/demo")));
+        assert!(pane_matches(&record, &pane("/tmp", "/r/demo")));
+        assert!(!pane_matches(&record, &pane("/r/demo", "/r/alpha")));
+    }
+
+    #[test]
     fn a_coordinator_is_a_registered_named_agent_working_in_the_project_folder() {
         let dir = "/r/demo";
         // Registered names, working in the folder.
@@ -1254,6 +1266,13 @@ mod tests {
         // `open --here`: a named foreground agent whose shell cwd is elsewhere.
         let child = named("hpc-demo", Agent { foreground_cwd: dir.into(), ..agent("w5:p1", "/tmp", "idle", 1) });
         assert!(is_coordinator("demo", dir, &child));
+        // A shell in this home running another project's registered
+        // coordinator belongs only to that other project (#97).
+        let other = named("hpc-alpha", Agent { foreground_cwd: "/r/alpha".into(), ..agent("w6:p1", dir, "working", 9) });
+        assert!(!is_coordinator("demo", dir, &other));
+        assert!(is_coordinator("alpha", "/r/alpha", &other));
+        let plain = named("hpc-demo", Agent { foreground_cwd: dir.into(), ..agent("w7:p1", dir, "idle", 1) });
+        assert!(is_coordinator("demo", dir, &plain));
         // An unnamed foreground agent in the folder is still a stranger.
         let unnamed_child = Agent { foreground_cwd: dir.into(), ..agent("w5:p2", "/tmp", "idle", 1) };
         assert!(!is_coordinator("demo", dir, &unnamed_child));

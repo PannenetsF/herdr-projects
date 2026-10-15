@@ -4881,3 +4881,37 @@ fn a_pending_rename_closes_a_busy_agent_after_the_wait_and_reports_a_failure() {
     assert!(!path.exists() && project.dir().is_dir());
     assert!(crate::inbox::unhandled(&project).iter().any(|i| i.event == "rename failed"));
 }
+
+#[test]
+fn coordinator_prompt_reaches_its_own_project_s_coordinator_not_one_whose_shell_sits_in_its_folder() {
+    // #97: alpha's coordinator was started from a shell in beta's home.
+    let world = World::new();
+    let alpha = world.project("alpha", "a.sock");
+    let beta = world.project("beta", "a.sock");
+    let home = |p: &Project| p.canonical_dir().to_string_lossy().into_owned();
+    let agent = |pane: &str, cwd: &str, foreground_cwd: &str, name: &str, state: &str, seq: u64| {
+        let (workspace, _) = pane.split_once(':').unwrap();
+        format!(
+            r#"{{"pane_id":"{pane}","tab_id":"{workspace}:t1","workspace_id":"{workspace}","cwd":"{cwd}","foreground_cwd":"{foreground_cwd}","name":"{name}","agent":"claude","agent_status":"{state}","state_change_seq":{seq}}}"#
+        )
+    };
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent("wW:p1", &home(&beta), &home(&alpha), "hpc-alpha", "working", 9),
+        agent("wH:p1", "/code/beta", &home(&beta), "hpc-beta", "done", 3)
+    );
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+    coordinator::prompt(&ctx, "beta", "Merge the open PRs.").unwrap();
+    coordinator::prompt(&ctx, "alpha", "Status?").unwrap();
+    let calls = world.runner.calls.borrow();
+    let sent: Vec<(String, String)> = calls
+        .iter()
+        .filter(|c| c.display().contains("agent prompt"))
+        .map(|c| {
+            let at = c.args.iter().position(|a| a == "prompt").unwrap();
+            (c.args[at + 1].clone(), prompt_text(c).to_string())
+        })
+        .collect();
+    assert_eq!(sent, [("wH:p1".to_string(), "Merge the open PRs.".to_string()), ("wW:p1".to_string(), "Status?".to_string())]);
+}
