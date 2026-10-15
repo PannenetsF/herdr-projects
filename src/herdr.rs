@@ -278,12 +278,26 @@ pub struct Agent {
     pub state_change_seq: u64,
     #[serde(default)]
     pub agent_session: Option<AgentSession>,
+    /// Herdr saw the agent's composer open for input. Codex can rest at
+    /// `agent_status: "unknown"` with this set. It does not show that the box
+    /// is on screen or empty: the trust-screen and empty-box checks still
+    /// gate typing.
+    #[serde(default)]
+    pub interactive_ready: bool,
 }
 
 impl Agent {
     /// The one "ready for a prompt" predicate: state `idle` or `done`.
     pub fn ready(&self) -> bool {
         ready_state(&self.agent_status)
+    }
+
+    /// Ready for a first brief: `ready`, or `unknown` while Herdr reports the
+    /// composer open, but only for a `kind` whose input box this binary can
+    /// read: the brief checks that box is empty before typing, and an
+    /// unreadable box would be typed into unchecked.
+    pub fn ready_for_brief(&self, kind: &str) -> bool {
+        self.ready() || (self.agent_status == "unknown" && self.interactive_ready && crate::prompt_box::knows(kind))
     }
 
     /// True when the agent works in `dir`: its shell's directory, or its own
