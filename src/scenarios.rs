@@ -1852,6 +1852,60 @@ fn local_threads_and_each_due_machine_get_one_agent_start_per_tick() {
 }
 
 #[test]
+fn every_project_sharing_a_machine_is_polled_in_its_due_tick() {
+    let (world, demo) = remote_world();
+    let world = World { runner: FakeRunner::new(), ..world };
+    let home = world.home.path().to_string_lossy().into_owned();
+    // A second project whose only thread waits to launch on the same "box".
+    let other = world.project("other", "a.sock");
+    let waiting = thread::allocate(&other, |t| {
+        t.status = Status::Open;
+        t.kind = Kind::Tab;
+        t.prompt_pending = true;
+        t.machine = "box".into();
+        t.agent = "claude".into();
+        t.agent_name = thread::agent_name(&other.slug, &t.id);
+        t.workspace_id = "w3".into();
+        t.tab_id = "w3:t2".into();
+        t.pane_id = "w3:p2".into();
+        t.cwd = home.clone();
+    })
+    .unwrap();
+    let local_panes = format!(r#"{{"result":{{"panes":[{},{}]}}}}"#, world.coordinator_pane(&demo), world.coordinator_pane(&other));
+    let remote_panes = format!(r#"{{"result":{{"panes":[{},{}]}}}}"#, pane_json("w2", "w2:t1", "w2:p1", "/home/me/wt"), pane_json("w3", "w3:t2", "w3:p2", &home));
+    world.runner.on("machine list --json", ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#));
+    world.runner.on_fn(|c| is_machine_call(c) && c.display().contains("agent list"), |_| Ok(ok(r#"{"result":{"agents":[]}}"#)));
+    world.runner.on_fn(|c| is_machine_call(c) && c.display().contains("pane list"), move |_| Ok(ok(&remote_panes)));
+    world.runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+    world.runner.on("pane list", ok(&local_panes));
+    world.runner.on("ssh", ok(""));
+    world.runner.on("report-metadata", ok(r#"{"result":{}}"#));
+    world.runner.on_fn(
+        |c| c.display().contains("agent start"),
+        |_| Ok(ok(r#"{"result":{"agent":{"pane_id":"w3:p2","tab_id":"w3:t2","workspace_id":"w3"}}}"#)),
+    );
+
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    let remote_polls = |w: &World| w.runner.calls.borrow().iter().filter(|c| is_machine_call(c) && c.display().contains("agent list")).count();
+    memory.tick = 1;
+    for project in [&demo, &other] {
+        ticker::tick_project_with(&ctx, project, &mut memory).unwrap();
+    }
+    // The first project asked does not use up the machine's turn.
+    assert_eq!(remote_polls(&world), 2);
+    assert_eq!(thread::load(&other, &waiting.id).unwrap().launch_attempts, 1);
+    // The poll rhythm stays per machine: neither is polled again for three ticks.
+    for tick in 2..=4 {
+        memory.tick = tick;
+        for project in [&demo, &other] {
+            ticker::tick_project_with(&ctx, project, &mut memory).unwrap();
+        }
+    }
+    assert_eq!(remote_polls(&world), 2);
+}
+
+#[test]
 fn a_failed_machine_call_changes_nothing_and_the_machine_is_skipped_for_eight_ticks() {
     let (world, project) = remote_world();
     let failing = World { runner: FakeRunner::new(), ..world };
