@@ -13,7 +13,7 @@ pub(crate) fn alive_panes(project: &Project, view: &SessionView) -> Vec<(String,
     let mut alive = Vec::new();
     if let Some(record) = project.coordinator() {
         let mut any = false;
-        for agent in view.agents.iter().filter(|a| coordinator::is_coordinator(&record, a)) {
+        for agent in view.agents.iter().filter(|a| coordinator::is_coordinator(&project.slug, &record.cwd, a)) {
             any = true;
             alive.push(("coordinator".to_string(), agent.pane_id.clone(), agent.agent_status.clone()));
         }

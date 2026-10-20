@@ -113,8 +113,11 @@ fn live_agents(project: &Project, view: &crate::threads::SessionView, dirs: &[&P
             known.working |= agent.agent_status == "working";
             continue;
         }
-        // Any agent in the folder counts as a coordinator (see `coordinator::discover`).
-        live.push(Live { label: format!("agent {} (pane {})", agent.name, agent.pane_id), pane: agent.pane_id.clone(), working: agent.agent_status == "working", coordinator: true });
+        // Registered coordinators drive the post-rename reopen; any other
+        // agent in the folders still blocks the rename and gets closed, but
+        // a hand-started session in the project home is not reopened.
+        let is_coordinator = crate::coordinator::is_coordinator(&project.slug, &project.canonical_dir().to_string_lossy(), agent);
+        live.push(Live { label: format!("agent {} (pane {})", agent.name, agent.pane_id), pane: agent.pane_id.clone(), working: agent.agent_status == "working", coordinator: is_coordinator });
     }
     live
 }

@@ -22,6 +22,18 @@ pub fn coordinator(slug: &str, n: u32) -> String {
     }
 }
 
+/// Whether `name` is a coordinator name of THIS slug: `hpc-<head24>` or
+/// `hpc-<head22>-N` (N ≥ 1). Checked structurally, not by prefix — the two
+/// truncation widths and the trailing-hyphen trim are what make a prefix
+/// match unsafe across slugs.
+pub fn is_coordinator_name(slug: &str, name: &str) -> bool {
+    if name == coordinator(slug, 0) {
+        return true;
+    }
+    let prefix = format!("hpc-{}-", head(slug, 22));
+    name.strip_prefix(&prefix).is_some_and(|suffix| suffix.parse::<u32>().is_ok_and(|n| n >= 1))
+}
+
 /// `hp-<slug truncated to 21>-<id>` (`t-0009` is 6 characters).
 pub fn thread(slug: &str, id: &str) -> String {
     format!("hp-{}-{id}", head(slug, 21))
@@ -73,5 +85,30 @@ mod tests {
         assert!(collide(&format!("{long}-a"), &format!("{long}-b")));
         assert!(!collide("alpha", "beta"));
         assert!(!collide("alpha", "alpha"));
+    }
+
+    #[test]
+    fn coordinator_name_family_is_decided_through_reconstructed_names() {
+        assert!(is_coordinator_name("demo", "hpc-demo"));
+        assert!(is_coordinator_name("demo", "hpc-demo-1"));
+        assert!(is_coordinator_name("demo", "hpc-demo-42"));
+        // N starts at 1; -0 is never allocated.
+        assert!(!is_coordinator_name("demo", "hpc-demo-0"));
+        assert!(!is_coordinator_name("demo", ""));
+        assert!(!is_coordinator_name("demo", "hp-demo-t-0001"));
+        assert!(!is_coordinator_name("demo", "hpc-other"));
+        assert!(!is_coordinator_name("demo", "hpc-demo-extra"));
+        assert!(!is_coordinator_name("demo", "Hpc-demo"));
+        assert!(!is_coordinator_name("demo", "hpc-demo-1x"));
+        // The 24/22 truncation widths: reconstruct, never prefix-match.
+        let slug = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 31 a's
+        assert!(is_coordinator_name(&slug, &coordinator(&slug, 0)));
+        assert!(is_coordinator_name(&slug, &coordinator(&slug, 7)));
+        // One char shorter than the truncated head is a different (shorter) slug.
+        assert!(!is_coordinator_name(&slug, "hpc-aaaaaaaaaaaaaaaaaaaaaaa"));
+        // Two slugs whose 24-heads differ but share a shorter prefix.
+        let longer = "demo-lation-system-project";
+        assert!(!is_coordinator_name("demo", &coordinator(longer, 0)));
+        assert!(!is_coordinator_name(longer, &coordinator("demo", 0)));
     }
 }

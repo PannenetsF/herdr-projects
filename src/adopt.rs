@@ -34,8 +34,8 @@ pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Re
         if record.socket != socket {
             continue;
         }
-        if coordinator::is_coordinator(&record, &agent) {
-            bail!("pane {pane} is a coordinator of `{slug}` (its working directory is the project folder)");
+        if coordinator::is_coordinator(&slug, &record.cwd, &agent) {
+            bail!("pane {pane} is a registered coordinator of `{slug}` (name `{}` in the project folder)", agent.name);
         }
         if let Some(t) = thread::list(&other).iter().find(|t| !t.is_remote() && t.status != Status::Resolved && t.pane_id == pane && thread::agent_matches(t, &agent)) {
             bail!("pane {pane} is already thread {} of `{slug}`", t.id);

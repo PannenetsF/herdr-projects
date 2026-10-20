@@ -1,9 +1,12 @@
-//! `open` and `context`: the coordinator's workspace and the digest it reads.
+//! `open`, `adopt` and `context`: coordinator identity, the coordinator's
+//! workspace and the digest it reads.
 //!
-//! A coordinator is any agent whose working directory is the project home;
-//! `AGENTS.md` in that folder primes it. `open` starts an agent in the pane it
-//! runs in, or in a tab of the project's workspace; the ticker discovers every
-//! such agent.
+//! A coordinator is a REGISTERED agent: it carries one of the project's
+//! coordinator names (`hpc-<slug>` or `hpc-<slug>-N`, allocated by `open` and
+//! `adopt`) and works in the project home. Working in the folder alone does
+//! not register an agent — a hand-started session in the project folder stays
+//! a stranger until `coordinator adopt` names it. The ticker discovers only
+//! registered agents; `AGENTS.md` in the project folder mirrors the rule.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -48,11 +51,13 @@ pub fn pane_matches(record: &Coordinator, pane: &Pane) -> bool {
         && (pane.cwd == record.cwd || pane.foreground_cwd == record.cwd)
 }
 
-/// A coordinator of the project: any agent whose working directory is the
-/// project home (the canonical path the record stores), including one `open`
-/// started in a shell pane elsewhere.
-pub fn is_coordinator(record: &Coordinator, agent: &Agent) -> bool {
-    agent.works_in(&record.cwd)
+/// A coordinator of `slug`: an agent carrying one of this project's
+/// registered coordinator names AND working in the project home (the
+/// canonical path the record stores, incl. an `open --here` foreground
+/// agent). The name is the identity; cwd is the confirmation, so a
+/// hand-started or resumed session that merely sits in the folder is not one.
+pub fn is_coordinator(slug: &str, dir: &str, agent: &Agent) -> bool {
+    names::is_coordinator_name(slug, &agent.name) && agent.works_in(dir)
 }
 
 /// The project's workspace is open when a listed pane of it works in the
@@ -71,26 +76,6 @@ pub fn project_workspace(record: &Coordinator, panes: &[Pane]) -> Option<String>
     panes.iter().find(|p| !record.cwd.is_empty() && Path::new(&p.cwd).starts_with(&record.cwd)).map(|p| p.workspace_id.clone())
 }
 
-/// The record `open` would write for the most recently active agent working
-/// in the project folder. `None` when no agent in `agents` works there.
-pub fn found(project: &Project, socket: &str, session: &str, agents: &[Agent]) -> Option<Coordinator> {
-    let cwd = project.canonical_dir().to_string_lossy().into_owned();
-    let agent = agents.iter().filter(|a| a.works_in(&cwd)).max_by_key(|a| a.state_change_seq)?;
-    Some(Coordinator {
-        socket: socket.to_string(),
-        session: session.to_string(),
-        workspace_id: agent.workspace_id.clone(),
-        tab_id: agent.tab_id.clone(),
-        pane_id: agent.pane_id.clone(),
-        agent_name: agent.name.clone(),
-        cwd,
-        agent: agent.agent.clone(),
-        profile: String::new(),
-        agent_session: agent.session_id().to_string(),
-        updated: String::new(),
-    })
-}
-
 /// One live coordinator pane, as the ticker last saw it (`.state/coordinators.json`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
@@ -105,18 +90,22 @@ pub struct LivePane {
     /// When the ticker first observed the current `(agent_status, state_change_seq)` pair.
     pub pair_since: String,
     pub agent_session: String,
+    /// Herdr's terminal id: stable across pane moves, reissued on server
+    /// restart. The rename-heal incarnation guard; absent on old records.
+    pub terminal_id: String,
 }
 
 pub fn live(project: &Project) -> Vec<LivePane> {
     project::read_json(&project.state_dir().join("coordinators.json")).unwrap_or_default()
 }
 
-/// The coordinators among `agents`, carrying `pair_since` over from the last
-/// observation when the pair is unchanged. Written under the lock by the caller.
-pub fn discover(record: &Coordinator, previous: &[LivePane], agents: &[Agent], now: &str) -> Vec<LivePane> {
+/// The coordinators among `agents`: registered names only, carrying
+/// `pair_since` over from the last observation when the pair is unchanged.
+/// Written under the lock by the caller.
+pub fn discover(slug: &str, dir: &str, previous: &[LivePane], agents: &[Agent], now: &str) -> Vec<LivePane> {
     agents
         .iter()
-        .filter(|a| is_coordinator(record, a))
+        .filter(|a| is_coordinator(slug, dir, a))
         .map(|a| {
             let same = previous.iter().find(|p| p.pane_id == a.pane_id && p.agent_status == a.agent_status && p.state_change_seq == a.state_change_seq);
             LivePane {
@@ -129,7 +118,27 @@ pub fn discover(record: &Coordinator, previous: &[LivePane], agents: &[Agent], n
                 state_change_seq: a.state_change_seq,
                 pair_since: same.map(|p| p.pair_since.clone()).unwrap_or_else(|| now.to_string()),
                 agent_session: a.session_id().to_string(),
+                terminal_id: a.terminal_id.clone(),
             }
+        })
+        .collect()
+}
+
+/// `(pane_id, name)` pairs that need their coordinator name re-applied before
+/// discovery: an UNNAMED occupant of a pane that was a registered coordinator
+/// on the previous tick, within the SAME server incarnation. The terminal id
+/// is the incarnation guard — Herdr reissues it on a server restart while
+/// pane ids restart at `w1:p1`, so a recycled slot is never healed, and
+/// nothing re-registers after a restart (the user re-`open`s or `adopt`s).
+pub fn heal(slug: &str, dir: &str, previous: &[LivePane], agents: &[Agent]) -> Vec<(String, String)> {
+    agents
+        .iter()
+        .filter_map(|a| {
+            let prev = previous.iter().find(|p| {
+                p.pane_id == a.pane_id && !p.terminal_id.is_empty() && p.terminal_id == a.terminal_id
+            })?;
+            (a.name.is_empty() && a.works_in(dir) && names::is_coordinator_name(slug, &prev.name))
+                .then(|| (a.pane_id.clone(), prev.name.clone()))
         })
         .collect()
 }
@@ -148,6 +157,16 @@ pub fn nudge_target(panes: &[LivePane], now: jiff::Timestamp) -> Option<&LivePan
         .filter(|p| crate::herdr::ready_state(&p.agent_status))
         .filter(|p| crate::thread::seconds_since(&p.pair_since, now) >= NUDGE_IDLE_SECS)
         .max_by_key(|p| p.state_change_seq)
+}
+
+/// The registered coordinator that can take a prompt: not blocked or unknown,
+/// the recorded primary pane preferred, then the most recently changed one.
+pub fn prompt_target<'a>(slug: &str, dir: &str, primary_pane: &str, agents: &'a [Agent]) -> Option<&'a Agent> {
+    agents
+        .iter()
+        .filter(|a| is_coordinator(slug, dir, a))
+        .filter(|a| a.agent_status != "blocked" && a.agent_status != "unknown")
+        .max_by_key(|a| (a.pane_id == primary_pane, a.state_change_seq))
 }
 
 /// The profile a coordinator record ran: before profiles, the built-in of
@@ -236,18 +255,38 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let dir = project.canonical_dir();
     let cwd = dir.to_string_lossy().into_owned();
 
-    // A coordinator is running: focus the most recently active one.
-    // With an explicit profile, only the recorded coordinator is reused, and
-    // only when it runs that profile: choosing another profile in the popup
-    // starts one beside the others.
+    // A coordinator is running: focus the most recently active one. Registered
+    // names identify it; the one exception is an UNNAMED occupant of the
+    // recorded pane (Herdr's native resume can leave a same-slot agent unnamed
+    // while the server keeps running — pane ids reset on a server restart, so
+    // this never matches a recycled slot). With an explicit profile, only the
+    // recorded coordinator is reused, and only when it runs that profile.
     let running: Vec<&Agent> = agents
         .iter()
-        .filter(|a| a.works_in(&cwd))
+        .filter(|a| {
+            is_coordinator(&project.slug, &cwd, a)
+                || previous
+                    .as_ref()
+                    .is_some_and(|r| r.pane_id == a.pane_id && a.name.is_empty() && a.works_in(&cwd))
+        })
         .filter(|a| options.profile.is_none() || previous.as_ref().is_some_and(|r| r.pane_id == a.pane_id && recorded_profile(r) == profile.name))
         .collect();
     if let Some(agent) = running.iter().max_by_key(|a| a.state_change_seq)
         && !options.new
     {
+        // Re-assert the name on a restored, currently unnamed occupant before
+        // anything reads discovery (errors are non-fatal, like adopt_here).
+        let mut restored_name = String::new();
+        if agent.name.is_empty() {
+            restored_name = previous
+                .as_ref()
+                .map(|r| r.agent_name.clone())
+                .filter(|n| names::is_coordinator_name(&project.slug, n))
+                .unwrap_or_else(|| {
+                    names::free_coordinator(&project.slug, &agents.iter().map(|a| a.name.clone()).collect::<Vec<_>>())
+                });
+            let _ = herdr.agent_rename(&agent.pane_id, &restored_name);
+        }
         if let Some(record) = &previous {
             sync_label(&herdr, &record.workspace_id, &label);
         }
@@ -263,7 +302,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             c.workspace_id = agent.workspace_id.clone();
             c.tab_id = agent.tab_id.clone();
             c.pane_id = agent.pane_id.clone();
-            c.agent_name = agent.name.clone();
+            c.agent_name = if restored_name.is_empty() { agent.name.clone() } else { restored_name.clone() };
             c.cwd = cwd.clone();
             c.agent = agent.agent.clone();
             if !agent.session_id().is_empty() {
@@ -426,7 +465,10 @@ fn adopt_here(herdr: &Herdr, project: &Project, record: &Coordinator) -> bool {
     let Ok(agents) = herdr.agent_list() else {
         return false;
     };
-    let Some(agent) = agents.iter().find(|a| a.pane_id == record.pane_id && is_coordinator(record, a)) else {
+    // The agent was exec'd in this very pane, so Herdr detects it without a
+    // name until the rename below: match the recorded pane plus cwd here, not
+    // the registered-name rule this function establishes.
+    let Some(agent) = agents.iter().find(|a| a.pane_id == record.pane_id && a.works_in(&record.cwd)) else {
         return false;
     };
     if agent.name != record.agent_name {
@@ -500,13 +542,13 @@ pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
     }
     let view = crate::threads::session_view(ctx, &project).with_context(|| format!("the herdr session of `{slug}` is not reachable; run `open {slug}` first"))?;
     let record = project.coordinator().unwrap_or_default();
-    let target = view
-        .agents
-        .iter()
-        .filter(|a| is_coordinator(&record, a))
-        .filter(|a| a.agent_status != "blocked" && a.agent_status != "unknown")
-        .max_by_key(|a| a.state_change_seq)
-        .with_context(|| format!("no coordinator of `{slug}` can take a prompt right now; `open {slug}` starts one"))?;
+    let prefix = current_prefix(&ctx.root)?;
+    let target = prompt_target(&project.slug, &record.cwd, &record.pane_id, &view.agents).with_context(|| {
+        format!(
+            "no registered coordinator (`{}`) of `{slug}` can take a prompt right now; `open {slug}` starts one, or register a hand-started pane with `{prefix} coordinator adopt {slug} --pane <id>` (`herdr agent list` shows ids)",
+            names::coordinator(slug, 0)
+        )
+    })?;
     view.herdr.agent_prompt(&target.pane_id, text).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("sent to the coordinator in pane {} (agent was {})", target.pane_id, target.agent_status);
     Ok(())
@@ -708,30 +750,108 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_coordinator_is_any_agent_in_the_project_folder() {
-        let record = Coordinator { cwd: "/r/demo".into(), workspace_id: "w1".into(), ..Coordinator::default() };
-        assert!(is_coordinator(&record, &agent("w1:p1", "/r/demo", "idle", 1)));
-        assert!(is_coordinator(&record, &agent("w9:p9", "/r/demo", "idle", 1)));
-        assert!(!is_coordinator(&record, &agent("w1:p1", "/r/demo/threads/t-0001", "idle", 1)));
-        assert!(!is_coordinator(&record, &agent("w1:p1", "/elsewhere", "idle", 1)));
-        let empty = Coordinator::default();
-        assert!(!is_coordinator(&empty, &agent("w1:p1", "", "idle", 1)));
-        // `open` ran it in a shell pane elsewhere: its own directory counts.
-        let child = Agent { foreground_cwd: "/r/demo".into(), ..agent("w5:p1", "/tmp", "idle", 1) };
-        assert!(is_coordinator(&record, &child));
+    fn named(name: &str, agent: Agent) -> Agent {
+        Agent { name: name.into(), ..agent }
     }
 
     #[test]
-    fn discovery_keeps_pair_since_while_the_pair_is_unchanged() {
-        let record = Coordinator { cwd: "/r/demo".into(), ..Coordinator::default() };
-        let first = discover(&record, &[], &[agent("w1:p1", "/r/demo", "idle", 5), agent("w2:p1", "/other", "idle", 1)], "2026-09-23T10:00:00Z");
-        assert_eq!(first.len(), 1);
+    fn a_coordinator_is_a_registered_named_agent_working_in_the_project_folder() {
+        let dir = "/r/demo";
+        // Registered names, working in the folder.
+        assert!(is_coordinator("demo", dir, &named("hpc-demo", agent("w1:p1", dir, "idle", 1))));
+        assert!(is_coordinator("demo", dir, &named("hpc-demo-2", agent("w9:p9", dir, "idle", 1))));
+        // A hand-started, unnamed session in the folder is NOT a coordinator.
+        assert!(!is_coordinator("demo", dir, &agent("w1:p2", dir, "idle", 1)));
+        // A thread that `cd`'d into the root is NOT a coordinator.
+        assert!(!is_coordinator("demo", dir, &named("hp-demo-t-0001", agent("w1:p3", dir, "idle", 1))));
+        // Another project's registered coordinator is not this project's.
+        assert!(!is_coordinator("demo", dir, &named("hpc-other", agent("w1:p4", dir, "idle", 1))));
+        // The name alone is not enough: cwd must be the project home.
+        assert!(!is_coordinator("demo", dir, &named("hpc-demo", agent("w1:p5", "/r/demo/threads/t-0001", "idle", 1))));
+        assert!(!is_coordinator("demo", dir, &named("hpc-demo", agent("w1:p6", "/elsewhere", "idle", 1))));
+        // Empty record stays empty.
+        assert!(!is_coordinator("demo", "", &named("hpc-demo", agent("w1:p7", "", "idle", 1))));
+        // `open --here`: a named foreground agent whose shell cwd is elsewhere.
+        let child = named("hpc-demo", Agent { foreground_cwd: dir.into(), ..agent("w5:p1", "/tmp", "idle", 1) });
+        assert!(is_coordinator("demo", dir, &child));
+        // An unnamed foreground agent in the folder is still a stranger.
+        let unnamed_child = Agent { foreground_cwd: dir.into(), ..agent("w5:p2", "/tmp", "idle", 1) };
+        assert!(!is_coordinator("demo", dir, &unnamed_child));
+    }
+
+    #[test]
+    fn discovery_admits_only_registered_names_and_keeps_pair_since() {
+        let dir = "/r/demo";
+        let first = discover(
+            "demo",
+            dir,
+            &[],
+            &[
+                named("hpc-demo", agent("w1:p1", dir, "idle", 5)),
+                // Unnamed hand-started session in the folder: excluded.
+                agent("w1:p2", dir, "idle", 8),
+                // Another project's coordinator: excluded.
+                named("hpc-other", agent("w2:p1", dir, "idle", 9)),
+                // Second coordinator of this project: included.
+                named("hpc-demo-1", agent("w1:p3", dir, "idle", 4)),
+            ],
+            "2026-09-23T10:00:00Z",
+        );
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].pane_id, "w1:p1");
+        assert_eq!(first[1].pane_id, "w1:p3");
+        assert_eq!(first[0].terminal_id, "");
         assert_eq!(first[0].pair_since, "2026-09-23T10:00:00Z");
-        let same = discover(&record, &first, &[agent("w1:p1", "/r/demo", "idle", 5)], "2026-09-23T10:01:00Z");
+        let same = discover("demo", dir, &first, &[named("hpc-demo", agent("w1:p1", dir, "idle", 5))], "2026-09-23T10:01:00Z");
         assert_eq!(same[0].pair_since, "2026-09-23T10:00:00Z");
-        let changed = discover(&record, &first, &[agent("w1:p1", "/r/demo", "working", 6)], "2026-09-23T10:02:00Z");
+        let changed = discover("demo", dir, &first, &[named("hpc-demo", agent("w1:p1", dir, "working", 6))], "2026-09-23T10:02:00Z");
         assert_eq!(changed[0].pair_since, "2026-09-23T10:02:00Z");
+    }
+
+    #[test]
+    fn heal_renames_an_unnamed_occupant_only_within_the_same_incarnation() {
+        let dir = "/r/demo";
+        let prev = vec![LivePane {
+            pane_id: "w1:p1".into(),
+            name: "hpc-demo".into(),
+            terminal_id: "term-1".into(),
+            ..LivePane::default()
+        }];
+        // Same pane, same terminal incarnation, now unnamed, still in the
+        // folder: re-assert its name.
+        let a = Agent { name: String::new(), terminal_id: "term-1".into(), ..agent("w1:p1", dir, "idle", 2) };
+        assert_eq!(heal("demo", dir, &prev, &[a]), vec![("w1:p1".to_string(), "hpc-demo".to_string())]);
+        // Already named: nothing to do.
+        let named_again = Agent { name: "hpc-demo".into(), terminal_id: "term-1".into(), ..agent("w1:p1", dir, "idle", 2) };
+        assert!(heal("demo", dir, &prev, &[named_again]).is_empty());
+        // Server restarted: Herdr reissued the terminal id on the recycled
+        // slot — never heal across incarnations.
+        let restarted = Agent { name: String::new(), terminal_id: "term-2".into(), ..agent("w1:p1", dir, "idle", 3) };
+        assert!(heal("demo", dir, &prev, &[restarted]).is_empty());
+        // Old record without a terminal id: do not guess.
+        let mut old = prev.clone();
+        old[0].terminal_id = String::new();
+        let a = Agent { name: String::new(), terminal_id: "term-1".into(), ..agent("w1:p1", dir, "idle", 2) };
+        assert!(heal("demo", dir, &old, &[a]).is_empty());
+        // Left the folder: nothing to do.
+        let moved = Agent { name: String::new(), terminal_id: "term-1".into(), ..agent("w1:p1", "/elsewhere", "idle", 2) };
+        assert!(heal("demo", dir, &prev, &[moved]).is_empty());
+    }
+
+    #[test]
+    fn prompt_target_prefers_the_recorded_primary_then_recency() {
+        let dir = "/r/demo";
+        let agents = vec![
+            named("hpc-demo-1", agent("w1:p2", dir, "idle", 99)),
+            named("hpc-demo", agent("w1:p1", dir, "idle", 1)),
+            agent("w1:p3", dir, "idle", 100), // unnamed, excluded
+        ];
+        assert_eq!(prompt_target("demo", dir, "w1:p1", &agents).unwrap().pane_id, "w1:p1");
+        // Primary gone: the most recently changed registered coordinator.
+        assert_eq!(prompt_target("demo", dir, "w1:pX", &agents).unwrap().pane_id, "w1:p2");
+        // Blocked registered coordinators never take a prompt.
+        let blocked = vec![named("hpc-demo", agent("w1:p1", dir, "blocked", 1))];
+        assert!(prompt_target("demo", dir, "w1:p1", &blocked).is_none());
     }
 
     #[test]

@@ -557,10 +557,14 @@ pub const SUBDIRS: [&str; 9] = ["memory", "scratch", "routines", "threads", "inb
 /// who is who by working directory. `prefix` is `<absolute binary> --root
 /// <root>`: bare `hp` is on no harness's `PATH`.
 pub fn agents_md(name: &str, slug: &str, prefix: &str) -> String {
+    let coordinator_name = crate::names::coordinator(slug, 0);
+    let next_name = crate::names::coordinator(slug, 1);
     format!(
         "# {name}\n\n\
          This folder is the home of the Herdr project \"{name}\" (`{slug}`). Written by herdr-projects; `doctor --fix` refreshes it.\n\n\
-         If your working directory is exactly this folder, you are the coordinator of {name}: run `{prefix} skill` now and follow what it prints, and run `{prefix} context {slug}` now and whenever you need project state.\n\n\
+         Coordinator identity is REGISTERED, not inferred from this folder: a coordinator of {name} carries the Herdr agent name `{coordinator_name}` (or `{next_name}` for later ones). `open` sets that name; `{prefix} coordinator adopt {slug} --pane <id>` registers an already-running pane (`herdr agent list` shows names and pane ids). A session merely started in this folder is not a coordinator.\n\n\
+         If your working directory is exactly this folder AND you carry a registered coordinator name (`{coordinator_name}` or `{next_name}`), you are the coordinator of {name}: run `{prefix} skill` now and follow what it prints, and run `{prefix} context {slug}` now and whenever you need project state.\n\n\
+         If your working directory is exactly this folder but you have NO registered coordinator name, you are NOT the coordinator: do not run `{prefix} context`, do not mark inbox items handled, and do not act as one. Tell the user you are unregistered and give them `{prefix} coordinator adopt {slug} --pane <your pane id>` to run in this pane.\n\n\
          If your working directory is under `threads/`, you are a thread: your brief is in your own folder (`.herdr-project/{slug}-<id>/brief.md`); ignore the rest of this file.\n"
     )
 }
@@ -568,12 +572,17 @@ pub fn agents_md(name: &str, slug: &str, prefix: &str) -> String {
 /// The command prefix `AGENTS.md` carries, so `doctor` can check that its
 /// binary still exists.
 pub fn prefix_in_agents_md(text: &str) -> Option<String> {
-    let line = text.lines().find(|l| l.starts_with("If your working directory is exactly this folder"))?;
-    let start = line.find('`')? + 1;
-    let rest = &line[start..];
-    let end = rest.find(" skill`")?;
-    Some(rest[..end].to_string())
+    let line = text.lines().find(|l| l.starts_with("If your working directory is exactly this folder AND you carry"))?;
+    // The line mentions the coordinator name in earlier backticks; the prefix
+    // is the backtick span directly before ` skill`.
+    let skill = line.find(" skill`")?;
+    let open = line[..skill].rfind('`')? + 1;
+    Some(line[open..skill].to_string())
 }
+
+/// Marker that the AGENTS.md predates registered coordinator names; doctor
+/// uses it to roll the new prose out even when the prefix is unchanged.
+pub const REGISTERED_COORDINATOR_MARKER: &str = "Coordinator identity is REGISTERED";
 
 pub const PR_FOLLOWUP: &str = "routines/pr-followup.md";
 
@@ -635,14 +644,19 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
     let mut problems = Vec::new();
     match std::fs::read_to_string(dir.join("AGENTS.md")) {
         Err(_) => problems.push("AGENTS.md is missing".into()),
-        Ok(text) => match prefix_in_agents_md(&text) {
-            None => problems.push("AGENTS.md does not name the binary".into()),
-            Some(found) => {
-                let binary = found.split(" --root ").next().unwrap_or("").trim_matches('\'');
-                if !Path::new(binary).is_file() {
-                    problems.push(format!("AGENTS.md points at a binary that does not exist ({binary})"));
-                } else if found != prefix {
-                    problems.push("AGENTS.md names another binary or root than this one".into());
+        Ok(text) => {
+            if !text.contains(REGISTERED_COORDINATOR_MARKER) {
+                problems.push("AGENTS.md predates registered coordinator names".into());
+            }
+            match prefix_in_agents_md(&text) {
+                None => problems.push("AGENTS.md does not name the binary".into()),
+                Some(found) => {
+                    let binary = found.split(" --root ").next().unwrap_or("").trim_matches('\'');
+                    if !Path::new(binary).is_file() {
+                        problems.push(format!("AGENTS.md points at a binary that does not exist ({binary})"));
+                    } else if found != prefix {
+                        problems.push("AGENTS.md names another binary or root than this one".into());
+                    }
                 }
             }
         },

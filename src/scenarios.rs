@@ -91,7 +91,7 @@ impl World {
                 c.workspace_id = "w1".into();
                 c.tab_id = "w1:t1".into();
                 c.pane_id = "w1:p1".into();
-                c.agent_name = format!("hp-{slug}-coordinator");
+                c.agent_name = crate::names::coordinator(slug, 0);
                 c.cwd = cwd;
             })
             .unwrap();
@@ -827,7 +827,7 @@ fn set_agents(world: &World, project: &Project, thread_state: &str) {
     let dir = project.canonical_dir().to_string_lossy().into_owned();
     *world.agents.borrow_mut() = format!(
         "[{},{}]",
-        agent_json("w1", "w1:t1", "w1:p1", &dir, &format!("hp-{}-coordinator", project.slug), "idle"),
+        agent_json("w1", "w1:t1", "w1:p1", &dir, &crate::names::coordinator(&project.slug, 0), "idle"),
         agent_json("w2", "w2:t1", "w2:p1", &cwd, &format!("hp-{}-t-0001", project.slug), thread_state)
     );
 }
@@ -969,7 +969,7 @@ fn a_blocked_nudge_is_retried_and_a_busy_coordinator_is_not_prompted() {
     set_front_matter(&project, "nudge = true");
     inbox::write(&project, "routine", "r", "due", "due", "Prompt").unwrap();
     let dir = project.canonical_dir().to_string_lossy().into_owned();
-    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hp-demo-coordinator", "working"));
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "working"));
     let ctx = world.ctx();
     ticker::tick_project(&ctx, &project).unwrap();
     assert_eq!(world.runner.count("agent prompt"), 0);
@@ -1761,7 +1761,7 @@ fn a_remote_thread_without_a_repo_is_refused() {
 
 fn open_alive(world: &World, project: &Project) -> anyhow::Result<()> {
     let cwd = project.canonical_dir().to_string_lossy().into_owned();
-    let name = format!("hp-{}-coordinator", project.slug);
+    let name = crate::names::coordinator(&project.slug, 0);
     *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &cwd, &name, "idle"));
     let socket = world.home.path().join("a.sock");
     let options = crate::coordinator::OpenOptions {
@@ -2250,6 +2250,9 @@ fn a_tab_thread_of_a_coordinator_running_in_another_workspace_opens_the_project_
     let h = Here::new(&[]);
     h.runs.borrow_mut().push((0, format!("[{}]", h.child_agent("w5:p1", "", "sess-7"))));
     h.open(true, false).unwrap();
+    // Same-incarnation native resume leaves the live occupant unnamed; the
+    // heal pass re-asserts its family name, which `place_tab` now requires.
+    *h.world.agents.borrow_mut() = format!("[{}]", h.child_agent("w5:p1", "hpc-demo", "sess-7"));
     let folder = h.project.dir().join("threads/t-0001");
     h.world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
     let args = |title: &str| StartArgs { title: title.into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() };
@@ -2280,9 +2283,9 @@ fn default_socket(world: &World) -> String {
 }
 
 #[test]
-fn an_agent_started_by_hand_in_a_never_opened_project_becomes_its_coordinator() {
+fn an_agent_started_by_hand_in_a_never_opened_project_stays_unregistered() {
     let world = World::new();
-    let socket = default_socket(&world);
+    default_socket(&world);
     let project = project::create(&world.root, "auto", "", vec![]).unwrap();
     let other = project::create(&world.root, "other", "", vec![]).unwrap();
     assert!(project.coordinator().is_none());
@@ -2294,22 +2297,19 @@ fn an_agent_started_by_hand_in_a_never_opened_project_becomes_its_coordinator() 
     let ctx = world.ctx();
     let mut memory = crate::steps::Memory::new(&ctx);
 
-    assert!(ticker::tick_for_test(&ctx, &mut memory));
-    let record = project.coordinator().expect("the hand-started agent is recorded");
-    assert_eq!((record.socket.as_str(), record.pane_id.as_str(), record.workspace_id.as_str(), record.agent.as_str()), (socket.as_str(), "wGM:p1", "wGM", "opencode"));
-    assert_eq!(record.cwd, dir);
+    ticker::tick_for_test(&ctx, &mut memory);
+    // No record means the socket is never even probed: cwd alone never
+    // registers a coordinator. The due routine is counted as skipped.
+    assert!(project.coordinator().is_none(), "the hand-started agent is NOT implicitly recorded");
     assert!(other.coordinator().is_none(), "no agent works in the other project's folder");
-    // Both projects were looked for in one agent list.
-    assert_eq!(world.runner.count("agent list"), 1);
-    // Its routine fired, and its pane and Space row carry tokens.
-    assert_eq!(items_of(&project, "routine").len(), 1);
-    assert_eq!(crate::coordinator::live(&project).len(), 1);
-    // Its row once, named for its project and marked as the group's head,
-    // then its place in the grouping.
-    assert_eq!(world.runner.count("pane report-metadata wGM:p1"), 2);
-    assert_eq!(world.runner.count("--display-agent Auto\u{200B}"), 1);
-    assert_eq!(world.runner.count("hp_group=auto!0!wGM:p1"), 1);
-    // Spaces carry no tokens of ours.
+    assert_eq!(world.runner.count("agent list"), 0);
+    assert_eq!(items_of(&project, "routine").len(), 0);
+    assert_eq!(crate::coordinator::live(&project).len(), 0);
+    assert_eq!(crate::steps::load_state(&project).routines["autopilot"].no_coordinator, 1);
+    // No tokens of any kind land on the stray pane.
+    assert_eq!(world.runner.count("pane report-metadata wGM:p1"), 0);
+    assert_eq!(world.runner.count("--display-agent Auto\u{200B}"), 0);
+    assert_eq!(world.runner.count("hp_group=auto!0!wGM:p1"), 0);
     assert_eq!(world.runner.count("workspace report-metadata wGM"), 0);
 }
 
@@ -2347,7 +2347,7 @@ fn a_routine_due_with_no_coordinator_does_nothing_and_is_recorded_as_skipped() {
 #[test]
 fn a_coordinator_that_appears_later_gets_the_next_scheduled_run_only() {
     let world = World::new();
-    default_socket(&world);
+    let socket = default_socket(&world);
     let project = project::create(&world.root, "demo", "", vec![]).unwrap();
     set_front_matter(&project, "nudge = true");
     write_routine(&project, "standup", "+++\nschedule = \"every 5m\"\n+++\nSummarise.\n");
@@ -2359,9 +2359,23 @@ fn a_coordinator_that_appears_later_gets_the_next_scheduled_run_only() {
     ticker::tick_for_test(&ctx, &mut memory);
     assert_eq!(crate::steps::load_state(&project).routines["standup"].no_coordinator, 1);
 
-    // An agent starts in the project folder: the missed run does not fire.
+    // A registered coordinator appears: the user adopted the hand-started
+    // pane (`coordinator adopt`), which writes the record and the family name.
+    // The missed run still does not fire.
     let dir = project.canonical_dir().to_string_lossy().into_owned();
-    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "", "idle"));
+    let cwd = dir.clone();
+    project
+        .update_coordinator(|c| {
+            c.socket = socket;
+            c.workspace_id = "w1".into();
+            c.tab_id = "w1:t1".into();
+            c.pane_id = "w1:p1".into();
+            c.agent_name = "hpc-demo".into();
+            c.cwd = cwd;
+            c.agent = "claude".into();
+        })
+        .unwrap();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
     *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t1", "w1:p1", &dir));
     ticker::tick_for_test(&ctx, &mut memory);
     assert!(project.coordinator().is_some());
@@ -2400,10 +2414,21 @@ fn a_routine_in_one_project_never_reaches_another_projects_coordinator() {
     }
     write_routine(&a, "standup", "+++\nschedule = \"every 5m\"\n+++\nSummarise.\n");
     world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
-    // Only beta has a coordinator; alpha has a thread agent in its worktree.
+    // Only beta has a registered coordinator; alpha has a thread agent in its worktree.
     let (a_dir, b_dir) = (a.canonical_dir().to_string_lossy().into_owned(), b.canonical_dir().to_string_lossy().into_owned());
     let a_thread = a.canonical_dir().join("threads/t-0001").to_string_lossy().into_owned();
     std::fs::create_dir_all(&a_thread).unwrap();
+    let socket = default_socket(&world);
+    b.update_coordinator(|c| {
+        c.socket = socket.clone();
+        c.workspace_id = "wB".into();
+        c.tab_id = "wB:t1".into();
+        c.pane_id = "wB:p1".into();
+        c.agent_name = "hpc-beta".into();
+        c.cwd = b_dir.clone();
+        c.agent = "claude".into();
+    })
+    .unwrap();
     let set = |agents: &[String]| {
         *world.agents.borrow_mut() = format!("[{}]", agents.join(","));
         let panes: Vec<String> = agents.iter().map(|a| {
@@ -2413,7 +2438,7 @@ fn a_routine_in_one_project_never_reaches_another_projects_coordinator() {
         }).collect();
         *world.panes.borrow_mut() = format!("[{}]", panes.join(","));
     };
-    set(&[agent_json("wB", "wB:t1", "wB:p1", &b_dir, "", "idle"), agent_json("wT", "wT:t1", "wT:p1", &a_thread, "hp-alpha-t-0001", "idle")]);
+    set(&[agent_json("wB", "wB:t1", "wB:p1", &b_dir, "hpc-beta", "idle"), agent_json("wT", "wT:t1", "wT:p1", &a_thread, "hp-alpha-t-0001", "idle")]);
     let ctx = world.ctx();
     let mut memory = crate::steps::Memory::new(&ctx);
     ticker::tick_for_test(&ctx, &mut memory);
@@ -2425,8 +2450,19 @@ fn a_routine_in_one_project_never_reaches_another_projects_coordinator() {
     assert_eq!(crate::steps::load_state(&a).routines["standup"].no_coordinator, 1);
     assert_eq!(world.runner.count("agent prompt"), 0, "neither beta's coordinator nor alpha's thread is prompted");
 
-    // Alpha gets its own coordinator: its item and nudge reach that pane only.
-    set(&[agent_json("wB", "wB:t1", "wB:p1", &b_dir, "", "idle"), agent_json("wT", "wT:t1", "wT:p1", &a_thread, "hp-alpha-t-0001", "idle"), agent_json("wA", "wA:t1", "wA:p1", &a_dir, "", "idle")]);
+    // Alpha gets its own registered coordinator (`coordinator adopt`): its
+    // item and nudge reach that pane only.
+    a.update_coordinator(|c| {
+        c.socket = socket.clone();
+        c.workspace_id = "wA".into();
+        c.tab_id = "wA:t1".into();
+        c.pane_id = "wA:p1".into();
+        c.agent_name = "hpc-alpha".into();
+        c.cwd = a_dir.clone();
+        c.agent = "claude".into();
+    })
+    .unwrap();
+    set(&[agent_json("wB", "wB:t1", "wB:p1", &b_dir, "hpc-beta", "idle"), agent_json("wT", "wT:t1", "wT:p1", &a_thread, "hp-alpha-t-0001", "idle"), agent_json("wA", "wA:t1", "wA:p1", &a_dir, "hpc-alpha", "idle")]);
     ticker::tick_for_test(&ctx, &mut memory);
     make_due(&a, "standup");
     ticker::tick_for_test(&ctx, &mut memory);

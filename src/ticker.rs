@@ -398,25 +398,13 @@ type Lists = (Vec<Agent>, Vec<Pane>);
 /// and shared by every project in that session.
 pub struct Sessions {
     lists: std::collections::BTreeMap<String, Option<Lists>>,
-    /// The sockets a project without a live record is looked for in: the
-    /// default session first, then every other project's recorded socket.
-    candidates: Option<Vec<(String, String)>>,
-    known: Vec<String>,
     /// Each session's projects, for the sidebar grouping.
     parts: std::collections::BTreeMap<String, crate::grouping::Parts>,
 }
 
 impl Sessions {
-    pub fn new(ctx: &Ctx) -> Sessions {
-        let mut known: Vec<String> = project::list_slugs(&ctx.root)
-            .iter()
-            .filter_map(|slug| Project::load(&ctx.root, slug).ok()?.coordinator())
-            .map(|record| record.socket)
-            .filter(|socket| !socket.is_empty())
-            .collect();
-        known.sort();
-        known.dedup();
-        Sessions { lists: Default::default(), candidates: None, known, parts: Default::default() }
+    pub fn new(_ctx: &Ctx) -> Sessions {
+        Sessions { lists: Default::default(), parts: Default::default() }
     }
 
     /// `None` when the socket is gone or the session does not answer.
@@ -433,43 +421,9 @@ impl Sessions {
             .as_ref()
     }
 
-    /// `(socket, session name)` pairs, the default session first.
-    fn candidates(&mut self, ctx: &Ctx) -> Vec<(String, String)> {
-        if let Some(found) = &self.candidates {
-            return found.clone();
-        }
-        let mut found = Vec::new();
-        if let Ok(session) = crate::paths::resolve_session(&Default::default(), ctx.env, ctx.runner) {
-            found.push((session.socket.to_string_lossy().into_owned(), session.name.unwrap_or_default()));
-        }
-        for socket in &self.known {
-            if !found.iter().any(|(s, _)| s == socket) {
-                found.push((socket.clone(), String::new()));
-            }
-        }
-        self.candidates = Some(found.clone());
-        found
-    }
-
     fn any_reachable(&self) -> bool {
         self.lists.values().any(Option::is_some)
     }
-}
-
-/// A project with no record, or one whose socket is gone: the first agent
-/// working in the project folder, in the default session or any session
-/// another project uses, becomes its coordinator and is recorded just as
-/// `open` records one. Agents in `threads/` or a worktree are threads.
-fn discover_record(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<Option<project::Coordinator>> {
-    for (socket, name) in sessions.candidates(ctx) {
-        let Some((agents, _)) = sessions.get(ctx, &socket) else {
-            continue;
-        };
-        if let Some(found) = coordinator::found(project, &socket, &name, agents) {
-            return project.update_coordinator(|c| *c = found).map(Some);
-        }
-    }
-    Ok(None)
 }
 
 /// Due routines of a project whose session cannot be reached or that has no
@@ -527,14 +481,22 @@ fn part(ctx: &Ctx, project: &Project, record: &project::Coordinator, coordinator
         (report, text)
     };
     let mut panes: Vec<crate::grouping::PaneRow> = Vec::new();
-    let recorded = (!record.pane_id.is_empty()).then(|| record.pane_id.clone());
-    for pane in coordinators.iter().map(|c| c.pane_id.clone()).chain(recorded) {
-        if panes.iter().any(|p| p.pane == pane) {
-            continue;
-        }
+    for pane in coordinators.iter().map(|c| c.pane_id.clone()) {
         let (report, text) = activity(&pane);
-        let line = coordinators.iter().find(|c| c.pane_id == pane).map(|c| coordinator::row_state(c, report.as_ref()).1).unwrap_or_default();
+        let line = coordinator::row_state(&coordinators.iter().find(|c| c.pane_id == pane).unwrap(), report.as_ref()).1;
         let sub = if paused { String::new() } else { crate::sidebar::sub_line(&line, &text) };
+        panes.push(crate::grouping::PaneRow { key: crate::grouping::coordinator_key(slug, &pane), pane, sub });
+    }
+    // The recorded primary still gets a row while it is a plain shell pane
+    // (the agent exited, or it has not started yet). With live agents in the
+    // snapshot, a slot that now holds a non-registered occupant — including a
+    // recycled slot after a server restart — must not inherit the
+    // coordinator segment. With no agent snapshot (the paused projection),
+    // keep the legacy row.
+    if !record.pane_id.is_empty() && !panes.iter().any(|p| p.pane == record.pane_id) && (agents.is_empty() || !agents.iter().any(|a| a.pane_id == record.pane_id)) {
+        let pane = record.pane_id.clone();
+        let (_, text) = activity(&pane);
+        let sub = if paused { String::new() } else { crate::sidebar::sub_line("", &text) };
         panes.push(crate::grouping::PaneRow { key: crate::grouping::coordinator_key(slug, &pane), pane, sub });
     }
     for t in &threads {
@@ -816,17 +778,16 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .collect()
 }
 
-/// Returns `Ok(None)` when the project's session cannot be reached, or it has
-/// no record and no agent works in its folder: then no state is read, so
-/// nothing is ever reported as gone.
+/// Returns `Ok(None)` when the project has never been opened, or its session
+/// cannot be reached: then no state is read, so nothing is ever reported as
+/// gone. Identity is never adopted from cwd here — a hand-started agent
+/// registers explicitly through `open` or `coordinator adopt`.
 fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<Option<Seen>> {
-    let recorded = project.coordinator().filter(|r| !r.socket.is_empty() && Path::new(&r.socket).exists());
-    let record = match recorded {
-        Some(record) => record,
-        None => match discover_record(ctx, project, sessions)? {
-            Some(record) => record,
-            None => return Ok(None),
-        },
+    let Some(record) = project
+        .coordinator()
+        .filter(|r| !r.socket.is_empty() && Path::new(&r.socket).exists())
+    else {
+        return Ok(None);
     };
     let Some((agents, panes)) = sessions.get(ctx, &record.socket).cloned() else {
         return Ok(None);
@@ -835,11 +796,18 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
     let slug = &project.slug;
     let mut first_error = None;
 
-    // The coordinators: every agent in the project folder. Nothing is
-    // launched or primed here; `open` starts them and AGENTS.md primes them.
+    // The coordinators: registered names only. Before discovery, re-assert a
+    // name a same-incarnation agent lost (native resume leaves a restored
+    // occupant unnamed). A rename error is logged, never fatal; the next tick
+    // retries, and a cross-restart pane is never healed.
     let previous = coordinator::live(project);
     let now_text = project::now();
-    let coordinators = coordinator::discover(&record, &previous, &agents, &now_text);
+    for (pane, name) in coordinator::heal(slug, &record.cwd, &previous, &agents) {
+        if let Err(error) = herdr.agent_rename(&pane, &name) {
+            eprintln!("{slug}: could not re-register pane {pane} as {name}: {error}");
+        }
+    }
+    let coordinators = coordinator::discover(slug, &record.cwd, &previous, &agents, &now_text);
     if coordinators != previous {
         coordinator::save_live(project, &coordinators)?;
     }
@@ -1121,10 +1089,12 @@ mod tests {
     }
 
     #[test]
-    fn the_ticker_discovers_coordinators_by_folder_and_never_launches_or_primes() {
+    fn the_ticker_discovers_only_registered_coordinators_and_never_launches_or_primes() {
         let f = fixture();
         let runner = FakeRunner::new();
-        // Two agents in the project folder, one of them unnamed (started by hand).
+        // Two agents in the project folder, one of them unnamed (started by
+        // hand). Only the registered `hpc-demo` is a coordinator; the unnamed
+        // root-cwd session is never implicitly registered.
         let two = with_cwd(&AGENT_READY.replace(r#"]}}"#, r#",{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"codex","agent_status":"working","cwd":"CWD","state_change_seq":9,"agent_session":{"value":"sess-2"}}]}}"#), &f);
         runner.on("agent list", ok(&two));
         runner.on("pane list", ok(&with_cwd(PANE, &f)));
@@ -1134,13 +1104,13 @@ mod tests {
         assert_eq!(runner.count("agent prompt"), 0);
         assert_eq!(runner.count("agent start"), 0);
         let live = coordinator::live(&f.project);
-        assert_eq!(live.len(), 2);
-        assert_eq!(live[1].agent, "codex");
-        assert_eq!(live[1].agent_session, "sess-2");
+        assert_eq!(live.len(), 1, "the unnamed root-cwd agent is not discovered: {live:?}");
+        assert_eq!(live[0].agent, "claude");
+        assert_eq!(live[0].agent_session, "sess-1");
         assert!(!live[0].pair_since.is_empty());
-        // Both coordinator panes get tokens.
+        // The registered coordinator keeps its segment token; the stray is
+        // recolored into the tail by the grouping pass (or left untouched).
         assert_eq!(runner.count("report-metadata w1:p1"), 1);
-        assert_eq!(runner.count("report-metadata w1:p2"), 1);
         // The primary pane's native session id is recorded for a later resume.
         assert_eq!(f.project.coordinator().unwrap().agent_session, "sess-1");
     }

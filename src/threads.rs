@@ -24,19 +24,11 @@ pub struct SessionView<'a> {
     pub panes: Vec<Pane>,
 }
 
-/// `None` when the project's session is unreachable, or it has no usable
-/// record and no agent works in its folder in the current session.
+/// `None` when the project has never been opened (or its recorded socket no
+/// longer exists): a hand-started agent in the folder is not a coordinator,
+/// so nothing is read off cwd here.
 pub fn session_view<'a>(ctx: &'a Ctx, project: &Project) -> Option<SessionView<'a>> {
-    let record = match project.coordinator().filter(|r| !r.socket.is_empty() && Path::new(&r.socket).exists()) {
-        Some(record) => record,
-        None => {
-            let session = crate::paths::resolve_session(&Default::default(), ctx.env, ctx.runner).ok()?;
-            let socket = session.socket.to_string_lossy().into_owned();
-            let agents = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner).agent_list().ok()?;
-            // Read only: the ticker records it on its next tick.
-            crate::coordinator::found(project, &socket, &session.name.unwrap_or_default(), &agents)?
-        }
-    };
+    let record = project.coordinator().filter(|r| !r.socket.is_empty() && Path::new(&r.socket).exists())?;
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
     let agents = herdr.agent_list().ok()?;
     let panes = herdr.pane_list().ok()?;
@@ -307,7 +299,7 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> 
 fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<Thread> {
     let coordinator = project.coordinator().context("the project has never been opened")?;
     let workspace = coordinator::project_workspace(&coordinator, &view.panes);
-    if workspace.is_none() && !view.agents.iter().any(|a| coordinator::is_coordinator(&coordinator, a)) {
+    if workspace.is_none() && !view.agents.iter().any(|a| coordinator::is_coordinator(&project.slug, &coordinator.cwd, a)) {
         bail!("the project's workspace is not open; run `open {}` first", project.slug);
     }
     let folder = if record.kind == Kind::Checkout {

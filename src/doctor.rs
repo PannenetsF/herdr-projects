@@ -280,9 +280,9 @@ fn report(
             continue;
         };
         let label = format!("project {slug}");
-        let none = format!("no coordinator running (start any agent in {}, or `open {slug}`)", project.dir().display());
-        // With no usable record, the agents the ticker would discover: the
-        // ones working in the project folder in this session.
+        let none = format!("no coordinator running (run `open {slug}`, or register a hand-started pane with `coordinator adopt {slug}`)");
+        // With no usable record, only registered coordinators are listed;
+        // hand-started agents in the folder are warned, never adopted.
         let (record, mut notes) = match project.coordinator() {
             Some(record) if Path::new(&record.socket).exists() => (Some(record), Vec::new()),
             Some(record) => (None, vec![format!("recorded socket {} no longer exists", record.socket)]),
@@ -301,29 +301,47 @@ fn report(
         match (herdr.pane_list(), herdr.agent_list()) {
             (Ok(panes), Ok(agents)) => {
                 let dir = project.canonical_dir().to_string_lossy().into_owned();
-                let coordinators: Vec<String> = agents
+                let registered: Vec<String> = agents
                     .iter()
-                    .filter(|a| a.works_in(&dir))
-                    .map(|a| if a.name.starts_with("hpc-") { format!("{} ({})", a.pane_id, a.agent) } else { format!("{} ({}, started by hand)", a.pane_id, a.agent) })
+                    .filter(|a| crate::coordinator::is_coordinator(slug, &dir, a))
+                    .map(|a| format!("{} ({})", a.pane_id, a.agent))
+                    .collect();
+                // Agents merely sitting in the project folder are strangers:
+                // list them with the exact registration command, but never
+                // act on them (--fix does not rename anything here).
+                let strangers: Vec<String> = agents
+                    .iter()
+                    .filter(|a| a.works_in(&dir) && !crate::names::is_coordinator_name(slug, &a.name))
+                    .map(|a| {
+                        format!(
+                            "pane {} ({}, {}) is in the project folder but NOT a registered coordinator; register with `{prefix} coordinator adopt {slug} --pane {}`",
+                            a.pane_id,
+                            if a.name.is_empty() { "unnamed".to_string() } else { format!("name {}", a.name) },
+                            a.agent_status,
+                            a.pane_id
+                        )
+                    })
                     .collect();
                 if let Some(record) = &record {
                     let workspace = crate::coordinator::workspace_open(record, &panes);
                     notes.push(format!("socket {}; workspace {} {}", record.socket, record.workspace_id, if workspace { "open" } else { "closed" }));
                 }
-                if coordinators.is_empty() {
+                let mut healthy = Some(true);
+                if registered.is_empty() {
                     notes.push(none);
-                } else {
-                    notes.push(format!("coordinator: {}", coordinators.join(", ")));
-                    if record.is_none() {
-                        notes.push("the ticker records it on its next tick".into());
+                    if record.is_some() {
+                        healthy = None;
                     }
+                } else {
+                    notes.push(format!("coordinator: {}", registered.join(", ")));
                 }
-                check(
-                    &mut out,
-                    if coordinators.is_empty() && record.is_some() { None } else { Some(true) },
-                    &label,
-                    format!("{}; {}", project.status(), notes.join("; ")),
-                );
+                for stranger in &strangers {
+                    notes.push(stranger.clone());
+                    // A registered coordinator usually exists alongside; an
+                    // unregistered root pane is still worth a warning.
+                    healthy = None;
+                }
+                check(&mut out, healthy, &label, format!("{}; {}", project.status(), notes.join("; ")));
             }
             (Err(error), _) | (_, Err(error)) => check(&mut out, None, &label, format!("session at {socket} unreachable: {error}")),
         }
@@ -663,5 +681,26 @@ mod tests {
         let (text, healthy) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner, false, None);
         assert!(!healthy);
         assert!(text.contains("[FAIL] names"), "{text}");
+    }
+
+    #[test]
+    fn an_unregistered_root_pane_is_warned_with_the_adopt_command_and_fix_never_renames() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        runner.on("pane list", ok(&format!(r#"{{"result":{{"panes":[{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"{dir}"}},{{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"{dir}"}}]}}}}"#)));
+        // One registered coordinator, one hand-started (unnamed) root pane.
+        runner.on("agent list", ok(&format!(r#"{{"result":{{"agents":[{{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","name":"hpc-demo","agent":"claude","agent_status":"idle","cwd":"{dir}"}},{{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"codex","agent_status":"working","cwd":"{dir}"}}]}}}}"#)));
+        let flags = SessionFlags::default();
+        for fix in [false, true] {
+            let (text, _) = report(&env, &root, &home.path().join("cfg"), &flags, &runner, fix, None);
+            assert!(text.contains("coordinator: w1:p1 (claude)"), "{text}");
+            assert!(text.contains("pane w1:p2 (unnamed, working) is in the project folder but NOT a registered coordinator"), "{text}");
+            assert!(text.contains("coordinator adopt demo --pane w1:p2"), "{text}");
+            assert_eq!(runner.count("agent rename"), 0, "--fix must never register a stranger");
+        }
     }
 }

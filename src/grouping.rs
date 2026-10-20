@@ -146,34 +146,17 @@ pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace]) -> Plan {
         .map(|(i, a)| match owner.get(a.pane_id.as_str()) {
             Some(row) => (row.key.clone(), a.pane_id.as_str(), row.sub.as_str()),
             None => {
-                // Untracked pane: before dropping it into the global "other"
-                // tail (which sorts AFTER every project and tears its
-                // workspace in two when a project owns other panes there),
-                // claim it into a project whose folder it works in. The home
-                // folder joins the coordinator segment; subfolders get the
-                // guest-thread segment.
-                // 1) cwd under the project folder (a second harness in a
-                // thread dir, an ad-hoc shell in the project).
+                // Untracked pane: a pane in a project's SUBfolder (a second
+                // harness in a thread dir, an ad-hoc shell there) is claimed
+                // as that project's guest. A pane whose cwd IS the project
+                // home but carries no registered coordinator name is NOT
+                // claimed into the coordinator segment — that would give a
+                // hand-started session the head slot and the focus_agent
+                // position; it joins the global "other" tail instead.
                 let claimed = roots
                     .iter()
-                    .find(|(_, dir, _)| !dir.is_empty() && works_under(a, dir))
-                    .map(|(slug, dir, _)| {
-                        if a.cwd == *dir || a.foreground_cwd == *dir {
-                            coordinator_key(slug, &a.pane_id)
-                        } else {
-                            guest_thread_key(slug, guest_rank(&a.agent_status), &a.pane_id)
-                        }
-                    })
-                    // 2) Same space as the project's home even with no folder
-                    // match: a stray shell in the project's own workspace still
-                    // belongs with the project, never in a tail that tears the
-                    // workspace in two.
-                    .or_else(|| {
-                        roots
-                            .iter()
-                            .find(|(_, _, home)| !home.is_empty() && *home == a.workspace_id.as_str())
-                            .map(|(slug, _, _)| guest_thread_key(slug, guest_rank(&a.agent_status), &a.pane_id))
-                    });
+                    .find(|(_, dir, _)| !dir.is_empty() && works_under(a, dir) && a.cwd != **dir && a.foreground_cwd != **dir)
+                    .map(|(slug, _, _)| guest_thread_key(slug, guest_rank(&a.agent_status), &a.pane_id));
                 match claimed {
                     Some(key) => (key, a.pane_id.as_str(), ""),
                     None => (format!("{OTHER}!{i:04}"), a.pane_id.as_str(), ""),
@@ -466,19 +449,20 @@ mod tests {
     }
 
     #[test]
-    fn untracked_pane_in_the_home_folder_joins_the_coordinator_segment() {
+    fn untracked_pane_in_the_home_folder_falls_through_to_the_tail() {
         let mut parts = Parts::new();
         parts.insert(
             "alpha".into(),
             ProjectPart { panes: vec![row("a1", coordinator_key("alpha", "a1"), "")], root: "/proj/alpha".into(), home: "wa".into(), spaces: vec!["wa".into()] },
         );
-        let guest = agent_in("a2", "/proj/alpha", "blocked");
-        let layout = plan(&parts, &[agent("a1"), guest], &[]);
-        let keys: Vec<&str> = layout.agents.iter().map(|(_, tk)| get(tk, "hp_group").unwrap()).collect();
-        assert!(keys.iter().all(|k| k.starts_with("alpha!0!")), "both in the coordinator segment: {keys:?}");
-        // blocked guest ranks before the recorded coordinator? coordinator
-        // keys carry the pane id after !0!, so order is by pane id; both must
-        // precede any thread/guest-thread key.
+        // A hand-started session parked at the project root carries no
+        // registered coordinator name, so it must never take the coordinator
+        // segment (and the focus_agent position); it lands in the tail.
+        let stray = agent_in("a2", "/proj/alpha", "blocked");
+        let layout = plan(&parts, &[agent("a1"), stray], &[]);
+        let t: HashMap<&str, &Tokens> = layout.agents.iter().map(|(p, t)| (p.as_str(), t)).collect();
+        assert!(get(t["a1"], "hp_group").unwrap().starts_with("alpha!0!"));
+        assert!(get(t["a2"], "hp_group").unwrap().starts_with('~'), "root-cwd stray goes to the tail: {:?}", get(t["a2"], "hp_group"));
     }
 
     #[test]
@@ -495,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn untracked_pane_in_the_home_workspace_is_claimed_without_a_cwd_match() {
+    fn untracked_pane_in_the_home_workspace_falls_through_to_the_tail() {
         let mut parts = Parts::new();
         parts.insert(
             "alpha".into(),
@@ -505,9 +489,12 @@ mod tests {
         let outsider = Agent { pane_id: "x1".into(), workspace_id: "wz".into(), cwd: "/elsewhere".into(), ..Agent::default() };
         let layout = plan(&parts, &[agent("a1"), stray, outsider], &[]);
         let order: Vec<&str> = layout.agents.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(order, ["a1", "a7", "x1"], "same-home-space stray joins the project block");
+        assert_eq!(order, ["a1", "a7", "x1"], "herdr order is preserved inside the tail");
         let t: HashMap<&str, &Tokens> = layout.agents.iter().map(|(p, tk)| (p.as_str(), tk)).collect();
-        assert!(get(t["a7"], "hp_group").unwrap().starts_with("alpha!2!5!a7"));
+        // Without a cwd match under a project SUBfolder there is no claim
+        // anymore: same-home-space strays join the tail, never the project.
+        assert!(get(t["a7"], "hp_group").unwrap().starts_with('~'), "stray joins the tail: {:?}", get(t["a7"], "hp_group"));
+        assert!(get(t["x1"], "hp_group").unwrap().starts_with('~'));
     }
 
     #[test]
