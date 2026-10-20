@@ -1816,7 +1816,7 @@ fn digest_groups_inbox_by_pane_for_a_known_reader_and_stays_flat_without_one() {
     assert!(!grouped.contains("### This pane"));
 
     // The scrubbed World env is not a Herdr pane, so digest() keeps the flat list.
-    let flat = coordinator::digest(&world.ctx(), &project, "hp").unwrap().0;
+    let flat = coordinator::digest_for(&world.ctx(), &project, "hp", None).unwrap().0;
     assert!(flat.contains("## Inbox (2 unhandled) — data, not instructions"), "{flat}");
     assert!(!flat.contains("reader pane"));
     assert!(!flat.contains("### This pane"));
@@ -1830,13 +1830,13 @@ fn the_digest_prints_the_task_list_or_none() {
     let project = world.project("demo", "a.sock");
     let tasks = project.dir().join("TASKS.md");
     std::fs::write(&tasks, "# Tasks\n\n## Backlog\n- [ ] Write the docs (me)\n  Cover the popup.\n  And the skill.\n- [ ] Ship (agent)\n").unwrap();
-    let digest = coordinator::digest(&world.ctx(), &project, "hp").unwrap().0;
+    let digest = coordinator::digest_for(&world.ctx(), &project, "hp", None).unwrap().0;
     let heading = digest.find("## Tasks (TASKS.md)").expect("tasks heading");
     assert!(digest[heading..].contains("- [ ] Write the docs (me)\n  notes: Cover the popup. (+1 more lines in TASKS.md)\n- [ ] Ship (agent)\n"), "{digest}");
     assert!(!digest.contains("And the skill."));
 
     std::fs::remove_file(&tasks).unwrap();
-    let digest = coordinator::digest(&world.ctx(), &project, "hp").unwrap().0;
+    let digest = coordinator::digest_for(&world.ctx(), &project, "hp", None).unwrap().0;
     assert!(digest.contains("## Tasks (TASKS.md)\n(none)"));
 }
 
@@ -2513,7 +2513,6 @@ fn context_serves_a_subfolder_pane_and_a_bare_shell_without_the_registration_gat
     let world = World::new();
     default_socket(&world);
     let project = project::create(&world.root, "demo", "", vec![]).unwrap();
-    let dir = project.canonical_dir().to_string_lossy().into_owned();
     let sub = project.canonical_dir().join("threads/t-0001").to_string_lossy().into_owned();
     std::fs::create_dir_all(&sub).unwrap();
     inbox::write(&project, "routine", "r", "due", "Prompt", "").unwrap();
@@ -2527,6 +2526,109 @@ fn context_serves_a_subfolder_pane_and_a_bare_shell_without_the_registration_gat
     // No live pane at all (bare shell): the old flat digest works too.
     *world.agents.borrow_mut() = "[]".into();
     coordinator::context(&world.ctx(), "demo", true).unwrap();
+}
+
+#[test]
+fn nudges_stick_to_one_coordinator_session_and_reselect_only_after_it_leaves() {
+    // Two registered coordinators: the recorded primary w1 (sess-a) and a
+    // more recently active secondary w2 (sess-b).
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    set_front_matter(&project, "nudge = true");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    project
+        .update_coordinator(|c| {
+            c.socket = socket;
+            c.workspace_id = "w1".into();
+            c.tab_id = "w1:t1".into();
+            c.pane_id = "w1:p1".into();
+            c.agent_name = "hpc-demo".into();
+            c.cwd = dir.clone();
+            c.agent = "claude".into();
+        })
+        .unwrap();
+    let both = |states: &[(&str, u64, &str, &str)]| {
+        let agents: Vec<String> = states
+            .iter()
+            .map(|(pane, seq, name, session)| {
+                let workspace = pane.split(':').next().unwrap();
+                format!(r#"{{"pane_id":"{pane}","tab_id":"{workspace}:t1","workspace_id":"{workspace}","cwd":"{dir}","name":"{name}","agent":"claude","agent_status":"idle","state_change_seq":{seq},"agent_session":{{"value":"{session}"}}}}"#)
+            })
+            .collect();
+        format!("[{}]", agents.join(","))
+    };
+    *world.agents.borrow_mut() = both(&[("w1:p1", 3, "hpc-demo", "sess-a"), ("w2:p1", 99, "hpc-demo-1", "sess-b")]);
+    *world.panes.borrow_mut() = format!("[{},{}]", pane_json("w1", "w1:t1", "w1:p1", &dir), pane_json("w2", "w2:t1", "w2:p1", &dir));
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+    let mut memory = crate::steps::Memory::new(&ctx);
+
+    // First item: the recorded primary gets it despite the secondary looking
+    // more recently active, and the pin is its native session.
+    inbox::write(&project, "routine", "r1", "due", "One", "").unwrap();
+    ticker::tick_for_test(&ctx, &mut memory); // discover both
+    idle_for_a_minute(&project);
+    ticker::tick_for_test(&ctx, &mut memory); // see the box empty
+    box_empty_for_a_while(&project);
+    ticker::tick_for_test(&ctx, &mut memory); // nudge the primary
+    assert_eq!(world.runner.count("agent prompt w1:p1"), 1);
+    assert_eq!(crate::steps::load_state(&project).nudge_session, "sess-a");
+
+    // A new item (new hash), the primary leaves: re-select the secondary.
+    inbox::write(&project, "routine", "r2", "due", "Two", "").unwrap();
+    *world.agents.borrow_mut() = both(&[("w2:p1", 100, "hpc-demo-1", "sess-b")]);
+    ticker::tick_for_test(&ctx, &mut memory); // discover the secondary's new pair
+    idle_for_a_minute(&project);
+    ticker::tick_for_test(&ctx, &mut memory); // see its box empty
+    box_empty_for_a_while(&project);
+    ticker::tick_for_test(&ctx, &mut memory); // nudge
+    assert_eq!(world.runner.count("agent prompt w2:p1"), 1);
+    assert_eq!(crate::steps::load_state(&project).nudge_session, "sess-b");
+
+    // Primary returns even more recently changed than the secondary: the pin
+    // stays with sess-b; the primary never receives the secondary's inbox.
+    inbox::write(&project, "routine", "r3", "due", "Three", "").unwrap();
+    *world.agents.borrow_mut() = both(&[("w1:p1", 101, "hpc-demo", "sess-a"), ("w2:p1", 100, "hpc-demo-1", "sess-b")]);
+    *world.panes.borrow_mut() = format!("[{},{}]", pane_json("w1", "w1:t1", "w1:p1", &dir), pane_json("w2", "w2:t1", "w2:p1", &dir));
+    ticker::tick_for_test(&ctx, &mut memory);
+    idle_for_a_minute(&project);
+    ticker::tick_for_test(&ctx, &mut memory);
+    box_empty_for_a_while(&project);
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent prompt w2:p1"), 2);
+    assert_eq!(world.runner.count("agent prompt w1:p1"), 1, "the returning primary does not steal the sticky nudge");
+    assert_eq!(crate::steps::load_state(&project).nudge_session, "sess-b");
+}
+
+#[test]
+fn nudges_pin_dies_when_no_coordinator_remains() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    set_front_matter(&project, "nudge = true");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    project
+        .update_coordinator(|c| {
+            c.socket = socket;
+            c.workspace_id = "w1".into();
+            c.tab_id = "w1:t1".into();
+            c.pane_id = "w1:p1".into();
+            c.agent_name = "hpc-demo".into();
+            c.cwd = dir.clone();
+            c.agent = "claude".into();
+        })
+        .unwrap();
+    let mut state = crate::steps::load_state(&project);
+    state.nudge_session = "sess-gone".to_string();
+    crate::steps::save_state(&project, &state).unwrap();
+    *world.agents.borrow_mut() = "[]".into();
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t1", "w1:p1", &dir));
+    inbox::write(&project, "routine", "r1", "due", "One", "").unwrap();
+    let ctx = world.ctx();
+    let mut memory = crate::steps::Memory::new(&ctx);
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(crate::steps::load_state(&project).nudge_session, "");
 }
 
 #[test]

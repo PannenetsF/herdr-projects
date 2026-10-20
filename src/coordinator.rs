@@ -149,14 +149,22 @@ pub fn save_live(project: &Project, panes: &[LivePane]) -> Result<()> {
 }
 
 /// The coordinator a nudge goes to: idle for at least `NUDGE_IDLE_SECS`
-/// (`done` counts as idle), the one whose pair changed most recently when
-/// several qualify. `None` when no coordinator is that idle.
-pub fn nudge_target(panes: &[LivePane], now: jiff::Timestamp) -> Option<&LivePane> {
-    panes
-        .iter()
-        .filter(|p| crate::herdr::ready_state(&p.agent_status))
-        .filter(|p| crate::thread::seconds_since(&p.pair_since, now) >= NUDGE_IDLE_SECS)
-        .max_by_key(|p| p.state_change_seq)
+/// (`done` counts as idle).
+///
+/// A nudge is sticky by native agent session: while `sticky_session` is still
+/// a live coordinator, only that one is ever returned (and `None` while it is
+/// not yet idle), so an inbox is never typed into a second coordinator just
+/// because it momentarily changed more recently. Once the sticky session has
+/// gone, the recorded primary pane wins ties, then the most recently changed
+/// pair.
+pub fn nudge_target<'a>(panes: &'a [LivePane], now: jiff::Timestamp, primary_pane: &str, sticky_session: &str) -> Option<&'a LivePane> {
+    let ready = |p: &&LivePane| crate::herdr::ready_state(&p.agent_status) && crate::thread::seconds_since(&p.pair_since, now) >= NUDGE_IDLE_SECS;
+    if !sticky_session.is_empty() {
+        if let Some(sticky) = panes.iter().find(|p| p.agent_session == sticky_session) {
+            return ready(&sticky).then_some(sticky);
+        }
+    }
+    panes.iter().filter(ready).max_by_key(|p| (p.pane_id == primary_pane, p.state_change_seq))
 }
 
 /// The registered coordinator that can take a prompt: not blocked or unknown,
@@ -758,16 +766,9 @@ pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     Ok(())
 }
 
-/// The digest and the ids of the inbox items it showed.
-pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec<String>)> {
-    // Outside a live Herdr pane (a bare shell, tests) the reader is unknown
-    // and the inbox stays a flat list.
-    let reader_pane = crate::progress::current(ctx.env, ctx.runner).map(|c| c.pane_id);
-    digest_for(ctx, project, prefix, reader_pane.as_deref())
-}
-
-/// [`digest`] with the reading pane supplied. Items from that pane are shown
-/// separately from other panes' items when it is known.
+/// The digest and the ids of the inbox items it showed. With a known reader
+/// pane, items from that pane are shown separately from other panes' items;
+/// `None` renders the inbox as one flat list.
 pub(crate) fn digest_for(ctx: &Ctx, project: &Project, prefix: &str, reader_pane: Option<&str>) -> Result<(String, Vec<String>)> {
     let mut out = String::new();
     let slug = &project.slug;
@@ -1057,8 +1058,42 @@ mod tests {
             pane("w1:p3", "idle", 9, "2026-09-23T10:01:30Z"),
             pane("w1:p4", "working", 12, "2026-09-23T09:00:00Z"),
         ];
-        assert_eq!(nudge_target(&panes, now).unwrap().pane_id, "w1:p2");
-        assert!(nudge_target(&panes[2..], now).is_none());
+        assert_eq!(nudge_target(&panes, now, "", "").unwrap().pane_id, "w1:p2");
+        assert!(nudge_target(&panes[2..], now, "", "").is_none());
+    }
+
+    #[test]
+    fn nudge_is_session_sticky_and_prefers_the_primary_after_it_leaves() {
+        let now: jiff::Timestamp = "2026-09-23T10:02:00Z".parse().unwrap();
+        let pane = |id: &str, seq: u64, session: &str| LivePane {
+            pane_id: id.into(),
+            agent_status: "idle".into(),
+            state_change_seq: seq,
+            pair_since: "2026-09-23T10:00:00Z".into(),
+            agent_session: session.into(),
+            ..LivePane::default()
+        };
+        let primary = pane("w1:p1", 3, "sess-primary");
+        // Secondary is more recently changed.
+        let secondary = pane("w1:p2", 9, "sess-secondary");
+        let panes = vec![primary.clone(), secondary.clone()];
+        // No pin yet: the recorded primary wins despite a lower seq.
+        assert_eq!(nudge_target(&panes, now, "w1:p1", "").unwrap().pane_id, "w1:p1");
+        // Once a nudge pinned the secondary, it stays there even though the
+        // primary is equally ready and recorded.
+        assert_eq!(nudge_target(&panes, now, "w1:p1", "sess-secondary").unwrap().pane_id, "w1:p2");
+        assert_eq!(nudge_target(&panes, now, "w1:p1", "sess-primary").unwrap().pane_id, "w1:p1");
+        // A sticky coordinator that is not yet idle blocks cross-flow: None,
+        // not a fallthrough to the ready one.
+        let busy = LivePane { agent_status: "working".to_string(), ..secondary.clone() };
+        let mixed = vec![primary, busy];
+        assert!(nudge_target(&mixed, now, "w1:p1", "sess-secondary").is_none());
+        // Sticky gone: re-select among the rest (primary by preference).
+        let rest = vec![secondary.clone()];
+        assert_eq!(nudge_target(&rest, now, "w1:p1", "sess-primary").unwrap().pane_id, "w1:p2");
+        // An empty pin never accidentally matches a pane with no session id.
+        let blank = [LivePane { pane_id: "w1:p9".into(), agent_status: "idle".into(), pair_since: "2026-09-23T10:00:00Z".into(), ..LivePane::default() }];
+        assert_eq!(nudge_target(&blank, now, "w1:p9", "").unwrap().pane_id, "w1:p9");
     }
 
     fn inbox_item(id: &str, kind: &str, summary: &str, body: &str, origin: Option<&str>) -> inbox::Item {

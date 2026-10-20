@@ -847,7 +847,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         let mut state = steps::load_state(project);
         let before = state.clone();
         let now = jiff::Timestamp::now();
-        let target = coordinator::nudge_target(&coordinators, now);
+        let target = coordinator::nudge_target(&coordinators, now, &record.pane_id, &state.nudge_session);
         if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, target, now) {
             first_error = first_error.or(Some(error.context("nudge")));
         }

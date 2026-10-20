@@ -46,6 +46,11 @@ pub struct State {
     /// `box_empty_since`, while a nudge waits for it.
     pub box_pane: String,
     pub box_empty_since: String,
+    /// The native agent session the last nudge went to: nudges stick to it
+    /// while it remains a live coordinator, so a second coordinator that
+    /// briefly looks more active never receives the other one's inbox.
+    #[serde(default)]
+    pub nudge_session: String,
     pub session_item_written: bool,
     /// thread id -> when the ticker first saw its pull request merged.
     pub merged_seen: BTreeMap<String, String>,
@@ -339,6 +344,15 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
         // `agent_blocked` and other errors are returned, logged by the caller,
         // and the nudge is retried on a later tick.
         herdr.agent_prompt(&pane.pane_id, &nudge_text(&unseen))?;
+        // Pin follow-up nudges to this agent session (an empty id — old herdr,
+        // missing data — never overwrites a real pin).
+        if !pane.agent_session.is_empty() {
+            state.nudge_session = pane.agent_session.clone();
+        }
+    }
+    if no_coordinator {
+        // The pin dies with its coordinator.
+        state.nudge_session.clear();
     }
     state.nudged = hash;
     forget_box(state);
