@@ -2473,6 +2473,62 @@ fn adopt_is_idempotent_and_refuses_every_invalid_pane() {
     assert_eq!(world.runner.count("agent rename wS:p1 hpc-alpha-1"), 1);
 }
 
+/// An env that looks like a command running live inside Herdr pane `pane`.
+fn live_pane_env(world: &World, pane: &str) -> Env {
+    Env::for_test(world.home.path(), &[("HERDR_ENV", "1"), ("HERDR_PANE_ID", pane), ("HERDR_SOCKET_PATH", &default_socket(world))])
+}
+
+#[test]
+fn context_is_refused_for_an_unregistered_root_pane_and_marks_nothing() {
+    let world = World::new();
+    default_socket(&world);
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    inbox::write(&project, "routine", "r", "due", "Prompt", "").unwrap();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "", "idle"));
+    world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term-1"}}}"#));
+    let seen = project.state_dir().join("inbox-seen.json");
+
+    let ctx = Ctx { env: &live_pane_env(&world, "w1:p1"), ..world.ctx() };
+    for peek in [false, true] {
+        let error = coordinator::context(&ctx, "demo", peek).unwrap_err().to_string();
+        assert!(error.contains("NOT a registered coordinator"), "{error}");
+        assert!(error.contains("coordinator adopt demo --pane w1:p1"), "{error}");
+        assert!(!seen.exists(), "the refusal must never mark inbox items seen");
+    }
+
+    // Once registered, context serves and marks seen.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
+    coordinator::context(&ctx, "demo", false).unwrap();
+    assert!(std::fs::read_to_string(&seen).unwrap().contains("routine-r"));
+
+    // A registered coordinator may also peek without changing seen marks.
+    let before = std::fs::read_to_string(&seen).unwrap();
+    coordinator::context(&ctx, "demo", true).unwrap();
+    assert_eq!(std::fs::read_to_string(&seen).unwrap(), before);
+}
+
+#[test]
+fn context_serves_a_subfolder_pane_and_a_bare_shell_without_the_registration_gate() {
+    let world = World::new();
+    default_socket(&world);
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let sub = project.canonical_dir().join("threads/t-0001").to_string_lossy().into_owned();
+    std::fs::create_dir_all(&sub).unwrap();
+    inbox::write(&project, "routine", "r", "due", "Prompt", "").unwrap();
+
+    // A live pane in a SUBfolder (a thread pane) is not gated, named or not.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &sub, "", "idle"));
+    world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term-1"}}}"#));
+    let ctx = Ctx { env: &live_pane_env(&world, "w1:p1"), ..world.ctx() };
+    coordinator::context(&ctx, "demo", false).unwrap();
+
+    // No live pane at all (bare shell): the old flat digest works too.
+    *world.agents.borrow_mut() = "[]".into();
+    coordinator::context(&world.ctx(), "demo", true).unwrap();
+}
+
 #[test]
 fn a_routine_due_with_no_coordinator_does_nothing_and_is_recorded_as_skipped() {
     let world = World::new();

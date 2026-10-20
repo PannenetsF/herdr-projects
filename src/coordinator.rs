@@ -725,7 +725,32 @@ pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
 pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let prefix = current_prefix(&ctx.root)?;
-    let (text, shown) = digest(ctx, &project, &prefix)?;
+    // Interactive self-check. Inside a live Herdr pane, an UNREGISTERED agent
+    // in the project home is refused: the digest is coordinator data and
+    // `context` marks inbox items seen globally, so a hand-started session
+    // reading it would both act as coordinator and hide items from the real
+    // one. The refusal is the same for --peek, and marks nothing. No live
+    // pane (a bare shell, CI), a pane the session does not list, a subfolder
+    // or a registered family name all keep the old behavior.
+    let current = crate::progress::current(ctx.env, ctx.runner);
+    if let Some(c) = &current {
+        let herdr = Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner);
+        if let Ok(agents) = herdr.agent_list()
+            && let Some(agent) = agents.iter().find(|a| a.pane_id == c.pane_id)
+        {
+            let root = project.canonical_dir();
+            let dir = root.to_string_lossy();
+            if agent.works_in(&dir) && !names::is_coordinator_name(&project.slug, &agent.name) {
+                bail!(
+                    "pane {} is in the `{slug}` project folder but is NOT a registered coordinator; this session must not read `context` or touch the inbox. Register it with `{prefix} coordinator adopt {slug} --pane {}`, then run context again",
+                    c.pane_id,
+                    c.pane_id
+                );
+            }
+        }
+    }
+    let reader_pane = current.as_ref().map(|c| c.pane_id.as_str());
+    let (text, shown) = digest_for(ctx, &project, &prefix, reader_pane)?;
     print!("{text}");
     if !peek {
         inbox::mark_seen(&project, &shown)?;
