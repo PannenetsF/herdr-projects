@@ -532,6 +532,174 @@ fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
     }
 }
 
+/// `coordinator adopt <slug> [--pane ID]`: register an already-running,
+/// hand-started agent pane as a coordinator of `slug`. The pane is renamed to
+/// the next free name of the project's coordinator family; nothing is
+/// prompted or started. With no existing record the pane becomes the primary;
+/// with one it becomes an additional (`hpc-<slug>-N`) coordinator.
+pub fn adopt(ctx: &Ctx, slug: &str, pane_arg: Option<&str>, session_flags: &SessionFlags) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    if project.status() == Status::Archived {
+        bail!("`{slug}` is archived; run `unarchive {slug}` first");
+    }
+    let prefix = current_prefix(&ctx.root)?;
+    // Priming first: once registered, the agent can run `context` and must
+    // read the registered-identity rules.
+    project::write_priming(&project, &prefix)?;
+
+    // Which pane? --pane wins; otherwise the pane the command runs in (only
+    // available inside a live Herdr pane).
+    let pane = if let Some(pane) = pane_arg {
+        pane.to_string()
+    } else {
+        crate::progress::current(ctx.env, ctx.runner)
+            .map(|c| c.pane_id)
+            .with_context(|| {
+                format!("no `--pane` given and this command is not running inside a Herdr pane; pass `{prefix} coordinator adopt {slug} --pane <id>` (`herdr agent list` shows ids)")
+            })?
+    };
+
+    // The session: the project's recorded one, else the one the flags/env
+    // resolve to (a project that was never opened is adopted in place).
+    let existing = project.coordinator().filter(|r| !r.socket.is_empty() && Path::new(&r.socket).exists());
+    let session = if let Some(record) = &existing {
+        crate::paths::Session {
+            socket: std::path::PathBuf::from(&record.socket),
+            name: None,
+        }
+    } else {
+        paths::resolve_session(session_flags, ctx.env, ctx.runner)?
+    };
+    let socket = session.socket.to_string_lossy().into_owned();
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
+    let agents = herdr.agent_list().with_context(|| format!("the herdr session at {socket} is not reachable"))?;
+    let panes = herdr.pane_list().unwrap_or_default();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let Some(agent) = agents.iter().find(|a| a.pane_id == pane) else {
+        if panes.iter().any(|p| p.pane_id == pane) {
+            bail!("no agent is detected in pane {pane} (it is at a shell prompt); start the agent there first, then adopt it");
+        }
+        bail!("pane {pane} is not listed by the herdr session at {socket}; `herdr agent list` shows live panes");
+    };
+
+    if agent.agent_status == "unknown" {
+        bail!("the agent in pane {pane} is still starting (status unknown); wait until it is ready, then run `coordinator adopt {slug} --pane {pane}` again");
+    }
+    // This project's own thread name (`hp-<slug>-t-0001`): it belongs to a
+    // thread, not the coordinator slot. Checked before cwd so a thread pane
+    // parked anywhere gets this exact refusal.
+    if names::is_thread_name(slug, &agent.name) {
+        bail!("pane {pane} is thread `{}` of `{slug}`; a thread pane cannot be adopted as a coordinator", agent.name);
+    }
+    // Another project already claims this pane on the SAME session. Checked
+    // before this project's cwd test: a pane registered to another project is
+    // refused by identity regardless of where it sits. A pane is identified by
+    // (socket, id): the same id in another session is another physical pane.
+    for other_slug in project::list_slugs(&ctx.root) {
+        if other_slug == slug {
+            continue;
+        }
+        let Ok(other) = Project::load(&ctx.root, &other_slug) else {
+            continue;
+        };
+        let Some(record) = other.coordinator() else {
+            continue;
+        };
+        if record.socket != socket {
+            continue;
+        }
+        // Session is the same one we just listed; reuse that list.
+        if is_coordinator(&other_slug, &record.cwd, agent) {
+            bail!("pane {pane} is a registered coordinator of `{other_slug}` (name `{}`); one pane cannot coordinate two projects", agent.name);
+        }
+        if let Some(t) = crate::thread::list(&other).iter().find(|t| !t.is_remote() && t.status != crate::thread::Status::Resolved && t.pane_id == pane && crate::thread::agent_matches(t, agent)) {
+            bail!("pane {pane} is already thread {} of `{other_slug}`", t.id);
+        }
+    }
+    if !agent.works_in(&dir) {
+        bail!(
+            "pane {pane} works in `{}` but the project folder is `{dir}`; a coordinator must run in the project home (check its foreground cwd too)",
+            if agent.cwd.is_empty() { "?".to_string() } else { agent.cwd.clone() }
+        );
+    }
+
+    if names::is_coordinator_name(slug, &agent.name) {
+        // Idempotent adoption: named correctly already. Make sure the record
+        // points at this pane (it is the primary when none existed).
+        return finish_adopt(ctx, &project, &existing, &herdr, &socket, session.name.as_deref().unwrap_or(""), &agent, &agent.name, &prefix, true);
+    }
+    if !agent.name.is_empty() {
+        bail!("pane {pane} already carries the unrelated name `{}`; it is never force-renamed. Rename it explicitly if that is intended (`herdr agent rename {pane} {}`).", agent.name, names::coordinator(slug, 0));
+    }
+
+    let taken: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
+    let name = names::free_coordinator(slug, &taken);
+    // Truncation collisions with another project's live family must not ship
+    // two agents under the same herdr name.
+    for other_slug in project::list_slugs(&ctx.root) {
+        if other_slug != slug && names::collide(slug, &other_slug) && taken.iter().any(|n| names::is_coordinator_name(&other_slug, n)) {
+            bail!("the coordinator name `{name}` of `{slug}` collides with a live coordinator of `{other_slug}`; rename the shorter project first");
+        }
+    }
+    herdr
+        .agent_rename(&pane, &name)
+        .with_context(|| format!("could not rename pane {pane} to `{name}`; if the agent shows a startup dialog, answer it and run `coordinator adopt {slug} --pane {pane}` again"))?;
+
+    // Reflect the rename for the record/finish path without re-listing.
+    let mut renamed = agent.clone();
+    renamed.name = name.clone();
+    finish_adopt(ctx, &project, &existing, &herdr, &socket, session.name.as_deref().unwrap_or(""), &renamed, &name, &prefix, false)
+}
+
+/// Writes (or leaves) the primary record, starts the ticker, colors the pane
+/// and tells the user what to run. `already_named` only changes the wording.
+fn finish_adopt(
+    ctx: &Ctx,
+    project: &Project,
+    existing: &Option<Coordinator>,
+    herdr: &Herdr,
+    socket: &str,
+    session_name: &str,
+    agent: &Agent,
+    name: &str,
+    prefix: &str,
+    already_named: bool,
+) -> Result<()> {
+    let slug = &project.slug;
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    if existing.is_none() {
+        // This pane becomes the primary coordinator.
+        project.update_coordinator(|c| {
+            *c = Coordinator {
+                socket: socket.to_string(),
+                session: session_name.to_string(),
+                workspace_id: agent.workspace_id.clone(),
+                tab_id: agent.tab_id.clone(),
+                pane_id: agent.pane_id.clone(),
+                agent_name: name.to_string(),
+                cwd: dir,
+                agent: agent.agent.clone(),
+                profile: String::new(),
+                agent_session: agent.session_id().to_string(),
+                updated: String::new(),
+            }
+        })?;
+        println!("registered pane {} as the primary coordinator of `{slug}` (`{name}`)", agent.pane_id);
+    } else if existing.as_ref().is_some_and(|r| r.pane_id == agent.pane_id) {
+        println!("pane {} is already the registered primary coordinator of `{slug}` (`{name}`)", agent.pane_id);
+    } else {
+        // An additional coordinator; the primary record is untouched.
+        println!("registered pane {} as an additional coordinator of `{slug}` (`{name}`); the primary record is unchanged", agent.pane_id);
+    }
+    report_tokens(herdr, project, &agent.pane_id);
+    ticker::start(ctx)?;
+    if already_named {
+        println!("it was already registered as `{name}`");
+    }
+    println!("let it read the project rules: run `{prefix} context {slug}` in that pane");
+    Ok(())
+}
+
 /// `coordinator prompt`: a sentence to a coordinator (the popup's task keys
 /// use it; the coordinator stays the only writer of TASKS.md).
 pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {

@@ -2313,6 +2313,166 @@ fn an_agent_started_by_hand_in_a_never_opened_project_stays_unregistered() {
     assert_eq!(world.runner.count("workspace report-metadata wGM"), 0);
 }
 
+/// Run `coordinator adopt` against the default session's socket.
+fn adopt_in(world: &World, slug: &str, pane: &str) -> anyhow::Result<()> {
+    let socket = default_socket(world);
+    let env = Env::for_test(world.home.path(), &[("HERDR_SOCKET_PATH", &socket)]);
+    coordinator::adopt(&Ctx { env: &env, ..world.ctx() }, slug, Some(pane), &Default::default())
+}
+
+#[test]
+fn adopt_registers_a_hand_started_pane_as_the_primary_coordinator() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "", "idle"));
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t1", "w1:p1", &dir));
+    world.runner.on("agent rename", ok(r#"{"result":{}}"#));
+
+    adopt_in(&world, "demo", "w1:p1").unwrap();
+    assert_eq!(world.runner.count("agent rename w1:p1 hpc-demo"), 1);
+    // The rename lands on the live agent, as it does against real herdr.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
+    assert_eq!(world.runner.count("agent prompt"), 0, "adopt never injects a prompt");
+    assert_eq!(world.runner.count("agent start"), 0, "adopt never starts anything");
+    let record = project.coordinator().expect("primary record written");
+    assert_eq!(
+        (record.socket.as_str(), record.workspace_id.as_str(), record.tab_id.as_str(), record.pane_id.as_str(), record.agent_name.as_str(), record.cwd.as_str()),
+        (socket.as_str(), "w1", "w1:t1", "w1:p1", "hpc-demo", dir.as_str())
+    );
+    // The next tick discovers it, colors it and nudges only that pane.
+    set_front_matter(&project, "nudge = true");
+    write_routine(&project, "standup", "+++\nschedule = \"every 5m\"\n+++\nSummarise.\n");
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+    let mut memory = crate::steps::Memory::new(&ctx);
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(crate::coordinator::live(&project).len(), 1);
+    make_due(&project, "standup");
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(items_of(&project, "routine").len(), 1);
+    make_due(&project, "standup");
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(items_of(&project, "routine").len(), 1);
+    idle_for_a_minute(&project);
+    ticker::tick_for_test(&ctx, &mut memory);
+    box_empty_for_a_while(&project);
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent prompt w1:p1"), 1);
+}
+
+#[test]
+fn a_second_adopted_pane_gets_hpc_demo_1_and_leaves_the_primary_untouched() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let other = socket;
+    // The existing primary lives at the same socket; point the record there.
+    project
+        .update_coordinator(|c| {
+            c.socket = other.clone();
+            c.workspace_id = "w1".into();
+            c.tab_id = "w1:t1".into();
+            c.pane_id = "w1:p1".into();
+            c.agent_name = "hpc-demo".into();
+            c.cwd = dir.clone();
+        })
+        .unwrap();
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"),
+        agent_json("w2", "w2:t1", "w2:p1", &dir, "", "idle")
+    );
+    *world.panes.borrow_mut() = format!("[{},{}]", pane_json("w1", "w1:t1", "w1:p1", &dir), pane_json("w2", "w2:t1", "w2:p1", &dir));
+    world.runner.on("agent rename", ok(r#"{"result":{}}"#));
+
+    adopt_in(&world, "demo", "w2:p1").unwrap();
+    assert_eq!(world.runner.count("agent rename w2:p1 hpc-demo-1"), 1);
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"),
+        agent_json("w2", "w2:t1", "w2:p1", &dir, "hpc-demo-1", "idle")
+    );
+    // The primary record is untouched.
+    let record = project.coordinator().unwrap();
+    assert_eq!((record.pane_id.as_str(), record.agent_name.as_str()), ("w1:p1", "hpc-demo"));
+    // Both are discovered on the next tick.
+    let ctx = world.ctx();
+    ticker::tick_project(&ctx, &project).unwrap();
+    let panes = crate::coordinator::live(&project);
+    assert_eq!(panes.iter().map(|p| p.pane_id.as_str()).collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from(["w1:p1", "w2:p1"]));
+}
+
+#[test]
+fn adopt_is_idempotent_and_refuses_every_invalid_pane() {
+    let world = World::new();
+    default_socket(&world);
+    let a = project::create(&world.root, "alpha", "", vec![]).unwrap();
+    let b = project::create(&world.root, "beta", "", vec![]).unwrap();
+    let a_dir = a.canonical_dir().to_string_lossy().into_owned();
+    let b_dir = b.canonical_dir().to_string_lossy().into_owned();
+    let a_thread = a.canonical_dir().join("threads/t-0001").to_string_lossy().into_owned();
+    std::fs::create_dir_all(&a_thread).unwrap();
+    // alpha: a registered coordinator and its thread; beta: its registered
+    // coordinator; plus an unnamed root pane, a shell-only pane and a stranger name.
+    *world.agents.borrow_mut() = format!(
+        "[{},{},{},{},{}]",
+        agent_json("wA", "wA:t1", "wA:p1", &a_dir, "hpc-alpha", "idle"),
+        agent_json("wT", "wT:t1", "wT:p1", &a_thread, "hp-alpha-t-0001", "idle"),
+        agent_json("wS", "wS:t1", "wS:p1", &a_dir, "", "idle"),
+        agent_json("wB", "wB:t1", "wB:p1", &b_dir, "hpc-beta", "idle"),
+        agent_json("wN", "wN:t1", "wN:p1", &a_dir, "someone-else", "idle")
+    );
+    *world.panes.borrow_mut() = format!(
+        "[{},{},{},{},{},{}]",
+        pane_json("wA", "wA:t1", "wA:p1", &a_dir),
+        pane_json("wT", "wT:t1", "wT:p1", &a_thread),
+        pane_json("wS", "wS:t1", "wS:p1", &a_dir),
+        pane_json("wB", "wB:t1", "wB:p1", &b_dir),
+        pane_json("wN", "wN:t1", "wN:p1", &a_dir),
+        pane_json("w9", "w9:t1", "w9:p1", &a_dir)
+    );
+    world.runner.on("agent rename", ok(r#"{"result":{}}"#));
+    // Both projects have records on the same socket.
+    a.update_coordinator(|c| {
+        c.socket = default_socket(&world);
+        c.pane_id = "wA:p1".into();
+        c.workspace_id = "wA".into();
+        c.tab_id = "wA:t1".into();
+        c.agent_name = "hpc-alpha".into();
+        c.cwd = a_dir.clone();
+    })
+    .unwrap();
+    b.update_coordinator(|c| {
+        c.socket = default_socket(&world);
+        c.pane_id = "wB:p1".into();
+        c.workspace_id = "wB".into();
+        c.tab_id = "wB:t1".into();
+        c.agent_name = "hpc-beta".into();
+        c.cwd = b_dir.clone();
+    })
+    .unwrap();
+
+    // Idempotent: already registered as hpc-alpha.
+    adopt_in(&world, "alpha", "wA:p1").unwrap();
+    assert_eq!(world.runner.count("agent rename"), 0);
+
+    let err = |pane: &str| adopt_in(&world, "alpha", pane).unwrap_err().to_string();
+    assert!(err("w9:p9").contains("not listed"), "{}", err("w9:p9"));
+    assert!(err("w9:p1").contains("no agent is detected"), "{}", err("w9:p1")); // shell only
+    assert!(err("wT:p1").contains("thread `hp-alpha-t-0001`"), "{}", err("wT:p1"));
+    assert!(err("wB:p1").contains("coordinator of `beta`"), "{}", err("wB:p1"));
+    assert!(err("wN:p1").contains("unrelated name `someone-else`"), "{}", err("wN:p1"));
+    // cwd mismatch: the beta coordinator cannot become alpha's.
+    assert!(err("wB:p1").contains("one pane cannot coordinate two projects"));
+
+    // The unnamed root pane is adoptable: becomes an additional coordinator.
+    adopt_in(&world, "alpha", "wS:p1").unwrap();
+    assert_eq!(world.runner.count("agent rename wS:p1 hpc-alpha-1"), 1);
+}
+
 #[test]
 fn a_routine_due_with_no_coordinator_does_nothing_and_is_recorded_as_skipped() {
     let world = World::new();

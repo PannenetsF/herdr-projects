@@ -39,6 +39,12 @@ pub fn thread(slug: &str, id: &str) -> String {
     format!("hp-{}-{id}", head(slug, 21))
 }
 
+/// Whether `name` is a thread name of THIS slug (`hp-<head21>-t-…`). The
+/// truncation width is reconstructed, like [`is_coordinator_name`].
+pub fn is_thread_name(slug: &str, name: &str) -> bool {
+    name.strip_prefix(&format!("hp-{}-", head(slug, 21))).is_some_and(|suffix| suffix.starts_with("t-"))
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn is_valid(name: &str) -> bool {
     let mut chars = name.chars();
@@ -100,6 +106,11 @@ mod tests {
         assert!(!is_coordinator_name("demo", "hpc-demo-extra"));
         assert!(!is_coordinator_name("demo", "Hpc-demo"));
         assert!(!is_coordinator_name("demo", "hpc-demo-1x"));
+        assert!(is_thread_name("demo", "hp-demo-t-0001"));
+        assert!(is_thread_name("demo", "hp-demo-t-12345"));
+        assert!(!is_thread_name("demo", "hpc-demo"));
+        assert!(!is_thread_name("demo", "hp-other-t-0001"));
+        assert!(!is_thread_name("demo", "hp-demox-t-0001"));
         // The 24/22 truncation widths: reconstruct, never prefix-match.
         let slug = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 31 a's
         assert!(is_coordinator_name(&slug, &coordinator(&slug, 0)));

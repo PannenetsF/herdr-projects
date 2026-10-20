@@ -310,6 +310,15 @@ enum InboxCommand {
 
 #[derive(Subcommand)]
 enum CoordinatorCommand {
+    /// Register the agent running in a pane as this project's coordinator (a hand-started session needs this)
+    Adopt {
+        slug: String,
+        /// The pane to register (default: the pane this command runs in); `herdr agent list` shows ids
+        #[arg(long, value_name = "ID")]
+        pane: Option<String>,
+        #[command(flatten)]
+        session: SessionArgs,
+    },
     /// Send a sentence to the project's coordinator (the popup's task keys use this)
     Prompt {
         slug: String,
@@ -686,6 +695,7 @@ pub fn run() -> Result<()> {
             },
         ),
         Command::Coordinator { command } => match command {
+            CoordinatorCommand::Adopt { slug, pane, session } => coordinator::adopt(&ctx, &slug, pane.as_deref(), &session.into()),
             CoordinatorCommand::Prompt { slug, text_file } => {
                 let text = read_text(&text_file)?;
                 coordinator::prompt(&ctx, &slug, &text)
