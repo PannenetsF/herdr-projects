@@ -20,6 +20,9 @@ pub struct Item {
     /// a prompt"). The nudge line is built from subjects and events only, never
     /// from summaries, which may quote text from reports or GitHub.
     pub event: String,
+    /// The pane the owning thread ran in; thread-derived events only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_pane: Option<String>,
     /// Empty except for `routine` items.
     #[serde(skip)]
     pub body: String,
@@ -53,6 +56,16 @@ pub fn safe_subject(subject: &str) -> String {
 /// tick never share a name. `event` is a fixed phrase from this binary. `body`
 /// is empty except for `routine` items.
 pub fn write(project: &Project, kind: &str, subject: &str, event: &str, summary: &str, body: &str) -> Result<String> {
+    write_item(project, kind, subject, event, summary, body, None)
+}
+
+/// Like [`write`], for an event derived from a thread: records the pane the
+/// thread ran in. An empty pane id is treated as absent.
+pub fn write_origin(project: &Project, kind: &str, subject: &str, event: &str, summary: &str, body: &str, origin_pane: &str) -> Result<String> {
+    write_item(project, kind, subject, event, summary, body, (!origin_pane.is_empty()).then(|| origin_pane.to_string()))
+}
+
+fn write_item(project: &Project, kind: &str, subject: &str, event: &str, summary: &str, body: &str, origin_pane: Option<String>) -> Result<String> {
     let _lock = project.lock()?;
     let counter_path = project.state_dir().join("inbox-counter.json");
     let n: u64 = project::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
@@ -67,6 +80,7 @@ pub fn write(project: &Project, kind: &str, subject: &str, event: &str, summary:
         // One line, no control characters: summaries are printed in the digest.
         summary: summary.chars().map(|c| if c.is_control() { ' ' } else { c }).collect(),
         event: event.to_string(),
+        origin_pane,
         body: String::new(),
     };
     let mut text = format!("+++\n{}+++\n", toml::to_string(&item)?);
@@ -237,5 +251,37 @@ mod tests {
         for bad in ["../PROJECT", "a/b", "", ".hidden", "x..y"] {
             assert!(done(&project, &[bad.to_string()], false).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn old_shaped_items_without_origin_pane_parse_as_unattributed() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        write_item(&project, "20260917T000001Z-thread-state-t-0001-1", "");
+        let text = std::fs::read_to_string(inbox_dir(&project).join("20260917T000001Z-thread-state-t-0001-1.md")).unwrap();
+        assert!(!text.contains("origin_pane"));
+        let item = parse(&text).unwrap();
+        assert_eq!(item.origin_pane, None);
+        assert_eq!(unhandled(&project)[0].origin_pane, None);
+    }
+
+    #[test]
+    fn origin_pane_round_trips_and_plain_writes_omit_it() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let attributed = write_origin(&project, "thread-state", "t-0001", "new report", "s", "", "w2:p3").unwrap();
+        let text = std::fs::read_to_string(inbox_dir(&project).join(format!("{attributed}.md"))).unwrap();
+        assert!(text.contains("origin_pane = \"w2:p3\""), "{text}");
+        assert_eq!(unhandled(&project).iter().find(|i| i.id == attributed).unwrap().origin_pane.as_deref(), Some("w2:p3"));
+
+        let plain = write(&project, "thread-state", "t-0002", "resolved", "s", "").unwrap();
+        let text = std::fs::read_to_string(inbox_dir(&project).join(format!("{plain}.md"))).unwrap();
+        assert!(!text.contains("origin_pane"), "{text}");
+        assert_eq!(unhandled(&project).iter().find(|i| i.id == plain).unwrap().origin_pane, None);
+
+        let empty = write_origin(&project, "thread-state", "t-0003", "resolved", "s", "", "").unwrap();
+        let text = std::fs::read_to_string(inbox_dir(&project).join(format!("{empty}.md"))).unwrap();
+        assert!(!text.contains("origin_pane"), "{text}");
+        assert_eq!(unhandled(&project).iter().find(|i| i.id == empty).unwrap().origin_pane, None);
     }
 }

@@ -760,7 +760,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
                         t.id,
                         refused.join(" "),
                     );
-                    inbox::write(project, "thread-state", &t.id, "launched without some flags", &summary, "")?;
+                    inbox::write_origin(project, "thread-state", &t.id, "launched without some flags", &summary, "", &t.origin_pane())?;
                 }
                 let builtin = config.get(&t.agent).filter(|p| p.builtin).map(|p| crate::profiles::launch_args(&p, &safety.thread_agent_args, &legacy)).unwrap_or_default();
                 (t.agent.clone(), [builtin, model].concat())
@@ -773,7 +773,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
                         t.status = thread::Status::Failed;
                         t.error = message.clone();
                     })?;
-                    inbox::write(project, "thread-state", &t.id, "not launched", &format!("{}: not launched: {message}", t.id), "")?;
+                    inbox::write_origin(project, "thread-state", &t.id, "not launched", &format!("{}: not launched: {message}", t.id), "", &t.origin_pane())?;
                     return Ok(());
                 }
                 (t.agent.clone(), t.profile_args.clone())
@@ -788,7 +788,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
                             t.status = thread::Status::Failed;
                             t.error = message.clone();
                         })?;
-                        inbox::write(project, "thread-state", &t.id, "not launched", &format!("{}: not launched: {message}", t.id), "")?;
+                        inbox::write_origin(project, "thread-state", &t.id, "not launched", &format!("{}: not launched: {message}", t.id), "", &t.origin_pane())?;
                         return Ok(());
                     }
                 };

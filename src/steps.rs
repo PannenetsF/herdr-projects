@@ -217,7 +217,7 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
                 summary.push_str(&format!(" on machine `{}` (reach it with `herdr --remote <ssh target>`, or select the machine in herdr's sidebar)", t.machine));
             }
         }
-        inbox::write(project, "thread-state", &t.id, transition_event(change), &summary, "")?;
+        inbox::write_origin(project, "thread-state", &t.id, transition_event(change), &summary, "", &t.origin_pane())?;
         if change.to == Group::WaitingOnYou {
             let reason = if !t.state_line.is_empty() && t.state_line != "needs you" { t.state_line.clone() } else { format!("needs you · {}", change.note) };
             let reason = if !t.activity.is_empty() && t.activity == crate::progress::WAITING { format!("needs you · {}", t.activity) } else { reason };
@@ -238,7 +238,7 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
         if let Some(notes) = copy_notes.get(&t.id) {
             summary.push_str(&format!("; not everything was copied: {}", notes.join("; ")));
         }
-        inbox::write(project, "thread-state", &t.id, "new report", &summary, "")?;
+        inbox::write_origin(project, "thread-state", &t.id, "new report", &summary, "", &t.origin_pane())?;
         notifier.send(&t.id, &format!("review · new report: {}", t.title), crate::notify::Sound::Done, false);
         let hash = t.report_hash.clone();
         thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
@@ -629,7 +629,7 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str, me
     let complete = copied.outcome == CopyOutcome::Complete;
     let notes = threads::clean(ctx, project, &resolved, &threads::Clean { keep_worktree: false, copy_complete: complete, merged_head });
     let why = if reason == "auto" { "it was idle for `auto_resolve_days` and was resolved automatically; `thread resolve --reopen` undoes it".to_string() } else { format!("resolved ({reason})") };
-    inbox::write(project, "thread-state", &t.id, "resolved", &format!("{}: {why}: {}", thread_label(t), notes.join("; ")), "")?;
+    inbox::write_origin(project, "thread-state", &t.id, "resolved", &format!("{}: {why}: {}", thread_label(t), notes.join("; ")), "", &t.origin_pane())?;
     Ok(true)
 }
 

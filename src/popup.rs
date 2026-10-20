@@ -378,8 +378,11 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
             for project in projects_in_scope(root, scope, false) {
                 for item in crate::inbox::unhandled(&project) {
                     let prefix = if scope.is_none() { format!("{} · ", project.slug) } else { String::new() };
+                    // Before the summary: rows are tail-truncated to width, and
+                    // real summaries already fill a whole row.
+                    let origin = item.origin_pane.as_ref().map(|p| format!("pane {p} · ")).unwrap_or_default();
                     let body = format!("{}\n\n{}", item.summary, item.body);
-                    rows.push(Row { header: false, text: format!("{prefix}{} · {} · {}", item.kind, item.subject, item.summary), color: None, kind: RowKind::Inbox { slug: project.slug.clone(), id: item.id, body } });
+                    rows.push(Row { header: false, text: format!("{prefix}{} · {} · {origin}{}", item.kind, item.subject, item.summary), color: None, kind: RowKind::Inbox { slug: project.slug.clone(), id: item.id, body } });
                 }
             }
             if rows.is_empty() {
@@ -1638,6 +1641,20 @@ mod tests {
         assert_eq!((title.as_str(), lines), ("Fix login", vec!["Backlog · claude".to_string(), String::new(), "  Safari drops the cookie.".into(), "  See issue 42.".into()]));
         assert!(!build(&world.ctx(), Section::Memory, Some("demo")).is_empty());
         assert_eq!(summary(&world.root), "1 project · 1 need you");
+    }
+
+    #[test]
+    fn inbox_rows_name_the_origin_pane_before_the_summary() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        crate::inbox::write_origin(&project, "thread-state", "t-0001", "new report", "a longish report summary", "", "w2:p3").unwrap();
+        crate::inbox::write(&project, "thread-state", "t-0002", "resolved", "plain item", "").unwrap();
+        let rows = build(&world.ctx(), Section::Inbox, Some("demo"));
+        let attributed = rows.iter().map(|r| &r.text).find(|t| t.contains("t-0001")).unwrap();
+        assert_eq!(attributed, "thread-state · t-0001 · pane w2:p3 · a longish report summary");
+        let plain = rows.iter().map(|r| &r.text).find(|t| t.contains("t-0002")).unwrap();
+        assert_eq!(plain, "thread-state · t-0002 · plain item");
+        assert!(!plain.contains("pane"));
     }
 
     fn rows() -> Vec<PickerRow> {

@@ -816,7 +816,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     for note in &notes {
         println!("  - {note}");
     }
-    crate::inbox::write(&project, "thread-state", id, "resolved", &format!("{id} \"{}\" was resolved: {}", resolved.title, notes.join("; ")), "")?;
+    crate::inbox::write_origin(&project, "thread-state", id, "resolved", &format!("{id} \"{}\" was resolved: {}", resolved.title, notes.join("; ")), "", &resolved.origin_pane())?;
     Ok(())
 }
 
@@ -933,7 +933,7 @@ fn last_pr_lookup(ctx: &Ctx, project: &Project, t: &Thread) -> Option<crate::pr:
             r.pr_state = state;
             r.pr_review = review;
         });
-        let _ = crate::inbox::write(project, "pr", &t.id, "PR found at resolve", &format!("{}: pull request {} (found at resolve)", crate::steps::thread_label(t), pr::describe_change(None, &summary)), "");
+        let _ = crate::inbox::write_origin(project, "pr", &t.id, "PR found at resolve", &format!("{}: pull request {} (found at resolve)", crate::steps::thread_label(t), pr::describe_change(None, &summary)), "", &t.origin_pane());
     }
     Some(summary)
 }

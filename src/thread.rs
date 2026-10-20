@@ -135,6 +135,17 @@ impl Thread {
         !self.machine.is_empty()
     }
 
+    /// Pane id to stamp on inbox items. A remote thread runs on another herdr
+    /// server, whose pane slots restart at w1:p1, so its machine is suffixed
+    /// and the origin can never equal the local reader's pane.
+    pub fn origin_pane(&self) -> String {
+        if self.machine.is_empty() {
+            self.pane_id.clone()
+        } else {
+            format!("{}@{}", self.pane_id, self.machine)
+        }
+    }
+
     pub fn report_path(&self) -> String {
         format!("{}/report.md", self.thread_dir)
     }
