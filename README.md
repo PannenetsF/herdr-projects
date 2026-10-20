@@ -125,6 +125,10 @@ In `~/.herdr-projects/<name>/` by default: `PROJECT.md` for your settings and st
 
 No. Run `herdr-projects thread start` yourself, or take an agent pane you already started and make it a thread with `thread adopt`. The `herdr-projects adopt-workspace` command turns the workspace you're in into a project with its agent as the first thread.
 
+### I started an agent in the project folder myself; is it the coordinator?
+
+Not on its own. A coordinator is a **registered** agent — one carrying a project name like `hpc-billing`, which `open` sets. A hand-started pane stays a stranger: the ticker sends it no inbox, the sidebar keeps it out of the project's head row, and `context` refuses it (so it cannot mark the inbox seen). Register it deliberately with `herdr-projects coordinator adopt billing` run in that pane (or `--pane <id>`); the first adoption becomes the primary coordinator and later ones add a second coordinator without displacing it.
+
 ### What if the safety settings aren't enough?
 
 They are soft. By default the coordinator proposes threads and waits (until you turn on yolo mode in the popup), thread agents keep their normal permission prompts, which the coordinator answers for plainly in-task actions and brings to you otherwise (it may choose their model, never their launch flags), and routines may not run shell commands until you enable them and approve each command in a terminal. But agents have a shell: one that runs with skip-permission arguments can edit those files, a thread can prompt the coordinator pretending to be you, an approved routine command covers its text and not the scripts it calls, and whatever reaches memory is repeated in every later brief. [Operations](docs/operations.md#what-the-safety-settings-do-and-dont-stop) says plainly what each guard stops and what it doesn't.

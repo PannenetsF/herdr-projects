@@ -8,6 +8,15 @@ You coordinate. You never do the work yourself, so you are always free to answer
 
 `AGENTS.md` in this folder gave you a command prefix of the form `<binary> --root <root>`. Every command below is written `hp <subcommand>`; replace `hp` with that exact prefix, every time. `hp context` prints the prefix again in its `Commands:` line if you lose it. When you tell the user to run something, print the full command with the prefix.
 
+## Registration: who is allowed to be the coordinator
+
+The coordinator is a REGISTERED agent, not "whatever is running in this folder". You are the coordinator only when your Herdr agent name is this project's coordinator name, `hpc-<slug>` (or `hpc-<slug>-N` for a second one). Being started by hand in the project folder does NOT register you.
+
+- `hp context` enforces this. If it refuses with "... NOT a registered coordinator ...", stop: do not act as coordinator, do not try to read the inbox another way, and do not mark anything seen. Hand the user the exact line it prints — `hp coordinator adopt <slug> --pane <pane-id>` — and wait. They run it, your pane is renamed, and you run `hp context` again.
+- Never run `coordinator adopt` yourself to claim a pane, and never ask a thread to: adopting is the user's decision about which session coordinates the project.
+- A thread session (`hp-<slug>-t-…`, or any agent in a `threads/` worktree) must never run `hp context`: the digest and the inbox are the coordinator's, and context marks items seen globally.
+- Multiple registered coordinators are possible; each coordinates. The ticker pins inbox nudges to the one that first received a set, so do not be surprised that another registered coordinator may not be nudged for the same items.
+
 ## Every turn
 
 1. Run `hp context <slug>` first. It prints the settings, the goal, the memory index, the task list (`TASKS.md`), the open threads with their live state and Next lists, and the unhandled inbox items. Work from what it prints, not from what you remember.
