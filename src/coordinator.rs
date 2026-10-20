@@ -543,8 +543,10 @@ fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
 /// `coordinator adopt <slug> [--pane ID]`: register an already-running,
 /// hand-started agent pane as a coordinator of `slug`. The pane is renamed to
 /// the next free name of the project's coordinator family; nothing is
-/// prompted or started. With no existing record the pane becomes the primary;
-/// with one it becomes an additional (`hpc-<slug>-N`) coordinator.
+/// prompted or started. With no live primary the pane becomes the primary
+/// (a record whose pane no longer exists in the session is stale and is
+/// replaced); with a live primary it becomes an additional
+/// (`hpc-<slug>-N`) coordinator.
 pub fn adopt(ctx: &Ctx, slug: &str, pane_arg: Option<&str>, session_flags: &SessionFlags) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     if project.status() == Status::Archived {
@@ -582,6 +584,24 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane_arg: Option<&str>, session_flags: &Sess
     let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
     let agents = herdr.agent_list().with_context(|| format!("the herdr session at {socket} is not reachable"))?;
     let panes = herdr.pane_list().unwrap_or_default();
+    // A recorded primary whose pane no longer exists in this session (neither
+    // as an agent nor as a shell pane) is stale: adoption replaces it instead
+    // of registering a second coordinator behind a dead record. A shell-only
+    // recorded pane counts as live: `open` reuses that very slot.
+    let stale_pane = existing.as_ref().and_then(|r| {
+        if r.socket == socket
+            && !agents.iter().any(|a| a.pane_id == r.pane_id)
+            && !panes.iter().any(|p| p.pane_id == r.pane_id)
+        {
+            Some(r.pane_id.clone())
+        } else {
+            None
+        }
+    });
+    if let Some(stale) = &stale_pane {
+        println!("the recorded primary pane {stale} no longer exists in this session; it will be replaced");
+    }
+    let existing = if stale_pane.is_some() { None } else { existing };
     let dir = project.canonical_dir().to_string_lossy().into_owned();
     let Some(agent) = agents.iter().find(|a| a.pane_id == pane) else {
         if panes.iter().any(|p| p.pane_id == pane) {
@@ -640,7 +660,15 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane_arg: Option<&str>, session_flags: &Sess
         bail!("pane {pane} already carries the unrelated name `{}`; it is never force-renamed. Rename it explicitly if that is intended (`herdr agent rename {pane} {}`).", agent.name, names::coordinator(slug, 0));
     }
 
-    let taken: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
+    let mut taken: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
+    // A live recorded primary that currently sits at a shell prompt carries no
+    // live name, yet `open` re-asserts its recorded name on that slot; keep it
+    // reserved so the new coordinator does not steal it.
+    if let Some(record) = &existing {
+        if !record.agent_name.is_empty() && !taken.iter().any(|n| n == &record.agent_name) {
+            taken.push(record.agent_name.clone());
+        }
+    }
     let name = names::free_coordinator(slug, &taken);
     // Truncation collisions with another project's live family must not ship
     // two agents under the same herdr name.

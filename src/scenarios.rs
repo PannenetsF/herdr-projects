@@ -2406,6 +2406,67 @@ fn a_second_adopted_pane_gets_hpc_demo_1_and_leaves_the_primary_untouched() {
 }
 
 #[test]
+fn adopt_replaces_a_recorded_primary_whose_pane_no_longer_exists() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    // The record points at a pane from an old incarnation; nothing with that
+    // id exists in the live session at all (neither agent nor shell pane).
+    project
+        .update_coordinator(|c| {
+            c.socket = socket.clone();
+            c.workspace_id = "w0".into();
+            c.tab_id = "w0:t1".into();
+            c.pane_id = "w0:p1".into();
+            c.agent_name = "hpc-demo".into();
+            c.cwd = dir.clone();
+        })
+        .unwrap();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "", "idle"));
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t1", "w1:p1", &dir));
+    world.runner.on("agent rename", ok(r#"{"result":{}}"#));
+
+    adopt_in(&world, "demo", "w1:p1").unwrap();
+    // It takes the base family name, not hpc-demo-1, and replaces the record.
+    assert_eq!(world.runner.count("agent rename w1:p1 hpc-demo"), 1);
+    let record = project.coordinator().unwrap();
+    assert_eq!((record.pane_id.as_str(), record.agent_name.as_str()), ("w1:p1", "hpc-demo"));
+}
+
+#[test]
+fn adopt_does_not_replace_a_recorded_primary_that_is_a_live_shell_pane() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    project
+        .update_coordinator(|c| {
+            c.socket = socket.clone();
+            c.workspace_id = "w1".into();
+            c.tab_id = "w1:t1".into();
+            c.pane_id = "w1:p1".into();
+            c.agent_name = "hpc-demo".into();
+            c.cwd = dir.clone();
+        })
+        .unwrap();
+    // Recorded slot exists but sits at a shell prompt (no agent); the new pane
+    // gets started beside it as an additional coordinator.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p2", &dir, "", "idle"));
+    *world.panes.borrow_mut() = format!(
+        "[{},{}]",
+        pane_json("w1", "w1:t1", "w1:p1", &dir),
+        pane_json("w1", "w1:t1", "w1:p2", &dir)
+    );
+    world.runner.on("agent rename", ok(r#"{"result":{}}"#));
+
+    adopt_in(&world, "demo", "w1:p2").unwrap();
+    assert_eq!(world.runner.count("agent rename w1:p2 hpc-demo-1"), 1);
+    let record = project.coordinator().unwrap();
+    assert_eq!(record.pane_id, "w1:p1");
+}
+
+#[test]
 fn adopt_is_idempotent_and_refuses_every_invalid_pane() {
     let world = World::new();
     default_socket(&world);
