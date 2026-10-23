@@ -152,11 +152,19 @@ pub fn sub_line(state_line: &str, activity: &str) -> String {
 }
 
 /// The groups of a project's open threads, as the ticker last persisted them.
+///
+/// Failed threads leave the ticker scan before they can persist a group, and
+/// `thread::group` classifies a failure as Waiting-on-you — so count them
+/// that way directly. Without this the needs-you badge (which reads
+/// `last_group`) silently disagreed with the live rows and the portal.
 pub fn recorded_groups(project: &Project) -> Vec<Group> {
     crate::thread::list(project)
         .into_iter()
-        .filter(|t| t.status != crate::thread::Status::Resolved)
-        .filter_map(|t| Group::from_token(&t.last_group))
+        .filter_map(|t| match t.status {
+            crate::thread::Status::Resolved => None,
+            crate::thread::Status::Failed => Some(Group::WaitingOnYou),
+            _ => Group::from_token(&t.last_group),
+        })
         .collect()
 }
 

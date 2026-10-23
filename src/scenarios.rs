@@ -287,6 +287,9 @@ fn one_agent_start_per_project_per_tick_and_three_failures_give_failed() {
         let t = thread::load(&project, id).unwrap();
         assert_eq!(t.status, Status::Failed, "{id}");
         assert!(t.error.contains("after 3 launch attempts"));
+        // Failed threads leave the ticker scan; the badge reads last_group,
+        // so a failed launch must be recorded as waiting-on-you at once.
+        assert_eq!(t.last_group, "waiting-on-you", "{id} badge must count failed launches");
     }
 }
 
@@ -622,6 +625,25 @@ fn thread_start_and_open_refuse_profiles_off_the_allow_list() {
 }
 
 #[test]
+fn a_failed_thread_counts_as_needs_you_everywhere() {
+    // Regression: the badge/popup count persisted `last_group`, while live
+    // rows reclassify a Failed thread as Waiting-on-you. A failed launch
+    // froze the badge at the old group and the two views disagreed.
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().to_path_buf();
+    world.thread(&project, &cwd, |t| t.prompt_pending = true);
+    thread::update(&project, "t-0001", |t| {
+        t.status = Status::Failed;
+        t.error = "no `claude` agent appeared in the pane after 3 launch attempts".into();
+        t.last_group = "working".into();
+    })
+    .unwrap();
+    let groups = crate::sidebar::recorded_groups(&project);
+    assert_eq!(groups, vec![crate::thread::Group::WaitingOnYou]);
+}
+
+#[test]
 fn a_thread_launches_with_its_profile_and_fails_closed_once_disallowed() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
@@ -649,8 +671,21 @@ fn a_thread_launches_with_its_profile_and_fails_closed_once_disallowed() {
     assert_eq!(t.status, Status::Failed);
     assert!(t.error.contains("not allowed for threads"), "{}", t.error);
     assert_eq!(world.runner.count("agent start"), 1);
-    assert!(items_of(&project, "thread-state").iter().any(|i| i.summary.contains("not launched")));
+    // The refusal is a Waiting-on-you transition (bell + inbox item), not a
+    // silent "not launched" note: failed threads leave the ticker scan, so
+    // without the transition the needs-you badge would never see them.
+    assert_eq!(t.last_group, "waiting-on-you");
+    assert!(items_of(&project, "thread-state").iter().any(|i| i.summary.contains("Waiting on you") && i.summary.contains("failed")));
     assert!(items_of(&project, "thread-state").iter().any(|i| i.origin_pane.as_deref() == Some("w2:p1")));
+    let shown: Vec<String> = world
+        .runner
+        .calls
+        .borrow()
+        .iter()
+        .map(|c| c.display())
+        .filter(|d| d.contains("notification show"))
+        .collect();
+    assert!(shown.iter().any(|d| d.contains("--sound request") && d.contains("t-0001")), "{shown:?}");
 }
 
 #[test]

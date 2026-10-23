@@ -572,6 +572,25 @@ struct Pass {
     error: Option<anyhow::Error>,
 }
 
+/// Mark a thread Failed and record the group a failed launch belongs to.
+///
+/// Failed threads leave the ticker's scan — only Open/Starting threads are
+/// polled — so without writing the group here their `last_group` stays frozen
+/// at the pre-failure group forever. The needs-you badge/popup count
+/// persisted `last_group`, the live `thread list` reclassifies Failed as
+/// Waiting-on-you, and the two drift apart (and no transition ever fires, so
+/// the failure never rings). Returns the transition so the normal
+/// announcement path rings once and writes the inbox item.
+fn mark_failed(project: &Project, id: &str, error: String) -> Result<steps::Transition> {
+    thread::update(project, id, |t| {
+        t.status = thread::Status::Failed;
+        t.error = error;
+        t.last_group = thread::Group::WaitingOnYou.token().to_string();
+        t.state_line = "needs you · failed".to_string();
+    })?;
+    Ok(steps::Transition { id: id.to_string(), to: thread::Group::WaitingOnYou, note: "failed".to_string() })
+}
+
 fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>) -> Result<Pass> {
     let slug = &project.slug;
     let now = jiff::Timestamp::now();
@@ -579,10 +598,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
     for t in threads {
         if t.status == thread::Status::Starting {
             if thread::seconds_since(&t.created, now) >= thread::STARTING_TIMEOUT_SECS {
-                thread::update(project, &t.id, |t| {
-                    t.status = thread::Status::Failed;
-                    t.error = "still starting after five minutes".into();
-                })?;
+                pass.transitions.push(mark_failed(project, &t.id, "still starting after five minutes".into())?);
             }
             continue;
         }
@@ -678,9 +694,11 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
 /// Launches pending threads whose pane is at a shell prompt. At most one
 /// `agent start` per machine per tick (`may_start`), and never a start and a
 /// prompt for the same pane in one tick: prompts only go to agents that were
-/// already listed before any start.
-fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], may_start: &mut bool, errors: &mut Vec<anyhow::Error>) {
+/// already listed before any start. Returns the group transitions of threads
+/// whose launch gave up this tick (they join the normal announcement path).
+fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], may_start: &mut bool, errors: &mut Vec<anyhow::Error>) -> Vec<steps::Transition> {
     let now = jiff::Timestamp::now();
+    let mut failed = Vec::new();
     for t in threads {
         if t.status != thread::Status::Open || !t.prompt_pending {
             continue;
@@ -690,11 +708,14 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
             continue;
         }
         if t.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
-            let failed = thread::update(project, &t.id, |t| {
-                t.status = thread::Status::Failed;
-                t.error = format!("no `{}` agent appeared in the pane after {} launch attempts", t.agent, thread::MAX_LAUNCH_ATTEMPTS);
-            });
-            errors.extend(failed.err());
+            match mark_failed(
+                project,
+                &t.id,
+                format!("no `{}` agent appeared in the pane after {} launch attempts", t.agent, thread::MAX_LAUNCH_ATTEMPTS),
+            ) {
+                Ok(change) => failed.push(change),
+                Err(error) => errors.push(anyhow::anyhow!(error)),
+            }
             continue;
         }
         if !*may_start {
@@ -730,12 +751,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
                 // Its machine's own definition, stored at start; the name is
                 // checked against this project's allow-list again.
                 if let Err(error) = crate::profiles::check_allowed(&config, &safety, crate::profiles::Role::Thread, &t.profile, &project.slug) {
-                    let message = format!("{error:#}");
-                    thread::update(project, &t.id, |t| {
-                        t.status = thread::Status::Failed;
-                        t.error = message.clone();
-                    })?;
-                    inbox::write_origin(project, "thread-state", &t.id, "not launched", &format!("{}: not launched: {message}", t.id), "", &t.origin_pane())?;
+                    failed.push(mark_failed(project, &t.id, format!("{error:#}"))?);
                     return Ok(());
                 }
                 (t.agent.clone(), t.profile_args.clone())
@@ -745,12 +761,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
                 let profile = match crate::profiles::resolve(&config, &safety, &settings, crate::profiles::Role::Thread, Some(&t.profile), &project.slug) {
                     Ok(profile) => profile,
                     Err(error) => {
-                        let message = format!("{error:#}");
-                        thread::update(project, &t.id, |t| {
-                            t.status = thread::Status::Failed;
-                            t.error = message.clone();
-                        })?;
-                        inbox::write_origin(project, "thread-state", &t.id, "not launched", &format!("{}: not launched: {message}", t.id), "", &t.origin_pane())?;
+                        failed.push(mark_failed(project, &t.id, format!("{error:#}"))?);
                         return Ok(());
                     }
                 };
@@ -769,6 +780,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
         })();
         errors.extend(launched.err().map(|e| e.context(format!("{}: launch", t.id))));
     }
+    failed
 }
 
 fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
@@ -882,8 +894,8 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
     let dirs: Vec<(String, String)> = threads.iter().filter(|t| !t.thread_dir.is_empty()).map(|t| (t.id.clone(), t.thread_dir.clone())).collect();
     let hashes = crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
-    let pass = thread_pass(project, &remote, "", threads, &agents, &panes, Some(&hashes)).map_err(|e| format!("{e:#}"))?;
-    errors.extend(pass.error);
+    let mut pass = thread_pass(project, &remote, "", threads, &agents, &panes, Some(&hashes)).map_err(|e| format!("{e:#}"))?;
+    errors.extend(pass.error.take());
 
     for t in threads {
         let Some(hash) = hashes.get(&t.id).filter(|h| **h != t.report_hash) else {
@@ -904,7 +916,7 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
             }
         }
     }
-    launch_pass(ctx, project, herdr, threads, &agents, &panes, &mut true, errors);
+    pass.transitions.extend(launch_pass(ctx, project, herdr, threads, &agents, &panes, &mut true, errors));
     Ok(pass.transitions)
 }
 
@@ -940,7 +952,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             }
         }
     }
-    launch_pass(ctx, project, &herdr, &local, &seen.agents, &seen.panes, &mut may_start, &mut errors);
+    transitions.extend(launch_pass(ctx, project, &herdr, &local, &seen.agents, &seen.panes, &mut may_start, &mut errors));
 
     // Remote threads, one machine at a time, every fourth tick.
     let mut state = steps::load_state(project);
