@@ -850,9 +850,25 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         crate::sidebar::report_pane(&herdr, &c.pane_id, &crate::sidebar::coordinator_display(project), slug, group, audience);
     }
 
-    let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None, stall_secs)?;
-    // The project's part of the sidebar grouping.
+    // The project's part of the sidebar grouping is built and inserted BEFORE
+    // the fallible thread pass. A rename/brief/state error on ONE thread must
+    // not make the whole project disappear from this tick's layout: if the
+    // part is absent, `grouping::plan` treats the coordinator pane as an
+    // untracked pane in the project home, stamps it `other`, and the hiding
+    // agent view drops it from the panel for that tick — the project header
+    // visibly blinking out and back every time a thread misbehaves.
     sessions.parts.entry(record.socket.clone()).or_default().insert(slug.clone(), part(ctx, project, &record, &coordinators, &agents, false));
+
+    let pass = match thread_pass(project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None, stall_secs) {
+        Ok(pass) => pass,
+        Err(error) => {
+            eprintln!("{slug}: thread pass: {error:#}");
+            // The layout part above is already in for this tick; the error is
+            // surfaced via first_error below but must not abort the rest of
+            // this project's tick (nudge) or evict its layout.
+            Pass { transitions: Vec::new(), recorded_panes: 0, missing_panes: 0, error: Some(error) }
+        }
+    };
     // Progress records of panes that are gone are dropped; a new agent in a
     // reused pane id is told apart by its terminal id.
     let live_ids: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();

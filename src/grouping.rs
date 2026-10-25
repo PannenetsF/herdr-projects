@@ -196,8 +196,7 @@ pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace]) -> Plan {
         .collect();
     let mut rows: Vec<(String, &str, &str)> = agents
         .iter()
-        .enumerate()
-        .map(|(i, a)| match owner.get(a.pane_id.as_str()) {
+        .map(|a| match owner.get(a.pane_id.as_str()) {
             Some(row) => (row.key.clone(), a.pane_id.as_str(), row.sub.as_str()),
             None => {
                 // Untracked pane: a pane in a project's SUBfolder (a second
@@ -213,7 +212,14 @@ pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace]) -> Plan {
                     .map(|(slug, _, _)| guest_thread_key(slug, guest_rank(&a.agent_status), &a.pane_id));
                 match claimed {
                     Some(key) => (key, a.pane_id.as_str(), ""),
-                    None => (format!("{OTHER}!{i:04}"), a.pane_id.as_str(), ""),
+                    // Keyed by the PANE ID, not by this tick's enumeration
+                    // index: an ordinal rewritten every other pane's token
+                    // whenever the agent list changes order, which produced
+                    // a constant low-level token churn (and a visible blink
+                    // if the sidebar ever showed these rows). Pane ids are
+                    // stable for a pane's lifetime and sort after every
+                    // project key because they start with `~!`.
+                    None => (format!("{OTHER}!{}", a.pane_id), a.pane_id.as_str(), ""),
                 }
             }
         })
