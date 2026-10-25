@@ -42,7 +42,11 @@ pub struct State {
     pub config_errors: BTreeSet<String>,
     /// Routing key -> hash of the unseen item set last nudged on it. A key is
     /// an owning coordinator name, or [`GLOBAL_NUDGE`] for project-wide items.
-    #[serde(default)]
+    /// Pre-pf.5 this field was a single `String` (the global queue); that
+    /// value migrates onto the [`GLOBAL_NUDGE`] key. A type mismatch without
+    /// a custom deserializer would fail the WHOLE ticker.json and, through
+    /// load_state's default fallback, wipe every other field (PR memory …).
+    #[serde(default, deserialize_with = "deserialize_nudged")]
     pub nudged: BTreeMap<String, String>,
     /// Routing key -> the input box pane currently observed going quiet, and
     /// since when.
@@ -65,6 +69,26 @@ pub struct State {
 /// notes): any ready coordinator may receive them, once project-wide.
 pub const GLOBAL_NUDGE: &str = "_";
 
+/// Accept both the pf.5 `{key: hash}` map and the pre-pf.5 single string,
+/// which was the hash for the one project-wide queue and moves onto
+/// [`GLOBAL_NUDGE`]. An empty legacy string means "nothing nudged yet".
+fn deserialize_nudged<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Legacy {
+        Map(BTreeMap<String, String>),
+        Single(String),
+    }
+    Ok(match Legacy::deserialize(deserializer)? {
+        Legacy::Map(map) => map,
+        Legacy::Single(s) if s.is_empty() => BTreeMap::new(),
+        Legacy::Single(s) => [(GLOBAL_NUDGE.to_string(), s)].into_iter().collect(),
+    })
+}
+
 /// The input-box wait recorded for one routing key.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
@@ -74,7 +98,21 @@ pub struct BoxWait {
 }
 
 pub fn load_state(project: &Project) -> State {
-    project::read_json(&project.state_dir().join("ticker.json")).unwrap_or_default()
+    let path = project.state_dir().join("ticker.json");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<State>(&text) {
+            Ok(state) => state,
+            Err(error) => {
+                // A parse failure starts empty, but it must never do so
+                // silently: falling back wiped PR/seen memory once when a
+                // field type changed (pf.4 String -> pf.5 map).
+                eprintln!("{}: parsing {}, starting empty: {error}", project.slug, path.display());
+                State::default()
+            }
+        },
+        // No file yet is the normal first run.
+        Err(_) => State::default(),
+    }
 }
 
 /// Only the ticker writes this file, so its own read-modify-write is safe; the
@@ -276,23 +314,46 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
     Ok(())
 }
 
+/// The event used for the one-time pf.5 migration note. It is the one kind of
+/// owner-less thread item that still nudges project-wide, so the notice
+/// actually reaches someone instead of hiding in `context`'s Unassigned area.
+pub const LEGACY_CHECKOUT_EVENT: &str = "checkout thread (legacy)";
+
 /// One-time note per still-live thread made with the removed `--kind
 /// checkout` placement: it keeps running in the repo's main checkout, and
 /// the note tells the coordinator how to replace it with a worktree thread.
-/// Deduped through `state.checkout_noted`, so it appears exactly once.
+/// Deduped through `state.checkout_noted`, so it appears exactly once. The
+/// id enters the dedup set only AFTER the item is written: a failed write
+/// must not suppress the one-time notice forever.
 pub fn note_legacy_checkouts(project: &Project, state: &mut State) -> Result<()> {
+    // The in-memory set can lag the disk across the slow tick and a
+    // concurrent `thread restart`; an existing note for the same
+    // (thread, event) makes the dedup race-proof regardless of whose state
+    // copy saves last.
+    let existing: std::collections::BTreeSet<String> = inbox::unhandled(project)
+        .into_iter()
+        .filter(|i| i.event == LEGACY_CHECKOUT_EVENT)
+        .map(|i| i.subject)
+        .collect();
     for t in thread::list(project) {
         if t.kind != thread::Kind::Checkout || !matches!(t.status, Status::Open | Status::Starting | Status::Failed) {
             continue;
         }
-        if !state.checkout_noted.insert(t.id.clone()) {
+        if state.checkout_noted.contains(&t.id) || existing.contains(&t.id) {
+            // Learn an externally-written note so we never reconsider it.
+            state.checkout_noted.insert(t.id.clone());
             continue;
         }
         let summary = format!(
             "{}: this is a checkout thread made before pf.5: it runs in the repository's main checkout, a placement that was removed. Resolve it with `thread resolve {} {}` and start a new thread for the remaining work; repository tasks now always run in their own worktree",
             thread_label(&t), project.slug, t.id
         );
-        inbox::write_thread(project, &t, "thread-state", "checkout thread (legacy)", &summary, "")?;
+        let result = inbox::write_thread(project, &t, "thread-state", LEGACY_CHECKOUT_EVENT, &summary, "");
+        if let Err(error) = result {
+            // Keep the id OUT of the set so a later tick/restart retries.
+            return Err(error);
+        }
+        state.checkout_noted.insert(t.id.clone());
     }
     Ok(())
 }
@@ -388,9 +449,17 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
     let mut queues: BTreeMap<String, Vec<inbox::Item>> = BTreeMap::new();
     for item in items {
         if crate::thread::validate_id(&item.subject).is_ok() {
-            // An owner-less thread item is claimed manually, never nudged.
-            if let Some(owner) = inbox::effective_owner(&item, &threads) {
-                queues.entry(owner).or_default().push(item);
+            // An owner-less thread item is claimed manually, never nudged —
+            // except the one-time legacy-checkout migration note, which is
+            // project-wide by design (every real pre-pf.5 checkout thread is
+            // owner-less, so the notice would otherwise never leave
+            // `context`'s Unassigned area).
+            match inbox::effective_owner(&item, &threads) {
+                Some(owner) => queues.entry(owner).or_default().push(item),
+                None if item.event == LEGACY_CHECKOUT_EVENT => {
+                    queues.entry(GLOBAL_NUDGE.to_string()).or_default().push(item)
+                }
+                None => {}
             }
         } else {
             queues.entry(GLOBAL_NUDGE.to_string()).or_default().push(item);
@@ -858,6 +927,93 @@ mod tests {
 
     fn at(text: &str) -> jiff::Timestamp {
         text.parse().unwrap()
+    }
+
+    #[test]
+    fn a_failed_legacy_note_write_does_not_poison_the_one_time_dedup() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let old = root.path().join("old-checkout");
+        std::fs::create_dir(&old).unwrap();
+        thread::allocate(&project, |t| {
+            t.kind = thread::Kind::Checkout;
+            t.status = thread::Status::Open;
+            t.title = "Legacy".into();
+            t.cwd = old.to_string_lossy().into_owned();
+        })
+        .unwrap();
+
+        let inbox = project.dir().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let mut perms = std::fs::metadata(&inbox).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o500); // readable, not writable
+        std::fs::set_permissions(&inbox, perms).unwrap();
+
+        let mut state = State::default();
+        let result = note_legacy_checkouts(&project, &mut state);
+        assert!(result.is_err(), "the write failure surfaces");
+        assert!(state.checkout_noted.is_empty(), "nothing is deduped before a successful write");
+
+        // Writable again: the note is delivered and only now deduped.
+        let mut perms = std::fs::metadata(&inbox).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&inbox, perms).unwrap();
+        note_legacy_checkouts(&project, &mut state).unwrap();
+        assert!(state.checkout_noted.contains("t-0001"));
+        assert_eq!(
+            inbox::unhandled(&project).iter().filter(|i| i.event == LEGACY_CHECKOUT_EVENT).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_pre_pf5_ticker_json_migrates_its_string_nudged_without_losing_other_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        // Exact pf.4 shape: `nudged` a single string (the global queue).
+        project::write_json(
+            &project.state_dir().join("ticker.json"),
+            &serde_json::json!({
+                "last_pr_check": "2026-10-25T08:00:00Z",
+                "prs": { "t-0001": {} },
+                "pr_ignored": { "t-0002": "https://x/y/3" },
+                "pr_line_noted": { "t-0003": "deadbeef" },
+                "routines": {},
+                "config_errors": ["cfg-hash-1"],
+                "nudged": "globalhash",
+                "box_pane": "w1:p1",
+                "box_empty_since": "2026-10-25T07:00:00Z",
+                "session_item_written": true,
+                "merged_seen": { "t-0004": "2026-10-25T06:00:00Z" }
+            }),
+        )
+        .unwrap();
+
+        let state = load_state(&project);
+        assert_eq!(state.nudged.get(GLOBAL_NUDGE).map(String::as_str), Some("globalhash"));
+        assert_eq!(state.nudged.len(), 1);
+        // The fields that silently resetting would re-fire PR notices and
+        // routines over must all survive the upgrade.
+        assert_eq!(state.last_pr_check, "2026-10-25T08:00:00Z");
+        assert!(state.prs.contains_key("t-0001"));
+        assert_eq!(state.pr_ignored.get("t-0002").map(String::as_str), Some("https://x/y/3"));
+        assert_eq!(state.pr_line_noted.get("t-0003").map(String::as_str), Some("deadbeef"));
+        assert!(state.config_errors.contains("cfg-hash-1"));
+        assert!(state.session_item_written);
+        assert_eq!(state.merged_seen.get("t-0004").map(String::as_str), Some("2026-10-25T06:00:00Z"));
+    }
+
+    #[test]
+    fn an_empty_legacy_nudged_string_and_corrupt_state_both_start_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let path = project.state_dir().join("ticker.json");
+        project::write_json(&path, &serde_json::json!({ "nudged": "" })).unwrap();
+        assert!(load_state(&project).nudged.is_empty());
+
+        std::fs::write(&path, "{ not json").unwrap();
+        assert_eq!(load_state(&project), State::default());
     }
 
     #[test]
