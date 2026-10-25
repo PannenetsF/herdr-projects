@@ -92,14 +92,22 @@ pub(crate) const IDENTITY_ENV_SCRUB: &[&str] = &[
     "DYLD_FRAMEWORK_PATH",
     "DYLD_FALLBACK_LIBRARY_PATH",
     "DYLD_FALLBACK_FRAMEWORK_PATH",
+    // "_debug" variant library selection: DYLD_IMAGE_SUFFIX=_interposing
+    // loads attacker-controlled sibling dylibs.
+    "DYLD_IMAGE_SUFFIX",
     "LD_PRELOAD",
     "LD_AUDIT",
     "LD_LIBRARY_PATH",
     "LD_ORIGIN_PATH",
     "LD_PROFILE",
+    // glibc 2.33+ tunables can redirect IFUNC resolution and (per distro)
+    // load modules; env-independent /etc/ld.so.preload remains uncloseable.
+    "__GLIBC_TUNABLES",
     "BASH_ENV",
     "ENV",
     "HERDR_BIN_PATH",
+    // Older/alternate herdr client var that also redirects the socket.
+    "HERDR_CLIENT_SOCKET_PATH",
 ];
 
 impl<'a> Herdr<'a> {

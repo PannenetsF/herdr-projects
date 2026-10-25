@@ -2527,28 +2527,39 @@ fn a_poisoned_herdr_bin_path_is_never_used_for_identity() {
 }
 
 #[test]
-fn a_marked_command_in_an_agentless_proven_pane_is_unverified_not_human() {
-    let world = World::new();
-    let socket = default_socket(&world);
-    let project = world.project("demo", "a.sock");
-    world.script_inside_herdr(&[&socket]);
-    world.procinfo_proves("w1:p1", 200, 9000, 500);
-    // The pane is proven but hosts NO agent row: a shell tab an agent drives
-    // with `pane run`. With the marker present it must not count as a person.
-    *world.agents.borrow_mut() = "[]".into();
-    let env = Env::for_test(
-        world.home.path(),
-        &[
-            ("HERDR_ENV", "1"),
-            ("HERDR_PANE_ID", "w1:p1"),
-            ("HERDR_SOCKET_PATH", &socket),
-            ("HP_TEST_SELF_PID", "9000"),
-            ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
-            ("HP_TEST_HERDR_BIN", "herdr"),
-        ],
-    );
-    let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
-    assert!(matches!(caller, coordinator::Caller::Unverified { .. }), "{caller:?}");
+fn a_command_in_an_agentless_proven_pane_is_unverified_with_or_without_marker() {
+    // The pane is process-fact proven but hosts NO agent row: a shell tab an
+    // agent drives with `pane run`/`send-text`. Client-side the marked and
+    // marker-stripped variants are indistinguishable, so BOTH must fail
+    // closed — a real person's terminal is never itself a Herdr pane.
+    for marked in [false, true] {
+        let world = World::new();
+        let socket = default_socket(&world);
+        let project = world.project("demo", "a.sock");
+        world.script_inside_herdr(&[&socket]);
+        world.procinfo_proves("w1:p1", 200, 9000, 500);
+        *world.agents.borrow_mut() = "[]".into();
+        let env = if marked {
+            Env::for_test(
+                world.home.path(),
+                &[
+                    ("HERDR_ENV", "1"),
+                    ("HERDR_PANE_ID", "w1:p1"),
+                    ("HERDR_SOCKET_PATH", &socket),
+                    ("HP_TEST_SELF_PID", "9000"),
+                    ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+                    ("HP_TEST_HERDR_BIN", "herdr"),
+                ],
+            )
+        } else {
+            stripped_caller_env(&world, "9000")
+        };
+        let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
+        assert!(
+            matches!(caller, coordinator::Caller::Unverified { .. }),
+            "marked={marked} -> {caller:?}"
+        );
+    }
 }
 
 #[test]

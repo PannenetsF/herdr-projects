@@ -230,7 +230,13 @@ pub(crate) fn classify(slug: &str, dir: &str, pane_id: &str, agent: &Agent) -> C
     if names::is_coordinator_name(slug, &agent.name) {
         return Caller::Coordinator { name: agent.name.clone(), pane: pane_id.to_string() };
     }
-    if agent.works_in(dir) || agent.name.starts_with("hpc-") || names::is_thread_name(slug, &agent.name) {
+    // Any hp machinery agent is a Stranger to THIS project unless it matched
+    // above: a worker of ANOTHER project (`hp-<other>-t-…`) must not fall
+    // through to Human just because its slug differs, and every `hpc-`
+    // coordinator family belongs to some project.
+    let other_projects_machine =
+        agent.name.starts_with("hpc-") || (agent.name.starts_with("hp-") && agent.name.contains("-t-"));
+    if agent.works_in(dir) || other_projects_machine || names::is_thread_name(slug, &agent.name) {
         return Caller::Stranger { pane: pane_id.to_string() };
     }
     Caller::Human

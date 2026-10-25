@@ -54,17 +54,19 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
         }
     };
 
-    let Some(facts) = Facts::gather(ctx) else {
+    let deadline = Instant::now() + IDENTITY_BUDGET;
+
+    let Some(facts) = Facts::gather(ctx, remaining(&deadline)) else {
         return fail(marked);
     };
-    let Some(home) = real_home(ctx) else {
+    let Some(home) = real_home(ctx, remaining(&deadline)) else {
         return fail(marked);
     };
-    let Some(bin) = trusted_herdr_bin(ctx, &home) else {
+    let Some(bin) = trusted_herdr_bin(ctx, &home, &deadline) else {
         return fail(marked);
     };
 
-    let sockets = registry_sockets(ctx, &bin, &home);
+    let sockets = registry_sockets(ctx, &bin, &home, remaining(&deadline));
     if sockets.is_empty() {
         return fail(marked);
     }
@@ -83,14 +85,13 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
         }
     }
 
-    let deadline = Instant::now() + IDENTITY_BUDGET;
     for socket in ordered_sockets {
         let herdr = Herdr::for_identity(&bin, &socket, ctx.runner);
         // Fast path: the pane owning this tty, its shell and foreground pids
         // in one call. A foreign tty resolves to the focused pane, whose pids
         // fail the proof.
         if let Ok(info) = herdr.call(&["pane", "process-info", "--current"], remaining(&deadline)) {
-            if let Some(caller) = proven_identity(&herdr, project, info.get("process_info"), &facts, marked) {
+            if let Some(caller) = proven_identity(&herdr, project, info.get("process_info"), &facts) {
                 return caller;
             }
         }
@@ -101,7 +102,7 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
                     herdr.call(&["pane", "process-info", "--pane", pane], remaining(&deadline))
                 {
                     if let Some(caller) =
-                        proven_identity(&herdr, project, info.get("process_info"), &facts, marked)
+                        proven_identity(&herdr, project, info.get("process_info"), &facts)
                     {
                         return caller;
                     }
@@ -123,7 +124,7 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
             else {
                 continue;
             };
-            if let Some(caller) = proven_identity(&herdr, project, info.get("process_info"), &facts, marked) {
+            if let Some(caller) = proven_identity(&herdr, project, info.get("process_info"), &facts) {
                 return caller;
             }
         }
@@ -142,7 +143,6 @@ fn proven_identity(
     project: &Project,
     info: Option<&serde_json::Value>,
     facts: &Facts,
-    marked: bool,
 ) -> Option<Caller> {
     let info = info?;
     let pane = info["pane_id"].as_str()?;
@@ -159,15 +159,13 @@ fn proven_identity(
         return Some(Caller::Unverified { pane: pane.to_string() });
     };
     let Some(agent) = agents.iter().find(|a| a.pane_id == pane) else {
-        // Proven inside a Herdr pane hosting no agent. Herdr injects the pane
-        // marker into every pane shell, so a marked command here is an agent
-        // driving a shell tab (`pane run`), not a person: fail closed. A
-        // genuinely marker-less command (a real terminal) never reaches here.
-        return Some(if marked {
-            Caller::Unverified { pane: pane.to_string() }
-        } else {
-            Caller::Human
-        });
+        // Proven inside a Herdr pane hosting no agent. There is no
+        // marker-free person path here: a real terminal is never a Herdr
+        // pane, while an agent can inject text into a shell tab (`pane run`/
+        // `send-text`) and then strip HERDR_ENV. Treat every proven,
+        // unaccounted-for pane as fail-closed; rescue runs in a terminal
+        // outside Herdr.
+        return Some(Caller::Unverified { pane: pane.to_string() });
     };
     let dir_path = project.canonical_dir();
     let dir = dir_path.to_string_lossy();
@@ -176,9 +174,9 @@ fn proven_identity(
 
 /// Running sessions the genuine binary lists from the real-home registry.
 /// Environment-set sockets are never consulted.
-fn registry_sockets(ctx: &Ctx, bin: &str, home: &Path) -> BTreeSet<PathBuf> {
+fn registry_sockets(ctx: &Ctx, bin: &str, home: &Path, timeout: Duration) -> BTreeSet<PathBuf> {
     let mut sockets = BTreeSet::new();
-    let cmd = Cmd::new(bin, QUERY_TIMEOUT)
+    let cmd = Cmd::new(bin, timeout)
         .args(["session", "list", "--json"])
         .env("HOME", home.to_string_lossy())
         .env_remove("HERDR_SOCKET_PATH")
@@ -243,13 +241,13 @@ fn trusted_resolved_prefix(path: &Path, home: &Path) -> bool {
 
 /// The first absolute candidate that exists, resolves under a trusted prefix
 /// and reports a supported version with a scrubbed environment.
-fn trusted_herdr_bin(ctx: &Ctx, raw_home: &Path) -> Option<String> {
+fn trusted_herdr_bin(ctx: &Ctx, raw_home: &Path, deadline: &Instant) -> Option<String> {
     // Tests script the binary explicitly; when they do not, there is no
     // trusted binary (the candidate scan is production-only so a test host's
     // real Homebrew install can't make identity nondeterministic).
     #[cfg(test)]
     {
-        let _ = raw_home;
+        let _ = (raw_home, deadline);
         return ctx.env.var("HP_TEST_HERDR_BIN").map(str::to_string);
     }
 
@@ -257,13 +255,20 @@ fn trusted_herdr_bin(ctx: &Ctx, raw_home: &Path) -> Option<String> {
     {
         let home = std::fs::canonicalize(raw_home).unwrap_or_else(|_| raw_home.to_path_buf());
         for candidate in bin_candidates(raw_home) {
+            if deadline.elapsed() >= IDENTITY_BUDGET {
+                break;
+            }
             let Ok(resolved) = std::fs::canonicalize(&candidate) else {
                 continue;
             };
             if !resolved.is_file() || !trusted_resolved_prefix(&resolved, &home) {
                 continue;
             }
-            let cmd = scrub(Cmd::new(resolved.to_string_lossy().as_ref(), QUERY_TIMEOUT).arg("--version"));
+            let cmd = scrub(Cmd::new(
+                resolved.to_string_lossy().as_ref(),
+                remaining(deadline),
+            )
+            .arg("--version"));
             let Ok(out) = ctx.runner.run(&cmd) else {
                 continue;
             };
@@ -291,16 +296,17 @@ pub(crate) fn scrub(mut cmd: Cmd) -> Cmd {
 /// `~` from the account database when `HOME` is unset — macOS bash and Linux
 /// dash both do this for a non-interactive `sh -c` — so ask a cleaned
 /// `/bin/sh` rather than parsing platform-specific `id -P` / `getent` output.
-fn real_home(ctx: &Ctx) -> Option<PathBuf> {
+fn real_home(ctx: &Ctx, timeout: Duration) -> Option<PathBuf> {
     // In tests the scripted world home stands in for the passwd home.
     #[cfg(test)]
     {
+        let _ = timeout;
         return ctx.env.var("HP_TEST_REAL_HOME").map(PathBuf::from);
     }
     #[cfg(not(test))]
     {
         let cmd = scrub(
-            Cmd::new("/bin/sh", QUERY_TIMEOUT)
+            Cmd::new("/bin/sh", timeout)
                 .args(["-c", "printf %s ~"])
                 .env_remove("HOME")
                 .env_remove("XDG_CONFIG_HOME"),

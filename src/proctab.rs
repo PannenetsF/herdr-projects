@@ -16,10 +16,9 @@ use std::time::Duration;
 use crate::paths::Ctx;
 use crate::runner::Cmd;
 
-const PS_TIMEOUT: Duration = Duration::from_secs(2);
 /// Absolute candidates first: a PATH-resolved `ps` could be shadowed by the
 /// very agent whose identity is being checked.
-const PS_BINS: &[&str] = &["/bin/ps", "/usr/bin/ps", "ps"];
+const PS_BINS: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 /// Ancestor chains are short in practice; this only needs to outrun a nesting
 /// of shells, not to be unbounded.
 const MAX_ANCESTORS: usize = 64;
@@ -44,11 +43,12 @@ pub(crate) struct Facts {
 
 impl Facts {
     /// Gather facts from the real process table through `runner` (so tests
-    /// script it like every other external command).
-    pub(crate) fn gather(ctx: &Ctx) -> Option<Facts> {
+    /// script it like every other external command). `timeout` is the
+    /// caller's remaining identity budget.
+    pub(crate) fn gather(ctx: &Ctx, timeout: Duration) -> Option<Facts> {
         let mut output = None;
         for bin in PS_BINS {
-            let mut cmd = Cmd::new(*bin, PS_TIMEOUT).args(["-ax", "-o", "pid=,ppid=,pgid=,comm="]);
+            let mut cmd = Cmd::new(*bin, timeout).args(["-ax", "-o", "pid=,ppid=,pgid=,comm="]);
             // Even an absolute ps can be interposed on via the dynamic loader
             // on non-Apple-platform Linux; strip every interposition var.
             for var in crate::herdr::IDENTITY_ENV_SCRUB {
