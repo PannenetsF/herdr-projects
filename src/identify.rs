@@ -2,123 +2,147 @@
 //!
 //! The old rule trusted two things an agent running inside Herdr fully
 //! controls: the `HERDR_*` environment markers (strippable with `env -u`) and
-//! the socket the CLI talks to (redirectable to a fake server). Both let a
-//! coordinator downgrade itself to a "human" and then drive owner-gated
+//! the socket/binary the CLI talks to (redirectable to a fake server). Both
+//! let a coordinator downgrade itself to a "human" and then drive owner-gated
 //! threads of every other coordinator.
 //!
 //! The rule now:
-//!   1. Gather THIS process's ancestry/process-group facts from `ps`.
-//!   2. Build the set of TRUSTED sockets only from disk: the passwd user's
-//!      real home (never `$HOME`, which may point at a second herdr server)
-//!      and this project's recorded coordinator socket. Environment-set
-//!      sockets are never consulted.
-//!   3. Enumerate every pane of every trusted socket (`pane list`) and read
-//!      its `process-info`; the one whose shell pid or foreground group the
-//!      ps facts prove contains THIS process is its pane. The injected
-//!      `HERDR_PANE_ID` and the tty's `pane current` answer are tried first
-//!      only as hints — `pane current` returns the focused pane for a tty no
-//!      pane owns, so it can never be proof, and a stale hint cannot hide the
-//!      real pane because the full enumeration always runs afterwards.
-//!   4. No trusted socket proves a pane: that is a genuine terminal outside
-//!      Herdr, CI or a detached daemon → [`Caller::Human`]. A process proven
-//!      inside Herdr but unaccounted for (agent row missing, server failing)
-//!      fails closed through the classify/agent steps.
+//!   1. Gather THIS process's ancestry/process-group facts from an absolute
+//!      `ps` with loader-interposition vars scrubbed.
+//!   2. Locate a genuine herdr binary from fixed absolute paths under the
+//!      passwd user's real home and system prefixes — never `$PATH` or
+//!      `HERDR_BIN_PATH` — and version-probe it with a scrubbed environment.
+//!   3. Trust ONLY running sessions that binary lists from the real-home
+//!      registry (never `$HOME`). The project's recorded socket is used only
+//!      for ordering and only when it is itself one of those sessions: a
+//!      socket path written into `coordinator.json` is not a trust root.
+//!   4. For each trusted socket, `pane process-info --current` proves the
+//!      pane from the ps facts in one call; the marker hint and an exhaustive
+//!      (deadline-bounded) pane scan back it up. The focused pane a foreign
+//!      tty resolves to cannot spoof anything: its pids fail the proof.
+//!
+//! Residual threats this client cannot settle (same uid is not a security
+//! boundary against Herdr itself): a genuinely installed rogue `herdr
+//! --session`, and a fully double-forked orphan indistinguishable from a
+//! launchd job. Both need server-side ownership rules; see COORDINATOR.md.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::coordinator::Caller;
-use crate::herdr::{Herdr, SessionInfo};
+use crate::herdr::{Herdr, SessionInfo, IDENTITY_ENV_SCRUB, MIN_VERSION};
 use crate::paths::Ctx;
 use crate::proctab::Facts;
 use crate::project::Project;
 use crate::runner::Cmd;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Total wall time spent proving a caller. Local calls are ~7ms, so even a
+/// full 55-pane sweep fits; a hung session can never stall a command longer.
+const IDENTITY_BUDGET: Duration = Duration::from_millis(900);
 
 /// Pane identity, fully proven by process facts.
 pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
-    let Some(facts) = Facts::gather(ctx) else {
-        return if marked {
+    let fail = |marked: bool| -> Caller {
+        if marked {
             Caller::Unverified { pane: String::new() }
         } else {
-            // ps itself failed with no Herdr markers: a real terminal or CI,
-            // not a pane hiding its identity.
+            // No marker and no provable pane: a real terminal, CI or a
+            // detached process the user themselves launched.
             Caller::Human
-        };
+        }
     };
 
-    for socket in trusted_sockets(ctx, project) {
-        let herdr = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
+    let Some(facts) = Facts::gather(ctx) else {
+        return fail(marked);
+    };
+    let Some(home) = real_home(ctx) else {
+        return fail(marked);
+    };
+    let Some(bin) = trusted_herdr_bin(ctx, &home) else {
+        return fail(marked);
+    };
 
-        // Fast path: `process-info --current` resolves the pane owning this
-        // tty and reports its shell/foreground pids in one call. Proven by
-        // the ps facts, this settles identity for every ordinary agent call,
-        // marked or stripped. A tty no pane owns resolves to the focused
-        // pane, whose pids fail the proof, so it can't spoof anything.
-        if let Ok(info) = herdr.call(&["pane", "process-info", "--current"], QUERY_TIMEOUT) {
-            if let Some(caller) = proven_identity(&herdr, project, info.get("process_info"), &facts) {
+    let sockets = registry_sockets(ctx, &bin, &home);
+    if sockets.is_empty() {
+        return fail(marked);
+    }
+    // The project's recorded socket only sets ordering; it must already be a
+    // registry session, so a rewritten coordinator.json cannot add a fake one.
+    let mut ordered_sockets = Vec::new();
+    if let Some(record) = project.coordinator() {
+        let recorded = PathBuf::from(record.socket);
+        if sockets.contains(&recorded) {
+            ordered_sockets.push(recorded);
+        }
+    }
+    for s in sockets.iter() {
+        if !ordered_sockets.contains(s) {
+            ordered_sockets.push(s.clone());
+        }
+    }
+
+    let deadline = Instant::now() + IDENTITY_BUDGET;
+    for socket in ordered_sockets {
+        let herdr = Herdr::for_identity(&bin, &socket, ctx.runner);
+        // Fast path: the pane owning this tty, its shell and foreground pids
+        // in one call. A foreign tty resolves to the focused pane, whose pids
+        // fail the proof.
+        if let Ok(info) = herdr.call(&["pane", "process-info", "--current"], remaining(&deadline)) {
+            if let Some(caller) = proven_identity(&herdr, project, info.get("process_info"), &facts, marked) {
                 return caller;
             }
         }
-
-        // Marker hint when the tty path missed (an odd subshell that kept
-        // the injected pane id).
+        // Marker hint for an odd subshell that kept the injected pane id.
         if marked {
             if let Some(pane) = ctx.env.var("HERDR_PANE_ID") {
-                if let Ok(info) = herdr.call(&["pane", "process-info", "--pane", pane], QUERY_TIMEOUT) {
-                    if let Some(caller) = proven_identity(&herdr, project, info.get("process_info"), &facts) {
+                if let Ok(info) =
+                    herdr.call(&["pane", "process-info", "--pane", pane], remaining(&deadline))
+                {
+                    if let Some(caller) =
+                        proven_identity(&herdr, project, info.get("process_info"), &facts, marked)
+                    {
                         return caller;
                     }
                 }
             }
         }
-
-        // Last resort: enumerate every pane. A genuinely foreign tty (a real
-        // terminal, CI) proves nothing and reaches here; it is rare, so the
-        // sequential scan cost is acceptable.
-        let Some(panes) = list_panes(&herdr) else { continue };
+        // Last resort: enumerate every pane on a bounded deadline.
+        let Ok(list) = herdr.call(&["pane", "list"], remaining(&deadline)) else {
+            continue;
+        };
+        let Some(panes) = list["panes"].as_array() else { continue };
         for pane in panes {
-            let Ok(info) = herdr.call(&["pane", "process-info", "--pane", &pane], QUERY_TIMEOUT) else {
+            if deadline.elapsed() >= IDENTITY_BUDGET {
+                break;
+            }
+            let Some(pane) = pane["pane_id"].as_str() else { continue };
+            let Ok(info) =
+                herdr.call(&["pane", "process-info", "--pane", pane], remaining(&deadline))
+            else {
                 continue;
             };
-            if let Some(caller) = proven_identity(&herdr, project, info.get("process_info"), &facts) {
+            if let Some(caller) = proven_identity(&herdr, project, info.get("process_info"), &facts, marked) {
                 return caller;
             }
         }
     }
-
-    // No trusted server accounts for the process. The marked case claims a
-    // pane; fail closed. Everything else is an ordinary terminal, CI or a
-    // detached process.
-    if marked {
-        Caller::Unverified { pane: String::new() }
-    } else {
-        Caller::Human
-    }
+    fail(marked)
 }
 
-/// All pane ids a trusted server knows.
-fn list_panes(herdr: &Herdr) -> Option<Vec<String>> {
-    let result = herdr.call(&["pane", "list"], QUERY_TIMEOUT).ok()?;
-    let panes = result["panes"].as_array()?;
-    Some(
-        panes
-            .iter()
-            .filter_map(|p| p["pane_id"].as_str().map(str::to_string))
-            .collect(),
-    )
+fn remaining(deadline: &Instant) -> Duration {
+    QUERY_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())).max(Duration::from_millis(1))
 }
 
 /// Classifies the caller when a server's `process_info` proves its pane
-/// contains THIS process. Returns None when the facts do not match (so the
-/// caller keeps searching other panes/sockets).
+/// contains THIS process. Returns None when the facts do not match.
 fn proven_identity(
     herdr: &Herdr,
     project: &Project,
     info: Option<&serde_json::Value>,
     facts: &Facts,
+    marked: bool,
 ) -> Option<Caller> {
     let info = info?;
     let pane = info["pane_id"].as_str()?;
@@ -135,50 +159,46 @@ fn proven_identity(
         return Some(Caller::Unverified { pane: pane.to_string() });
     };
     let Some(agent) = agents.iter().find(|a| a.pane_id == pane) else {
-        // Proven inside a Herdr pane that hosts no agent: a person in the
-        // pane's own shell.
-        return Some(Caller::Human);
+        // Proven inside a Herdr pane hosting no agent. Herdr injects the pane
+        // marker into every pane shell, so a marked command here is an agent
+        // driving a shell tab (`pane run`), not a person: fail closed. A
+        // genuinely marker-less command (a real terminal) never reaches here.
+        return Some(if marked {
+            Caller::Unverified { pane: pane.to_string() }
+        } else {
+            Caller::Human
+        });
     };
     let dir_path = project.canonical_dir();
     let dir = dir_path.to_string_lossy();
     Some(crate::coordinator::classify(&project.slug, &dir, pane, agent))
 }
 
-/// Sockets allowed to answer identity questions: the sessions of the passwd
-/// user's real home and the project's own recorded socket. Environment-set
-/// sockets are deliberately excluded.
-fn trusted_sockets(ctx: &Ctx, project: &Project) -> Vec<PathBuf> {
+/// Running sessions the genuine binary lists from the real-home registry.
+/// Environment-set sockets are never consulted.
+fn registry_sockets(ctx: &Ctx, bin: &str, home: &Path) -> BTreeSet<PathBuf> {
     let mut sockets = BTreeSet::new();
-
-    if let Some(home) = real_home(ctx) {
-        let cmd = Cmd::new(ctx.env.herdr_bin(), QUERY_TIMEOUT)
-            .args(["session", "list", "--json"])
-            .env("HOME", home.to_string_lossy())
-            .env_remove("HERDR_SOCKET_PATH")
-            .env_remove("HERDR_SESSION")
-            .env_remove("XDG_CONFIG_HOME");
-        if let Ok(out) = ctx.runner.run(&cmd) {
-            if out.success() {
-                if let Some(list) = parse_sessions(&out.stdout) {
-                    // Every session the real user's CLI lists from disk is
-                    // theirs; only running ones can answer a query.
-                    for s in list {
-                        if s.running {
-                            sockets.insert(s.socket_path);
-                        }
-                    }
-                }
+    let cmd = Cmd::new(bin, QUERY_TIMEOUT)
+        .args(["session", "list", "--json"])
+        .env("HOME", home.to_string_lossy())
+        .env_remove("HERDR_SOCKET_PATH")
+        .env_remove("HERDR_SESSION")
+        .env_remove("XDG_CONFIG_HOME");
+    let cmd = scrub(cmd);
+    let Ok(out) = ctx.runner.run(&cmd) else {
+        return sockets;
+    };
+    if !out.success() {
+        return sockets;
+    }
+    if let Some(list) = parse_sessions(&out.stdout) {
+        for s in list {
+            if s.running {
+                sockets.insert(s.socket_path);
             }
         }
     }
-
-    if let Some(record) = project.coordinator() {
-        if !record.socket.is_empty() {
-            sockets.insert(PathBuf::from(record.socket));
-        }
-    }
-
-    sockets.into_iter().collect()
+    sockets
 }
 
 fn parse_sessions(stdout: &str) -> Option<Vec<SessionInfo>> {
@@ -190,11 +210,78 @@ fn parse_sessions(stdout: &str) -> Option<Vec<SessionInfo>> {
     Some(reply.sessions)
 }
 
+/// Absolute, registry-orthogonal locations a genuine herdr client lives at.
+/// `$PATH` and `HERDR_BIN_PATH` are deliberately absent.
+fn bin_candidates(home: &Path) -> Vec<PathBuf> {
+    let mut v = vec![
+        PathBuf::from("/opt/homebrew/bin/herdr"),
+        PathBuf::from("/usr/local/bin/herdr"),
+        home.join(".local/bin/herdr"),
+        home.join(".nix-profile/bin/herdr"),
+    ];
+    // A Nix home-manager install is a symlink into /nix/store; add the
+    // per-user profile path the remote hosts use.
+    if let Some(profile) = std::env::var_os("NIX_PROFILES") {
+        for dir in std::env::split_paths(&std::path::PathBuf::from(profile)) {
+            v.push(dir.join("bin/herdr"));
+        }
+    }
+    v
+}
+
+/// Prefixes a resolved herdr executable may legitimately sit under. A symlink
+/// in a trusted dir that resolves into /tmp (or anywhere else) is rejected.
+fn trusted_resolved_prefix(path: &Path, home: &Path) -> bool {
+    const SYSTEM: &[&str] = &["/opt/homebrew/", "/usr/local/", "/nix/store/"];
+    SYSTEM.iter().any(|p| path.starts_with(p))
+        || path.starts_with(home.join(".local"))
+        || path.starts_with(home.join(".nix-profile"))
+}
+
+/// The first absolute candidate that exists, resolves under a trusted prefix
+/// and reports a supported version with a scrubbed environment.
+fn trusted_herdr_bin(ctx: &Ctx, home: &Path) -> Option<String> {
+    // Tests script the binary explicitly; when they do not, there is no
+    // trusted binary (the candidate scan is production-only so a test host's
+    // real Homebrew install can't make identity nondeterministic).
+    #[cfg(test)]
+    return ctx.env.var("HP_TEST_HERDR_BIN").map(str::to_string);
+
+    #[cfg(not(test))]
+    for candidate in bin_candidates(home) {
+        let Ok(resolved) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        if !resolved.is_file() || !trusted_resolved_prefix(&resolved, home) {
+            continue;
+        }
+        let cmd = scrub(Cmd::new(resolved.to_string_lossy().as_ref(), QUERY_TIMEOUT).arg("--version"));
+        let Ok(out) = ctx.runner.run(&cmd) else {
+            continue;
+        };
+        let text = [out.stdout.trim(), out.stderr.trim()].into_iter().find(|t| !t.is_empty()).unwrap_or("");
+        if let Some(version) = crate::herdr::parse_version(text) {
+            if version >= MIN_VERSION {
+                return Some(resolved.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Scrubs loader-interposition and shell-hijack variables from a command.
+pub(crate) fn scrub(mut cmd: Cmd) -> Cmd {
+    for var in IDENTITY_ENV_SCRUB {
+        cmd = cmd.env_remove(*var);
+    }
+    cmd
+}
+
 /// The passwd user's real home, found without trusting `HOME` (which may
 /// point at a second herdr server the attacker runs). A login shell expands
-/// `~` from the account database when `HOME` is unset — same behaviour in
-/// macOS bash and Linux dash — so ask a cleaned `/bin/sh` rather than parsing
-/// platform-specific `id -P` / `getent` output.
+/// `~` from the account database when `HOME` is unset — macOS bash and Linux
+/// dash both do this for a non-interactive `sh -c` — so ask a cleaned
+/// `/bin/sh` rather than parsing platform-specific `id -P` / `getent` output.
 fn real_home(ctx: &Ctx) -> Option<PathBuf> {
     // In tests the scripted world home stands in for the passwd home.
     #[cfg(test)]
@@ -203,10 +290,12 @@ fn real_home(ctx: &Ctx) -> Option<PathBuf> {
     }
     #[cfg(not(test))]
     {
-        let cmd = Cmd::new("/bin/sh", QUERY_TIMEOUT)
-            .args(["-c", "printf %s ~"])
-            .env_remove("HOME")
-            .env_remove("XDG_CONFIG_HOME");
+        let cmd = scrub(
+            Cmd::new("/bin/sh", QUERY_TIMEOUT)
+                .args(["-c", "printf %s ~"])
+                .env_remove("HOME")
+                .env_remove("XDG_CONFIG_HOME"),
+        );
         let out = ctx.runner.run(&cmd).ok()?;
         let home = out.stdout.trim();
         if !out.success() || home.is_empty() {

@@ -8,7 +8,8 @@ use serde::Deserialize;
 
 use crate::runner::{Cmd, Runner};
 
-pub const MIN_VERSION: Version = Version(0, 9, 1);
+/// 0.9.5 is required for `pane process-info`, the process-fact identity probe.
+pub const MIN_VERSION: Version = Version(0, 9, 5);
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -76,7 +77,30 @@ pub struct Herdr<'a> {
     /// A saved SSH machine: every call is forwarded as `herdr --machine M ...`.
     machine: Option<String>,
     runner: &'a dyn Runner,
+    /// Identity checks only: the binary is already an absolute, vetted path
+    /// and the child environment is scrubbed of interposition/override vars.
+    identity: bool,
 }
+
+/// Variables an agent could use to interpose on, or redirect, the herdr
+/// client that proves its identity. `DYLD_*` is refused by Apple-platform
+/// binaries but applies to the Homebrew herdr; `LD_*` matters on remote
+/// Linux; `BASH_ENV`/`ENV` can hijack the `/bin/sh` home probe.
+pub(crate) const IDENTITY_ENV_SCRUB: &[&str] = &[
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_ORIGIN_PATH",
+    "LD_PROFILE",
+    "BASH_ENV",
+    "ENV",
+    "HERDR_BIN_PATH",
+];
 
 impl<'a> Herdr<'a> {
     pub fn new(bin: impl Into<String>, socket: impl Into<PathBuf>, runner: &'a dyn Runner) -> Self {
@@ -85,7 +109,15 @@ impl<'a> Herdr<'a> {
             socket: socket.into(),
             machine: None,
             runner,
+            identity: false,
         }
+    }
+
+    /// The hardened constructor for caller-identity queries: `bin` must be an
+    /// absolute, registry-trusted path; the child never inherits an
+    /// interposable loader, a shell-init hook or `HERDR_BIN_PATH`.
+    pub fn for_identity(bin: impl Into<String>, socket: impl Into<PathBuf>, runner: &'a dyn Runner) -> Self {
+        Herdr { identity: true, ..Herdr::new(bin, socket, runner) }
     }
 
     /// The same session, with calls forwarded to a saved machine.
@@ -95,6 +127,7 @@ impl<'a> Herdr<'a> {
             socket: self.socket.clone(),
             machine: (!machine.is_empty()).then(|| machine.to_string()),
             runner: self.runner,
+            identity: self.identity,
         }
     }
 
@@ -108,7 +141,12 @@ impl<'a> Herdr<'a> {
         if !self.socket.as_os_str().is_empty() {
             cmd = cmd.env("HERDR_SOCKET_PATH", self.socket.to_string_lossy());
         }
-        let cmd = cmd.env_remove("HERDR_SESSION");
+        let mut cmd = cmd.env_remove("HERDR_SESSION");
+        if self.identity {
+            for var in IDENTITY_ENV_SCRUB {
+                cmd = cmd.env_remove(*var);
+            }
+        }
         match &self.machine {
             Some(machine) => cmd.args(["--machine", machine]),
             None => cmd,

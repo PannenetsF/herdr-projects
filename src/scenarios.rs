@@ -2344,6 +2344,7 @@ fn a_coordinator_started_thread_is_owned_by_its_registered_name_and_persists_it(
             ("HERDR_PANE_ID", "w2:p1"),
             ("HERDR_SOCKET_PATH", socket_b.to_str().unwrap()),
             ("HP_TEST_SELF_PID", "9100"),
+            ("HP_TEST_HERDR_BIN", "herdr"),
             ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
         ],
     );
@@ -2417,6 +2418,7 @@ fn stripped_caller_env(world: &World, self_pid: &str) -> Env {
         &[
             ("HP_TEST_SELF_PID", self_pid),
             ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+            ("HP_TEST_HERDR_BIN", "herdr"),
         ],
     )
 }
@@ -2457,6 +2459,7 @@ fn a_socket_outside_the_trusted_set_cannot_answer_identity_questions() {
             ("HERDR_PANE_ID", "w1:p1"),
             ("HERDR_SOCKET_PATH", fake.to_str().unwrap()),
             ("HP_TEST_SELF_PID", "9000"),
+            ("HP_TEST_HERDR_BIN", "herdr"),
             ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
         ],
     );
@@ -2467,6 +2470,85 @@ fn a_socket_outside_the_trusted_set_cannot_answer_identity_questions() {
             && c.env.iter().any(|(k, v)| k == "HERDR_SOCKET_PATH" && v.ends_with("fake.sock"))
     });
     assert!(!queried_fake, "identity must never be proven by the env-supplied socket");
+}
+
+#[test]
+fn a_recorded_socket_that_left_the_session_registry_is_not_a_trust_root() {
+    let world = World::new();
+    let registry_socket = default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    // The on-disk record is rewritten to a rogue socket the real registry
+    // does not list. The registry knows only the genuine session.
+    let rogue = world.home.path().join("rogue.sock");
+    project.update_coordinator(|c| c.socket = rogue.to_string_lossy().into_owned()).unwrap();
+    world.script_inside_herdr(&[&registry_socket]);
+    // The genuine registry session cannot prove this command's pane.
+    *world.current.borrow_mut() = "w9:p9".into();
+    world.procinfo.borrow_mut().push((
+        "w9:p9".into(),
+        ok(r#"{"result":{"process_info":{"pane_id":"w9:p9","shell_pid":4242,"foreground_process_group_id":4242,"foreground_processes":[{"pid":4242}]}}}"#).stdout,
+    ));
+
+    let env = stripped_caller_env(&world, "9000");
+    let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
+    assert_eq!(caller, coordinator::Caller::Human, "{caller:?}");
+    let queried_rogue = world
+        .runner
+        .calls
+        .borrow()
+        .iter()
+        .any(|c| c.env.iter().any(|(k, v)| k == "HERDR_SOCKET_PATH" && v.ends_with("rogue.sock")));
+    assert!(!queried_rogue, "a rewritten coordinator.json must not add a trusted server");
+}
+
+#[test]
+fn a_poisoned_herdr_bin_path_is_never_used_for_identity() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    world.script_inside_herdr(&[&socket]);
+    // No scripted trusted binary: identity cannot run, regardless of
+    // HERDR_BIN_PATH, which the normal (non-identity) code paths honor.
+    let env = Env::for_test(
+        world.home.path(),
+        &[
+            ("HERDR_ENV", "1"),
+            ("HERDR_PANE_ID", "w1:p1"),
+            ("HERDR_BIN_PATH", "/tmp/fake-herdr"),
+            ("HP_TEST_SELF_PID", "9000"),
+            ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+        ],
+    );
+    let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
+    assert!(matches!(caller, coordinator::Caller::Unverified { .. }), "{caller:?}");
+    let spawned_fake =
+        world.runner.calls.borrow().iter().any(|c| c.program == "/tmp/fake-herdr");
+    assert!(!spawned_fake, "identity must resolve its own binary, never HERDR_BIN_PATH");
+}
+
+#[test]
+fn a_marked_command_in_an_agentless_proven_pane_is_unverified_not_human() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    world.script_inside_herdr(&[&socket]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
+    // The pane is proven but hosts NO agent row: a shell tab an agent drives
+    // with `pane run`. With the marker present it must not count as a person.
+    *world.agents.borrow_mut() = "[]".into();
+    let env = Env::for_test(
+        world.home.path(),
+        &[
+            ("HERDR_ENV", "1"),
+            ("HERDR_PANE_ID", "w1:p1"),
+            ("HERDR_SOCKET_PATH", &socket),
+            ("HP_TEST_SELF_PID", "9000"),
+            ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+            ("HP_TEST_HERDR_BIN", "herdr"),
+        ],
+    );
+    let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
+    assert!(matches!(caller, coordinator::Caller::Unverified { .. }), "{caller:?}");
 }
 
 #[test]
@@ -2502,6 +2584,7 @@ fn the_focused_pane_fallback_for_a_foreign_tty_is_not_accepted_as_proof() {
             ("HERDR_PANE_ID", "w9:p9"),
             ("HERDR_SOCKET_PATH", &socket),
             ("HP_TEST_SELF_PID", "9000"),
+            ("HP_TEST_HERDR_BIN", "herdr"),
             ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
         ],
     );
@@ -3104,6 +3187,7 @@ fn live_pane_env(world: &World, pane: &str) -> Env {
             ("HERDR_SOCKET_PATH", &default_socket(world)),
             ("HP_TEST_SELF_PID", "9000"),
             ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+            ("HP_TEST_HERDR_BIN", "herdr"),
         ],
     )
 }
@@ -3322,6 +3406,7 @@ fn two_coordinator_world() -> (World, Project, Env, Env) {
             ("HERDR_PANE_ID", "w1:p1"),
             ("HERDR_SOCKET_PATH", socket_a.to_str().unwrap()),
             ("HP_TEST_SELF_PID", "9000"),
+            ("HP_TEST_HERDR_BIN", "herdr"),
             ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
         ],
     );
@@ -3332,6 +3417,7 @@ fn two_coordinator_world() -> (World, Project, Env, Env) {
             ("HERDR_PANE_ID", "w2:p1"),
             ("HERDR_SOCKET_PATH", socket_b.to_str().unwrap()),
             ("HP_TEST_SELF_PID", "9100"),
+            ("HP_TEST_HERDR_BIN", "herdr"),
             ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
         ],
     );

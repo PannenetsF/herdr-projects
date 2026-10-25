@@ -48,10 +48,13 @@ impl Facts {
     pub(crate) fn gather(ctx: &Ctx) -> Option<Facts> {
         let mut output = None;
         for bin in PS_BINS {
-            let Ok(out) = ctx
-                .runner
-                .run(&Cmd::new(*bin, PS_TIMEOUT).args(["-ax", "-o", "pid=,ppid=,pgid=,comm="]))
-            else {
+            let mut cmd = Cmd::new(*bin, PS_TIMEOUT).args(["-ax", "-o", "pid=,ppid=,pgid=,comm="]);
+            // Even an absolute ps can be interposed on via the dynamic loader
+            // on non-Apple-platform Linux; strip every interposition var.
+            for var in crate::herdr::IDENTITY_ENV_SCRUB {
+                cmd = cmd.env_remove(*var);
+            }
+            let Ok(out) = ctx.runner.run(&cmd) else {
                 continue;
             };
             if out.success() {

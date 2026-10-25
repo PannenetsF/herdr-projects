@@ -525,14 +525,14 @@ mod tests {
         );
         assert!(!healthy);
         assert!(text.contains("[FAIL] herdr: 0.9.0"), "{text}");
-        assert!(text.contains("0.9.1 or later"));
+        assert!(text.contains("0.9.5 or later"));
     }
 
     #[test]
     fn new_herdr_passes_and_warnings_do_not_fail() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         let (text, healthy) = report(
             &env,
@@ -554,7 +554,7 @@ mod tests {
     fn missing_priming_files_are_reported_and_fixed() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         // A project made before AGENTS.md existed: no priming files, no uploads/.
         let project = project::create(&root, "demo", "", vec![]).unwrap();
@@ -590,7 +590,7 @@ mod tests {
                 runner.on_fn(on_host, |_| Ok(ok("eliasstravik\n")));
             }
             runner.on("gh api user", fail(1, "HTTP 401: Requires authentication"));
-            for (needle, output) in [("herdr --version", "herdr 0.9.1\n"), ("git --version", "git 2\n"), ("gh --version", "gh 2\n")] {
+            for (needle, output) in [("herdr --version", "herdr 0.9.5\n"), ("git --version", "git 2\n"), ("gh --version", "gh 2\n")] {
                 runner.on(needle, ok(output));
             }
             let (text, _) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner, false, None);
@@ -608,7 +608,7 @@ mod tests {
     fn routines_skipped_for_want_of_a_coordinator_are_named() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         std::fs::write(project.dir().join("routines/standup.md"), "+++\nschedule = \"every 5m\"\n+++\nGo.\n").unwrap();
@@ -627,7 +627,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let claude = home.path().join("claude-config");
         let env = Env::for_test(home.path(), &[("CLAUDE_CONFIG_DIR", claude.to_str().unwrap())]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         let cfg = home.path().join("cfg");
         let flags = SessionFlags::default();
@@ -671,7 +671,7 @@ mod tests {
     fn colliding_agent_names_fail_the_report() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         let long = "x".repeat(30);
         for suffix in ["a", "b"] {
@@ -687,7 +687,7 @@ mod tests {
     fn an_unregistered_root_pane_is_warned_with_the_adopt_command_and_fix_never_renames() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         let dir = project.canonical_dir().to_string_lossy().into_owned();
