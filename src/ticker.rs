@@ -586,12 +586,14 @@ fn mark_failed(project: &Project, id: &str, error: String) -> Result<steps::Tran
         t.status = thread::Status::Failed;
         t.error = error;
         t.last_group = thread::Group::WaitingOnYou.token().to_string();
+        // A failed launch is a rule-3 cause: always for the human.
+        t.audience = thread::Audience::Human.token().to_string();
         t.state_line = "needs you · failed".to_string();
     })?;
     Ok(steps::Transition { id: id.to_string(), to: thread::Group::WaitingOnYou, note: "failed".to_string() })
 }
 
-fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>) -> Result<Pass> {
+fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>, stall_secs: i64) -> Result<Pass> {
     let slug = &project.slug;
     let now = jiff::Timestamp::now();
     let mut pass = Pass { transitions: Vec::new(), recorded_panes: 0, missing_panes: 0, error: None };
@@ -656,7 +658,9 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
         let after = thread::Thread { prompt_pending: t.prompt_pending && !delivered, report_hash, ..t.clone() };
         // In the tick that delivers a prompt the agent still reads as idle; it
         // has just been given work, so it is Working, not Idle.
-        let group = if delivered { thread::Group::Working } else { thread::group(&after, &live, now) };
+        let class = thread::classify(&after, &live, now);
+        let (group, audience) = if delivered { (thread::Group::Working, None) } else { (class.group, thread::audience_of(&class, &live, stall_secs)) };
+        let audience_token = audience.map(|a| a.token().to_string()).unwrap_or_default();
         if !t.last_group.is_empty() && group.token() != t.last_group {
             let note = if !live.pane_exists { "pane closed".to_string() } else if state.is_empty() { "no agent".to_string() } else { state.clone() };
             pass.transitions.push(Transition { id: t.id.clone(), to: group, note });
@@ -667,7 +671,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
             None => (String::new(), None),
         };
         let self_changed = !t.is_remote() && (activity != t.activity || percent != t.percent);
-        if delivered || state != t.last_state || group.token() != t.last_group || line != t.state_line || self_changed {
+        if delivered || state != t.last_state || group.token() != t.last_group || line != t.state_line || self_changed || audience_token != t.audience {
             thread::update(project, &t.id, |t| {
                 if delivered {
                     t.prompt_pending = false;
@@ -677,6 +681,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
                     t.last_state_change = project::now();
                 }
                 t.last_group = group.token().to_string();
+                t.audience = audience_token.clone();
                 t.state_line = line.clone();
                 if self_changed {
                     t.activity = activity.clone();
@@ -685,7 +690,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
             })?;
         }
         if live.pane_exists {
-            crate::sidebar::report_pane(herdr, &t.pane_id, &crate::sidebar::thread_display(t), slug, group);
+            crate::sidebar::report_pane(herdr, &t.pane_id, &crate::sidebar::thread_display(t), slug, group, audience);
         }
     }
     Ok(pass)
@@ -806,6 +811,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
     };
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
     let slug = &project.slug;
+    let stall_secs = thread::stall_upgrade_secs(ctx.env.var(thread::STALL_UPGRADE_ENV));
     let mut first_error = None;
 
     // The coordinators: registered names only. Before discovery, re-assert a
@@ -838,10 +844,13 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         let terminal = agents.iter().find(|a| a.pane_id == c.pane_id).map(|a| a.terminal_id.clone()).unwrap_or_default();
         let report = crate::progress::self_report(&ctx.root, &record.socket, &c.pane_id, &terminal);
         let (group, _) = coordinator::row_state(c, report.as_ref());
-        crate::sidebar::report_pane(&herdr, &c.pane_id, &crate::sidebar::coordinator_display(project), slug, group);
+        // A coordinator's wait is always the human's cue: blocked screen or
+        // question, there is no internal audience for a project head row.
+        let audience = crate::sidebar::needs_you(group).then_some(thread::Audience::Human);
+        crate::sidebar::report_pane(&herdr, &c.pane_id, &crate::sidebar::coordinator_display(project), slug, group, audience);
     }
 
-    let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None)?;
+    let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None, stall_secs)?;
     // The project's part of the sidebar grouping.
     sessions.parts.entry(record.socket.clone()).or_default().insert(slug.clone(), part(ctx, project, &record, &coordinators, &agents, false));
     // Progress records of panes that are gone are dropped; a new agent in a
@@ -894,7 +903,7 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
     let dirs: Vec<(String, String)> = threads.iter().filter(|t| !t.thread_dir.is_empty()).map(|t| (t.id.clone(), t.thread_dir.clone())).collect();
     let hashes = crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
-    let mut pass = thread_pass(project, &remote, "", threads, &agents, &panes, Some(&hashes)).map_err(|e| format!("{e:#}"))?;
+    let mut pass = thread_pass(project, &remote, "", threads, &agents, &panes, Some(&hashes), thread::stall_upgrade_secs(ctx.env.var(thread::STALL_UPGRADE_ENV))).map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error.take());
 
     for t in threads {

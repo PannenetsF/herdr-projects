@@ -224,6 +224,14 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
         }
         inbox::write_origin(project, "thread-state", &t.id, transition_event(change), &summary, "", &t.origin_pane())?;
         if change.to == Group::WaitingOnYou {
+            // An internal confirmation point (fresh harness permission prompt,
+            // self-reported question) keeps its inbox item for the coordinator,
+            // but it does not ring the human. A later internal -> stalled
+            // upgrade is not a group transition, so it raises no bell either;
+            // the badge and popup pick it up from the persisted audience.
+            if t.audience == crate::thread::Audience::Internal.token() {
+                continue;
+            }
             let reason = if !t.state_line.is_empty() && t.state_line != "needs you" { t.state_line.clone() } else { format!("needs you · {}", change.note) };
             let reason = if !t.activity.is_empty() && t.activity == crate::progress::WAITING { format!("needs you · {}", t.activity) } else { reason };
             notifier.send(&t.id, &reason, crate::notify::Sound::Request, false);

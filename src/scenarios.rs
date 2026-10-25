@@ -999,6 +999,46 @@ fn a_thread_that_needs_you_gives_one_specific_notification_with_sound_unless_mut
 }
 
 #[test]
+fn a_fresh_blocked_prompt_is_internal_no_bell_but_still_an_inbox_item() {
+    let (world, project, _) = finished_world("blocked");
+    // A prompt that just came up (45 s ago), not a stalled one.
+    let recent = (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(45)).to_string();
+    thread::update(&project, "t-0001", |t| {
+        t.last_state = "blocked".into();
+        t.last_state_change = recent;
+    })
+    .unwrap();
+    let ctx = world.ctx();
+    for _ in 0..3 {
+        ticker::tick_project(&ctx, &project).unwrap();
+    }
+    let t = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(t.last_group, "waiting-on-you");
+    assert_eq!(
+        t.audience, "internal",
+        "a fresh permission prompt is internal"
+    );
+    // The coordinator still gets its thread-state item with key guidance.
+    assert!(
+        items_of(&project, "thread-state")
+            .iter()
+            .any(|i| i.event == "blocked on a prompt"
+                && i.summary.contains("thread keys demo t-0001"))
+    );
+    // But nothing rings for the human.
+    let rings = world
+        .runner
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| {
+            c.display().contains("notification show") && c.display().contains("--sound request")
+        })
+        .count();
+    assert_eq!(rings, 0, "internal prompts must not ring");
+}
+
+#[test]
 fn a_blocked_nudge_is_retried_and_a_busy_coordinator_is_not_prompted() {
     let (world, project, _) = finished_world("idle");
     set_front_matter(&project, "nudge = true");

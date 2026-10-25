@@ -14,6 +14,12 @@ use crate::runner::{Cmd, Runner};
 pub const STARTING_TIMEOUT_SECS: i64 = 300;
 pub const BLOCKED_DEBOUNCE_SECS: i64 = 30;
 pub const NOT_READY_SECS: i64 = 60;
+/// A rule-4 wait (a harness permission question or a self-reported question)
+/// is an internal confirmation point, not a human cue. Once it has sat longer
+/// than this it is considered stalled and counted for the human again.
+pub const STALL_UPGRADE_SECS: i64 = 600;
+/// Overrides [`STALL_UPGRADE_SECS`], parsed the way the other env knobs are.
+pub const STALL_UPGRADE_ENV: &str = "HERDR_PROJECTS_STALL_UPGRADE_SECS";
 pub const MEMORY_CAP_CHARS: usize = 32_000;
 pub const LIBRARY_CAP_KB: u64 = 50 * 1024;
 pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
@@ -113,6 +119,11 @@ pub struct Thread {
     pub last_state: String,
     pub last_state_change: String,
     pub last_group: String,
+    /// Who the group's current attention point is for, as
+    /// [`Audience::token`]: `human`, `internal`, `stalled`, or empty when the
+    /// thread wants nobody. The ticker rewrites it every tick; the badge,
+    /// popup and portal read it instead of re-guessing from `last_group`.
+    pub audience: String,
     pub report_hash: String,
     pub last_report_change: String,
     pub last_review_item_hash: String,
@@ -571,53 +582,162 @@ pub fn seconds_since(timestamp: &str, now: jiff::Timestamp) -> i64 {
         .unwrap_or(0)
 }
 
+/// Who a waiting row's current attention point is for. Reported to Herdr as
+/// the `hp_audience` token so the portal can tell a human cue apart from an
+/// internal confirmation point. Persisted in [`Thread::audience`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Audience {
+    /// A person must act: a report to read, a failed/dead thread, a launch
+    /// that never came up, or a start that timed out.
+    Human,
+    /// A harness permission/confirmation prompt, or the agent's own question:
+    /// something the coordinator or harness usually handles.
+    Internal,
+    /// An internal point that has sat unanswered longer than the stall
+    /// upgrade window, so it is counted for the human after all.
+    Stalled,
+}
+
+impl Audience {
+    pub fn token(self) -> &'static str {
+        match self {
+            Audience::Human => "human",
+            Audience::Internal => "internal",
+            Audience::Stalled => "stalled",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Audience> {
+        match token {
+            "human" => Some(Audience::Human),
+            "internal" => Some(Audience::Internal),
+            "stalled" => Some(Audience::Stalled),
+            _ => None,
+        }
+    }
+}
+
+/// Why a thread is in [`Group::WaitingOnYou`]: the rule in [`classify`] that
+/// won. Rules 2 and 3 are human cues; rule 4 is an internal confirmation
+/// point until it stalls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitReason {
+    /// Rule 2: still `Starting` after [`STARTING_TIMEOUT_SECS`].
+    StartingTimeout,
+    /// Rule 3: the record is [`Status::Failed`].
+    Failed,
+    /// Rule 3: the pane is gone with no report written.
+    PaneGone,
+    /// Rule 3: a launch stuck on a dialog or on an agent that never got ready.
+    StuckLaunch,
+    /// Rule 4: the harness has shown `blocked` past [`BLOCKED_DEBOUNCE_SECS`].
+    Blocked,
+    /// Rule 4: the agent's own report says it is waiting for the user.
+    SelfWaiting,
+}
+
+/// The group of a thread and, when it is waiting on you, the rule that put it
+/// there. [`group`] is this with only the group kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Classification {
+    pub group: Group,
+    pub wait: Option<WaitReason>,
+}
+
+/// The stall-upgrade window with its env override applied, parsed like
+/// `HERDR_PROJECTS_OUTAGE_SECS`: an unset or unparsable value gives the
+/// default, so a typo never disables the upgrade.
+pub fn stall_upgrade_secs(var: Option<&str>) -> i64 {
+    var.and_then(|v| v.parse().ok())
+        .unwrap_or(STALL_UPGRADE_SECS)
+}
+
 /// The group of a thread. First matching row wins. One function, so the CLI
 /// and the ticker always agree.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group {
+    classify(thread, live, now).group
+}
+
+/// [`group`] with the winning [`WaitReason`] attached whenever the result is
+/// [`Group::WaitingOnYou`]. The precedence is `group`'s, unchanged.
+pub fn classify(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Classification {
+    let wait = |reason| Classification { group: Group::WaitingOnYou, wait: Some(reason) };
     let state = live.agent_state.as_deref();
     let has_report = !thread.report_hash.is_empty();
     // 1
     if thread.status == Status::Resolved {
-        return Group::Resolved;
+        return Classification { group: Group::Resolved, wait: None };
     }
     // 2
     if thread.status == Status::Starting {
         return if seconds_since(&thread.created, now) < STARTING_TIMEOUT_SECS {
-            Group::Working
+            Classification { group: Group::Working, wait: None }
         } else {
-            Group::WaitingOnYou
+            wait(WaitReason::StartingTimeout)
         };
     }
     // 3: a failed start, a dead pane, or a launch stuck on a dialog.
     let stuck_launch = thread.prompt_pending
         && (thread.brief_stuck || (state.is_some_and(|s| !ready_state(s)) && live.state_secs >= NOT_READY_SECS));
+    if thread.status == Status::Failed {
+        return wait(WaitReason::Failed);
+    }
     // A pane closed after the thread wrote its report is finished work, not
     // a thread that needs the user.
-    if thread.status == Status::Failed || (!live.pane_exists && !has_report) || stuck_launch {
-        return Group::WaitingOnYou;
+    if !live.pane_exists && !has_report {
+        return wait(WaitReason::PaneGone);
+    }
+    if stuck_launch {
+        return wait(WaitReason::StuckLaunch);
     }
     // 4: the harness shows a question or permission prompt, or the agent
     // said it is waiting for the user.
     let blocked_long = state == Some("blocked") && live.state_secs >= BLOCKED_DEBOUNCE_SECS;
-    if blocked_long || live.self_waiting() {
-        return Group::WaitingOnYou;
+    if blocked_long {
+        return wait(WaitReason::Blocked);
+    }
+    if live.self_waiting() {
+        return wait(WaitReason::SelfWaiting);
     }
     // 5: pull request and report facts. The harness showing `working` still
     // wins over an unread report: a report written mid-run is not a result.
     let pr_open = thread.pr_state.eq_ignore_ascii_case("open");
     if pr_open && thread.pr_review.eq_ignore_ascii_case("approved") {
-        return Group::Landing;
+        return Classification { group: Group::Landing, wait: None };
     }
     let new_report = has_report && thread.report_hash != thread.acked_report_hash;
     if (new_report || (has_report && pr_open)) && !thread.prompt_pending && state != Some("working") {
-        return Group::ReadyForReview;
+        return Classification { group: Group::ReadyForReview, wait: None };
     }
     // 6: working by the harness or by its own report.
     if matches!(state, Some("working") | Some("blocked")) || thread.prompt_pending || live.self_working() {
-        return Group::Working;
+        return Classification { group: Group::Working, wait: None };
     }
     // 7
-    Group::Idle
+    Classification { group: Group::Idle, wait: None }
+}
+
+/// The audience of a **thread** row's current attention point:
+///
+/// - a report ready for review, and every rule-2/rule-3 wait, are [`Audience::Human`];
+/// - a rule-4 wait is [`Audience::Internal`] while fresh, [`Audience::Stalled`]
+///   once it has sat longer than `stall_secs`. A blocked harness prompt uses
+///   the blocked-state duration; a self-reported question with no blocked
+///   state uses the age of its report;
+/// - every other group returns `None` — the token is cleared, so "wants the
+///   human" is simply "`hp_audience` is `human` or `stalled`" and a working or
+///   idle row carries no claim either way.
+pub fn audience_of(class: &Classification, live: &Live, stall_secs: i64) -> Option<Audience> {
+    match class.group {
+        Group::ReadyForReview => Some(Audience::Human),
+        Group::WaitingOnYou => Some(match class.wait? {
+            WaitReason::StartingTimeout | WaitReason::Failed | WaitReason::PaneGone | WaitReason::StuckLaunch => Audience::Human,
+            WaitReason::Blocked => if live.state_secs > stall_secs { Audience::Stalled } else { Audience::Internal },
+            WaitReason::SelfWaiting => if live.report_age_secs > stall_secs { Audience::Stalled } else { Audience::Internal },
+        }),
+        _ => None,
+    }
 }
 
 /// A pane is the thread's pane only when workspace, tab and working directory
@@ -1036,6 +1156,76 @@ mod tests {
         assert_eq!(group(&open_thread(), &reported("Done", Some(100), 5, "idle"), now()), Group::Idle);
         // A new report beats self-reported progress.
         assert_eq!(group(&t, &reported("Polishing", Some(90), 5, "idle"), now()), Group::ReadyForReview);
+    }
+
+    #[test]
+    fn classify_names_every_waiting_on_you_reason() {
+        // Rule 2: a start that never came up is a human cue.
+        let old_start = Thread { status: Status::Starting, created: ago(301), ..open_thread() };
+        assert_eq!(classify(&old_start, &Live::default(), now()).wait, Some(WaitReason::StartingTimeout));
+        // Rule 3: failed, pane gone, launch stuck on a dialog.
+        let failed = Thread { status: Status::Failed, ..open_thread() };
+        assert_eq!(classify(&failed, &live(Some("working"), 0), now()).wait, Some(WaitReason::Failed));
+        assert_eq!(classify(&open_thread(), &Live { pane_exists: false, ..Live::default() }, now()).wait, Some(WaitReason::PaneGone));
+        let stuck = Thread { prompt_pending: true, brief_stuck: true, ..open_thread() };
+        assert_eq!(classify(&stuck, &live(Some("blocked"), 0), now()).wait, Some(WaitReason::StuckLaunch));
+        let stuck = Thread { prompt_pending: true, ..open_thread() };
+        assert_eq!(classify(&stuck, &live(Some("unknown"), 60), now()).wait, Some(WaitReason::StuckLaunch));
+        // Rule 4: a debounced blocked prompt, then a self-reported question.
+        assert_eq!(classify(&open_thread(), &live(Some("blocked"), 30), now()).wait, Some(WaitReason::Blocked));
+        assert_eq!(classify(&open_thread(), &reported("Waiting for you", None, 5, "idle"), now()).wait, Some(WaitReason::SelfWaiting));
+        // Non-waiting groups carry no reason.
+        for (t, l) in [
+            (open_thread(), live(Some("working"), 0)),
+            (Thread { report_hash: "h".into(), ..open_thread() }, live(Some("done"), 0)),
+            (Thread::default(), live(Some("idle"), 0)),
+        ] {
+            assert_eq!(classify(&t, &l, now()).wait, None);
+        }
+    }
+
+    #[test]
+    fn audience_matches_each_reason() {
+        let human = |t: &Thread, l: &Live| audience_of(&classify(t, l, now()), l, STALL_UPGRADE_SECS);
+        // Rule 2 and rule 3 are always for the human.
+        let old_start = Thread { status: Status::Starting, created: ago(301), ..open_thread() };
+        assert_eq!(human(&old_start, &Live::default()), Some(Audience::Human));
+        assert_eq!(human(&Thread { status: Status::Failed, ..open_thread() }, &live(Some("working"), 0)), Some(Audience::Human));
+        assert_eq!(human(&open_thread(), &Live { pane_exists: false, ..Live::default() }), Some(Audience::Human));
+        let stuck = Thread { prompt_pending: true, brief_stuck: true, ..open_thread() };
+        assert_eq!(human(&stuck, &live(Some("blocked"), 0)), Some(Audience::Human));
+        // Reports ready for review are human; the other groups want nobody.
+        assert_eq!(human(&Thread { report_hash: "h".into(), ..open_thread() }, &live(Some("done"), 0)), Some(Audience::Human));
+        assert_eq!(human(&open_thread(), &live(Some("working"), 0)), None);
+        assert_eq!(human(&open_thread(), &live(Some("idle"), 0)), None);
+    }
+
+    #[test]
+    fn rule_4_waits_are_internal_until_they_stall() {
+        let audience = |l: &Live, secs| audience_of(&classify(&open_thread(), l, now()), l, secs);
+        // A fresh blocked prompt is internal, even exactly at the boundary:
+        // it must have lasted LONGER than the window.
+        assert_eq!(audience(&live(Some("blocked"), 30), STALL_UPGRADE_SECS), Some(Audience::Internal));
+        assert_eq!(audience(&live(Some("blocked"), 400), STALL_UPGRADE_SECS), Some(Audience::Internal));
+        assert_eq!(audience(&live(Some("blocked"), 600), STALL_UPGRADE_SECS), Some(Audience::Internal));
+        assert_eq!(audience(&live(Some("blocked"), 601), STALL_UPGRADE_SECS), Some(Audience::Stalled));
+        // A blocked prompt under the debounce is Working, so no audience yet.
+        assert_eq!(audience(&live(Some("blocked"), 29), STALL_UPGRADE_SECS), None);
+        // A self-reported question is timed by its report's age.
+        assert_eq!(audience(&reported("Waiting for you", None, 599, "idle"), STALL_UPGRADE_SECS), Some(Audience::Internal));
+        assert_eq!(audience(&reported("Waiting for you", None, 600, "idle"), STALL_UPGRADE_SECS), Some(Audience::Internal));
+        assert_eq!(audience(&reported("Waiting for you", None, 601, "idle"), STALL_UPGRADE_SECS), Some(Audience::Stalled));
+        // The env override shrinks the window.
+        assert_eq!(audience(&live(Some("blocked"), 45), 30), Some(Audience::Stalled));
+        assert_eq!(stall_upgrade_secs(None), STALL_UPGRADE_SECS);
+        assert_eq!(stall_upgrade_secs(Some("42")), 42);
+        assert_eq!(stall_upgrade_secs(Some("")), STALL_UPGRADE_SECS);
+        assert_eq!(stall_upgrade_secs(Some("soon")), STALL_UPGRADE_SECS);
+        for (a, token) in [(Audience::Human, "human"), (Audience::Internal, "internal"), (Audience::Stalled, "stalled")] {
+            assert_eq!(a.token(), token);
+            assert_eq!(Audience::from_token(token), Some(a));
+        }
+        assert_eq!(Audience::from_token("nope"), None);
     }
 
     #[test]

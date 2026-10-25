@@ -29,7 +29,12 @@ const OTHER: &str = "~";
 
 /// Every token this module writes.
 pub fn tokens() -> Vec<String> {
-    ["hp_sub", "hp_group"].map(String::from).to_vec()
+    // `hp_audience` is written here only for guest/other panes; tracked panes
+    // get it from `sidebar::report_pane`. It is listed once so `clear` covers
+    // every writer.
+    ["hp_sub", "hp_group", "hp_role", "hp_audience"]
+        .map(String::from)
+        .to_vec()
 }
 
 /// Tokens of earlier layouts: the 0.2.17/0.2.18 headings and the 0.2.19
@@ -73,6 +78,55 @@ pub struct ProjectPart {
 
 /// Every project's part in one Herdr session, keyed by slug.
 pub type Parts = BTreeMap<String, ProjectPart>;
+
+/// The role a pane plays in a project, from its `hp_group` key. Reported as
+/// the `hp_role` token; the default agent view hides guest/other panes on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// A project's registered coordinator (`{slug}!0!…`).
+    Coordinator,
+    /// A registered thread (`{slug}!1!…`).
+    Thread,
+    /// An unregistered pane working in a project subfolder (`{slug}!2!…`).
+    Guest,
+    /// Belongs to no project (`~!…`).
+    Other,
+}
+
+impl Role {
+    pub fn token(self) -> &'static str {
+        match self {
+            Role::Coordinator => "coordinator",
+            Role::Thread => "thread",
+            Role::Guest => "guest",
+            Role::Other => "other",
+        }
+    }
+
+    /// Derives a pane's role from its `hp_group` key. Slugs never contain
+    /// `!`, so the segment after the first one is the key's kind; the
+    /// no-project tail is recognized by its leading `~`. An unknown shape
+    /// reads as [`Role::Thread`] (visible) rather than hiding a pane.
+    pub fn from_key(key: &str) -> Role {
+        if key.starts_with(OTHER) {
+            return Role::Other;
+        }
+        match key.split('!').nth(1) {
+            Some("0") => Role::Coordinator,
+            Some("2") => Role::Guest,
+            _ => Role::Thread,
+        }
+    }
+
+    /// Guest and other panes are automation/no-project panes: their
+    /// attention points are never for the human.
+    fn audience(self) -> Option<crate::thread::Audience> {
+        match self {
+            Role::Guest | Role::Other => Some(crate::thread::Audience::Internal),
+            Role::Coordinator | Role::Thread => None,
+        }
+    }
+}
 
 /// `!` sorts before every slug character, so keys sort as their slugs do.
 pub fn coordinator_key(slug: &str, pane: &str) -> String {
@@ -166,7 +220,17 @@ pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace]) -> Plan {
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     for (key, pane, sub) in rows {
-        let tokens = vec![("hp_sub".to_string(), (!sub.is_empty()).then(|| sub.to_string())), ("hp_group".to_string(), Some(key))];
+        let role = Role::from_key(&key);
+        let mut tokens: Tokens = vec![
+            ("hp_sub".to_string(), (!sub.is_empty()).then(|| sub.to_string())),
+            ("hp_group".to_string(), Some(key.clone())),
+            ("hp_role".to_string(), Some(role.token().to_string())),
+        ];
+        // Guest/other panes own their audience here; tracked panes get theirs
+        // (or a clear) from `sidebar::report_pane`, so it is not touched.
+        if let Some(audience) = role.audience() {
+            tokens.push(("hp_audience".to_string(), Some(audience.token().to_string())));
+        }
         out.agents.push((pane.to_string(), tokens));
     }
 
@@ -346,8 +410,14 @@ mod tests {
         assert_eq!(get(t["a3"], "hp_sub"), Some("review · report"));
         assert_eq!(get(t["a1"], "hp_sub"), None, "an empty sub-line is cleared, so no row is drawn");
         assert!(t["a1"].iter().any(|(n, v)| n == "hp_sub" && v.is_none()));
-        // No card carries a row of ours besides its own sub-line.
-        assert!(layout.agents.iter().all(|(_, t)| t.iter().all(|(n, _)| n == "hp_sub" || n == "hp_group")));
+        // Every card carries its role; only no-project panes also carry the
+        // guest/other audience — tracked panes leave hp_audience to report_pane.
+        assert_eq!(get(t["a1"], "hp_role"), Some("coordinator"));
+        assert_eq!(get(t["a3"], "hp_role"), Some("thread"));
+        assert_eq!(get(t["x1"], "hp_role"), Some("other"));
+        assert_eq!(get(t["x1"], "hp_audience"), Some("internal"));
+        assert!(t["a1"].iter().all(|(n, _)| ["hp_sub", "hp_group", "hp_role"].contains(&n.as_str())));
+        assert!(t["x1"].iter().any(|(n, v)| n == "hp_audience" && v.as_deref() == Some("internal")));
         // The sort key the agent view uses reproduces this order.
         let keys: Vec<&str> = layout.agents.iter().map(|(_, t)| get(t, "hp_group").unwrap()).collect();
         let mut sorted = keys.clone();
@@ -440,7 +510,13 @@ mod tests {
         let t: HashMap<&str, &Tokens> = layout.agents.iter().map(|(p, t)| (p.as_str(), t)).collect();
         let guest_key = get(t["a9"], "hp_group").unwrap();
         assert!(guest_key.starts_with("alpha!2!4!a9"), "guest-thread segment, working rank 4, got {guest_key}");
+        assert_eq!(get(t["a9"], "hp_role"), Some("guest"));
+        assert_eq!(get(t["a9"], "hp_audience"), Some("internal"), "a guest is never a human cue");
+        assert_eq!(get(t["a1"], "hp_role"), Some("coordinator"));
+        assert_eq!(get(t["a1"], "hp_audience"), None, "tracked panes leave the audience to report_pane");
         assert!(get(t["x1"], "hp_group").unwrap().starts_with('~'));
+        assert_eq!(get(t["x1"], "hp_role"), Some("other"));
+        assert_eq!(get(t["x1"], "hp_audience"), Some("internal"));
         // Keys remain ascending so the view reproduces this order.
         let mut keys: Vec<&str> = layout.agents.iter().map(|(_, t)| get(t, "hp_group").unwrap()).collect();
         keys.sort();
@@ -504,5 +580,42 @@ mod tests {
         assert_eq!(guest_rank("working"), 4);
         assert_eq!(guest_rank("idle"), 5);
         assert_eq!(guest_rank(""), 5);
+    }
+
+    #[test]
+    fn role_follows_each_key_shape() {
+        assert_eq!(
+            Role::from_key(&coordinator_key("demo", "w1:p1")),
+            Role::Coordinator
+        );
+        assert_eq!(
+            Role::from_key(&thread_key("demo", 1, "t-0007")),
+            Role::Thread
+        );
+        assert_eq!(
+            Role::from_key(&guest_thread_key("demo", 4, "w9:p2")),
+            Role::Guest
+        );
+        assert_eq!(Role::from_key("~!0007"), Role::Other);
+        // The values the hp_role token carries.
+        assert_eq!(Role::Coordinator.token(), "coordinator");
+        assert_eq!(Role::Thread.token(), "thread");
+        assert_eq!(Role::Guest.token(), "guest");
+        assert_eq!(Role::Other.token(), "other");
+        // Guests and others are internal; tracked roles claim no audience here.
+        assert_eq!(
+            Role::Guest.audience(),
+            Some(crate::thread::Audience::Internal)
+        );
+        assert_eq!(
+            Role::Other.audience(),
+            Some(crate::thread::Audience::Internal)
+        );
+        assert_eq!(Role::Coordinator.audience(), None);
+        assert_eq!(Role::Thread.audience(), None);
+        // Every token this module writes is cleared (and counted in the chunk test).
+        for name in ["hp_role", "hp_audience"] {
+            assert!(tokens().iter().any(|t| t == name), "{name}");
+        }
     }
 }

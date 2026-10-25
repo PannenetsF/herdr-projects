@@ -520,7 +520,7 @@ pub fn row_state(pane: &LivePane, report: Option<&crate::progress::Record>) -> (
 }
 
 pub fn report_tokens(herdr: &Herdr, project: &Project, pane_id: &str) {
-    crate::sidebar::report_pane(herdr, pane_id, &crate::sidebar::coordinator_display(project), &project.slug, crate::thread::Group::Idle);
+    crate::sidebar::report_pane(herdr, pane_id, &crate::sidebar::coordinator_display(project), &project.slug, crate::thread::Group::Idle, None);
 }
 
 /// Renames a recorded workspace whose label is not the project's display name,

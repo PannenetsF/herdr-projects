@@ -64,6 +64,10 @@ pub struct ThreadRow {
     pub socket: String,
     pub thread: Thread,
     pub group: Group,
+    /// Whether the group's current wait is for the human: a needs-you group
+    /// with audience human or stalled. An internal prompt is listed but never
+    /// reddened or counted.
+    pub human: bool,
     pub next: Vec<String>,
     pub pr_facts: String,
 }
@@ -157,7 +161,7 @@ pub fn picker_rows(root: &Path) -> Vec<PickerRow> {
     let mut rows = vec![PickerRow { slug: None, name: "All projects".into(), status: summary(root) }];
     for project in projects_in_scope(root, None, false) {
         let name = project.read_project_md().map(|(s, _)| project::display_name(&s.name, &project.slug)).unwrap_or_else(|_| project.slug.clone());
-        let status = crate::sidebar::project_line(&crate::sidebar::recorded_groups(&project), project.status() == Status::Paused);
+        let status = crate::sidebar::project_line(&crate::sidebar::recorded_state(&project), project.status() == Status::Paused);
         rows.push(PickerRow { slug: Some(project.slug.clone()), name, status });
     }
     rows
@@ -251,12 +255,16 @@ pub fn thread_rows(root: &Path, scope: Option<&str>) -> Vec<ThreadRow> {
         let state = crate::steps::load_state(&project);
         for t in thread::list(&project) {
             let group = if t.status == thread::Status::Resolved { Group::Resolved } else { Group::from_token(&t.last_group).unwrap_or(Group::Working) };
+            // An empty audience (older record) counts as human, like the badge.
+            let human = crate::sidebar::needs_you(group)
+                && t.audience != crate::thread::Audience::Internal.token();
             rows.push(ThreadRow {
                 slug: project.slug.clone(),
                 socket: socket.clone(),
                 next: thread::all_next(&project, &t.id),
                 pr_facts: pr_facts(&t, state.prs.get(&t.id)),
                 group,
+                human,
                 thread: t,
             });
         }
@@ -264,9 +272,11 @@ pub fn thread_rows(root: &Path, scope: Option<&str>) -> Vec<ThreadRow> {
     rows
 }
 
-fn group_color(group: Group) -> Option<Color> {
+fn group_color(group: Group, human: bool) -> Option<Color> {
     match group {
-        Group::WaitingOnYou => Some(Color::Red),
+        // An internal permission prompt waits but is not the human's cue:
+        // it stays in the list uncolored; a stalled wait is red again.
+        Group::WaitingOnYou if human => Some(Color::Red),
         Group::ReadyForReview => Some(Color::Yellow),
         Group::Landing => Some(Color::Green),
         Group::Resolved => Some(Color::DarkGrey),
@@ -330,10 +340,10 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
                     if mine.is_empty() {
                         continue;
                     }
-                    let groups: Vec<Group> = mine.iter().map(|r| r.group).collect();
+                    let groups: Vec<(Group, bool)> = mine.iter().map(|r| (r.group, r.human)).collect();
                     rows.push(header(format!("{slug} · {}", crate::sidebar::project_line(&groups, false))));
                     for r in mine {
-                        rows.push(Row { header: false, text: format!("  {}", thread_line(r, false)), color: group_color(r.group), kind: RowKind::Thread(Box::new(r.clone())) });
+                        rows.push(Row { header: false, text: format!("  {}", thread_line(r, false)), color: group_color(r.group, r.human), kind: RowKind::Thread(Box::new(r.clone())) });
                     }
                 }
             } else {
@@ -344,7 +354,7 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
                     }
                     rows.push(header(format!("{} ({})", group.label(), mine.len())));
                     for r in mine {
-                        rows.push(Row { header: false, text: format!("  {}", thread_line(r, false)), color: group_color(r.group), kind: RowKind::Thread(Box::new(r.clone())) });
+                        rows.push(Row { header: false, text: format!("  {}", thread_line(r, false)), color: group_color(r.group, r.human), kind: RowKind::Thread(Box::new(r.clone())) });
                     }
                 }
             }
@@ -564,7 +574,7 @@ impl OrDefault for Result<(project::Settings, String)> {
 /// The header summary: `3 projects · 2 need you`.
 pub fn summary(root: &Path) -> String {
     let projects = projects_in_scope(root, None, false);
-    let need: usize = projects.iter().map(|p| crate::sidebar::recorded_groups(p).into_iter().filter(|g| crate::sidebar::needs_you(*g)).count()).sum();
+    let need: usize = projects.iter().map(|p| crate::sidebar::recorded_state(p).into_iter().filter(|(g, human)| crate::sidebar::needs_you(*g) && *human).count()).sum();
     format!("{} project{} · {need} need you", projects.len(), if projects.len() == 1 { "" } else { "s" })
 }
 

@@ -53,7 +53,9 @@ fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Res
 }
 
 pub fn report_thread_tokens(herdr: &Herdr, thread: &Thread, slug: &str, group: Group) {
-    crate::sidebar::report_pane(&herdr.on_machine(&thread.machine), &thread.pane_id, &crate::sidebar::thread_display(thread), slug, group);
+    // Adoption and start report Working: no audience yet; the ticker stamps
+    // the real one (and clears it) on its next pass.
+    crate::sidebar::report_pane(&herdr.on_machine(&thread.machine), &thread.pane_id, &crate::sidebar::thread_display(thread), slug, group, None);
 }
 
 fn clear_thread_tokens(herdr: &Herdr, thread: &Thread) {
@@ -1048,37 +1050,45 @@ pub fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread, view: Opti
 pub struct Row {
     pub thread: Thread,
     pub group: Group,
+    /// Who the group's current wait is for; `None` when the row wants nobody.
+    pub audience: Option<thread::Audience>,
     pub note: String,
 }
 
 pub fn rows(ctx: &Ctx, project: &Project) -> Vec<Row> {
     let view = session_view(ctx, project);
     let now = jiff::Timestamp::now();
+    let stall_secs = thread::stall_upgrade_secs(ctx.env.var(thread::STALL_UPGRADE_ENV));
     thread::list(project)
         .into_iter()
-        .map(|t| row(&t, &project.root, view.as_ref(), now))
+        .map(|t| row(&t, &project.root, view.as_ref(), now, stall_secs))
         .collect()
 }
 
-fn row(t: &Thread, root: &Path, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
+fn row(t: &Thread, root: &Path, view: Option<&SessionView>, now: jiff::Timestamp, stall_secs: i64) -> Row {
     // Before the first poll a thread that is waiting for its launch is Working.
     let recorded = Group::from_token(&t.last_group).unwrap_or(if t.prompt_pending { Group::Working } else { Group::Idle });
+    // The audience the ticker last persisted: used for remote threads and
+    // when the session is unreachable, where the CLI does no live classify.
+    let recorded_audience = || thread::Audience::from_token(&t.audience);
     if t.status == Status::Resolved {
-        return Row { thread: t.clone(), group: Group::Resolved, note: t.resolved_reason.clone() };
+        return Row { thread: t.clone(), group: Group::Resolved, audience: None, note: t.resolved_reason.clone() };
     }
     let Some(view) = view else {
         // Records are still printed; panes are not treated as gone.
-        return Row { thread: t.clone(), group: recorded, note: "session unreachable".into() };
+        return Row { thread: t.clone(), group: recorded, audience: recorded_audience(), note: "session unreachable".into() };
     };
     if t.is_remote() {
         // Remote state is what the ticker last polled; the CLI makes no ssh call.
         let state = if t.last_state.is_empty() { "not polled yet" } else { &t.last_state };
-        return Row { thread: t.clone(), group: recorded, note: format!("{state}, on {}", t.machine) };
+        return Row { thread: t.clone(), group: recorded, audience: recorded_audience(), note: format!("{state}, on {}", t.machine) };
     }
     let live = thread::live_with_report(t, &view.agents, &view.panes, now, root, &view.socket);
     // A report the ticker has not hashed yet still counts, as it does for the ticker.
     let fresh = Thread { report_hash: thread::local_report_hash(t).unwrap_or_else(|| t.report_hash.clone()), ..t.clone() };
-    let group = thread::group(&fresh, &live, now);
+    let class = thread::classify(&fresh, &live, now);
+    let audience = thread::audience_of(&class, &live, stall_secs);
+    let group = class.group;
     let note = if t.status == Status::Failed {
         format!("failed: {}", t.error)
     } else if !live.pane_exists {
@@ -1086,7 +1096,7 @@ fn row(t: &Thread, root: &Path, view: Option<&SessionView>, now: jiff::Timestamp
     } else {
         live.agent_state.unwrap_or_else(|| "no agent".into())
     };
-    Row { thread: t.clone(), group, note }
+    Row { thread: t.clone(), group, audience, note }
 }
 
 /// One thread as JSON: the record, its group and note, the Next list and the
@@ -1097,6 +1107,10 @@ pub fn row_json(project: &Project, row: &Row) -> serde_json::Value {
     let mut value = serde_json::to_value(t).unwrap_or_default();
     value["group"] = row.group.label().into();
     value["group_token"] = row.group.token().into();
+    value["audience"] = match row.audience {
+        Some(audience) => audience.token().into(),
+        None => serde_json::Value::Null,
+    };
     value["rank"] = row.group.rank().into();
     value["note"] = row.note.clone().into();
     value["next"] = thread::all_next(project, &t.id).into();
@@ -1123,7 +1137,8 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str, json: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     let view = session_view(ctx, &project);
-    let row = row(&record, &project.root, view.as_ref(), jiff::Timestamp::now());
+    let stall_secs = thread::stall_upgrade_secs(ctx.env.var(thread::STALL_UPGRADE_ENV));
+    let row = row(&record, &project.root, view.as_ref(), jiff::Timestamp::now(), stall_secs);
     if json {
         println!("{}", serde_json::to_string_pretty(&row_json(&project, &row))?);
         return Ok(());

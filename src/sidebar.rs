@@ -11,7 +11,7 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Val
 
 use crate::herdr::{CALL_TIMEOUT, Herdr};
 use crate::project::{self, Project};
-use crate::thread::{Group, Live, Thread};
+use crate::thread::{Audience, Group, Live, Thread};
 
 pub const TOKEN_TTL_MS: u64 = 300_000;
 /// Tokens this plugin wrote before 0.2.0; cleared on every report.
@@ -85,14 +85,23 @@ pub fn coordinator_display(project: &Project) -> String {
 /// Reports one pane's row: display name, project and rank, with a TTL so the
 /// row falls back to Herdr's own when the ticker stops. Never `--seq`: token
 /// patches are per key and the grouping tokens come from `grouping`.
-pub fn report_pane(herdr: &Herdr, pane: &str, display: &str, slug: &str, group: Group) {
+///
+/// `audience` is the pane's `hp_audience` value; `None` clears the token, so a
+/// thread that goes back to working stops claiming any attention. Guest and
+/// other panes are never reported here; `grouping` stamps them `internal`.
+pub fn report_pane(herdr: &Herdr, pane: &str, display: &str, slug: &str, group: Group, audience: Option<Audience>) {
     let ttl = TOKEN_TTL_MS.to_string();
     let rank = group.rank().to_string();
+    let audience_token = audience.map(|a| format!("hp_audience={}", a.token()));
     let tokens = [format!("hp_project={slug}"), format!("hp_rank={rank}")];
     let mut args = vec!["pane", "report-metadata", pane, "--source", crate::herdr::SOURCE, "--display-agent", display, "--ttl-ms", &ttl];
     for token in &tokens {
         args.push("--token");
         args.push(token);
+    }
+    match &audience_token {
+        Some(token) => args.extend(["--token", token]),
+        None => args.extend(["--clear-token", "hp_audience"]),
     }
     for old in OLD_TOKENS {
         args.push("--clear-token");
@@ -107,7 +116,7 @@ pub fn clear_pane(herdr: &Herdr, pane: &str) {
         return;
     }
     let mut args = vec!["pane", "report-metadata", pane, "--source", crate::herdr::SOURCE, "--clear-display-agent"];
-    for name in ["hp_project", "hp_rank"].into_iter().chain(OLD_TOKENS) {
+    for name in ["hp_project", "hp_rank", "hp_audience"].into_iter().chain(OLD_TOKENS) {
         args.push("--clear-token");
         args.push(name);
     }
@@ -115,14 +124,16 @@ pub fn clear_pane(herdr: &Herdr, pane: &str) {
     crate::grouping::clear(herdr, "pane", pane);
 }
 
-/// `2 need you · 3 working`, `paused`, or `idle`.
-pub fn project_line(groups: &[Group], paused: bool) -> String {
+/// `2 need you · 3 working`, `paused`, or `idle`. Each pair is a thread's
+/// group plus whether its current wait is for the human (audience `human` or
+/// `stalled`); an internal permission prompt is not counted as needing you.
+pub fn project_line(groups: &[(Group, bool)], paused: bool) -> String {
     if paused {
         return "paused".into();
     }
-    let count = |f: &dyn Fn(Group) -> bool| groups.iter().filter(|g| f(**g)).count();
+    let count = |f: &dyn Fn(Group) -> bool| groups.iter().filter(|(g, _)| f(*g)).count();
     let mut parts = Vec::new();
-    let need = count(&|g| needs_you(g));
+    let need = groups.iter().filter(|(g, human)| needs_you(*g) && *human).count();
     if need > 0 {
         parts.push(format!("{need} need you"));
     }
@@ -157,13 +168,26 @@ pub fn sub_line(state_line: &str, activity: &str) -> String {
 /// `thread::group` classifies a failure as Waiting-on-you — so count them
 /// that way directly. Without this the needs-you badge (which reads
 /// `last_group`) silently disagreed with the live rows and the portal.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn recorded_groups(project: &Project) -> Vec<Group> {
+    recorded_state(project).into_iter().map(|(group, _)| group).collect()
+}
+
+/// [`recorded_groups`] with, per thread, whether its current wait is for the
+/// human: a needs-you group whose persisted audience is not `internal`. An
+/// empty audience (a record an older build wrote) counts as human, so the
+/// badge never blanks during an upgrade.
+pub fn recorded_state(project: &Project) -> Vec<(Group, bool)> {
     crate::thread::list(project)
         .into_iter()
-        .filter_map(|t| match t.status {
-            crate::thread::Status::Resolved => None,
-            crate::thread::Status::Failed => Some(Group::WaitingOnYou),
-            _ => Group::from_token(&t.last_group),
+        .filter_map(|t| {
+            let group = match t.status {
+                crate::thread::Status::Resolved => return None,
+                crate::thread::Status::Failed => Group::WaitingOnYou,
+                _ => Group::from_token(&t.last_group)?,
+            };
+            let human = !needs_you(group) || t.audience != Audience::Internal.token();
+            Some((group, human))
         })
         .collect()
 }
@@ -179,7 +203,7 @@ pub fn needs_you_line(root: &Path) -> Option<String> {
         .iter()
         .filter_map(|slug| Project::load(root, slug).ok())
         .filter(|p| p.status() == project::Status::Active)
-        .map(|p| recorded_groups(&p).into_iter().filter(|g| needs_you(*g)).count())
+        .map(|p| recorded_state(&p).into_iter().filter(|(g, human)| needs_you(*g) && *human).count())
         .sum();
     (n > 0).then(|| format!("projects: {n} need you"))
 }
@@ -188,15 +212,31 @@ pub fn needs_you_line(root: &Path) -> Option<String> {
 
 /// The default view: agents in project blocks (`hp_group`, see `grouping`),
 /// each by need; agents without it last.
+///
+/// Guest panes (an unregistered session cwd-under a project) and panes of no
+/// project are hidden with a `not(in …)` on `hp_role` rather than an
+/// allow-list: a pane with no token yet — before the first tick, or in the
+/// gap of a TTL refresh — does NOT match `in`, so it stays visible. Only
+/// panes the ticker has positively marked `guest`/`other` leave the view.
 pub fn default_view() -> serde_json::Value {
     serde_json::json!({
         "source": crate::herdr::SOURCE,
         "label": "projects",
+        "filter": {
+            "op": "not",
+            "filter": {
+                "op": "in",
+                "field": { "token": "hp_role" },
+                "values": ["guest", "other"],
+            },
+        },
         "sort": [{ "field": { "token": "hp_group" }, "order": "asc" }, { "field": { "token": "hp_rank" }, "order": "asc" }],
     })
 }
 
-/// `focus <slug>`: only that project's agents, by need.
+/// `focus <slug>`: only that project's agents, by need. The `hp_project`
+/// equality already hides guest and other panes: only tracked coordinator and
+/// thread rows ever carry that token, so no extra role filter is needed.
 pub fn project_view(slug: &str) -> serde_json::Value {
     serde_json::json!({
         "source": crate::herdr::SOURCE,
@@ -739,9 +779,100 @@ sidebar = { agents = { rows = [[{ token = "$hp_top", fg = "#cba6f7", bold = true
     #[test]
     fn project_lines_count_what_needs_you() {
         use Group::*;
-        assert_eq!(project_line(&[WaitingOnYou, ReadyForReview, Working, Working, Working, Idle], false), "2 need you · 3 working");
-        assert_eq!(project_line(&[Landing], false), "1 landing");
-        assert_eq!(project_line(&[Idle], false), "idle");
-        assert_eq!(project_line(&[WaitingOnYou], true), "paused");
+        // (group, whether the wait is for the human).
+        let p = |g: Group, human: bool| (g, human);
+        assert_eq!(project_line(&[p(WaitingOnYou, true), p(ReadyForReview, true), p(Working, false), p(Working, false), p(Working, false), p(Idle, false)], false), "2 need you · 3 working");
+        assert_eq!(project_line(&[p(Landing, false)], false), "1 landing");
+        assert_eq!(project_line(&[p(Idle, false)], false), "idle");
+        assert_eq!(project_line(&[p(WaitingOnYou, true)], true), "paused");
+        // An internal permission prompt waits but is not counted as needing you.
+        assert_eq!(project_line(&[p(WaitingOnYou, false), p(Working, false), p(ReadyForReview, true)], false), "1 need you · 1 working");
+        assert_eq!(project_line(&[p(WaitingOnYou, false)], false), "idle");
+        // A stalled wait is counted again.
+        assert_eq!(project_line(&[p(WaitingOnYou, true)], false), "1 need you");
+    }
+
+    /// Evaluates the view filters this module emits against a pane's token
+    /// map, mirroring herdr 0.9.5's leaf semantics — in particular that a
+    /// missing token never matches `in` or `eq`. Supports just the ops these
+    /// views use: `not`, `all`, `in`, `eq`.
+    fn visible<'b, F: Fn(&str) -> Option<&'b str>>(filter: &serde_json::Value, token: &F) -> bool {
+        match filter["op"].as_str().unwrap() {
+            "not" => !visible(&filter["filter"], token),
+            "all" => filter["filters"].as_array().unwrap().iter().all(|f| visible(f, token)),
+            "in" => {
+                let name = filter["field"]["token"].as_str().unwrap();
+                token(name).is_some_and(|value| filter["values"].as_array().unwrap().iter().any(|v| v.as_str() == Some(value)))
+            }
+            "eq" => {
+                let name = filter["field"]["token"].as_str().unwrap();
+                token(name) == filter["value"].as_str()
+            }
+            op => panic!("unexpected filter op {op}"),
+        }
+    }
+
+    #[test]
+    fn default_view_is_the_exact_guest_other_hiding_filter() {
+        assert_eq!(
+            default_view(),
+            serde_json::json!({
+                "source": crate::herdr::SOURCE,
+                "label": "projects",
+                "filter": {
+                    "op": "not",
+                    "filter": {
+                        "op": "in",
+                        "field": { "token": "hp_role" },
+                        "values": ["guest", "other"],
+                    },
+                },
+                "sort": [
+                    { "field": { "token": "hp_group" }, "order": "asc" },
+                    { "field": { "token": "hp_rank" }, "order": "asc" },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn default_view_hides_guest_and_other_but_keeps_unmarked_and_tracked_panes() {
+        let filter = default_view()["filter"].clone();
+        let role = |value: &'static str| move |name: &str| (name == "hp_role").then_some(value);
+        assert!(visible(&filter, &role("coordinator")));
+        assert!(visible(&filter, &role("thread")));
+        assert!(!visible(&filter, &role("guest")));
+        assert!(!visible(&filter, &role("other")));
+        // The visibility guarantee: no hp_role token yet (first tick / TTL
+        // gap) means `in` cannot match, so the pane is kept.
+        let unmarked = |_: &str| None;
+        assert!(visible(&filter, &unmarked));
+    }
+
+    #[test]
+    fn project_view_keeps_only_the_projects_tracked_panes() {
+        use std::collections::HashMap;
+        let filter = project_view("alpha")["filter"].clone();
+        fn pane<'a>(pairs: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<&'a str> {
+            let map: HashMap<&str, &str> = pairs.iter().copied().collect();
+            move |name: &str| map.get(name).copied()
+        }
+        // Tracked coordinator/thread rows of the project (any role token).
+        assert!(visible(
+            &filter,
+            &pane(&[("hp_project", "alpha"), ("hp_role", "coordinator")])
+        ));
+        assert!(visible(
+            &filter,
+            &pane(&[("hp_project", "alpha"), ("hp_role", "thread")])
+        ));
+        // Another project, a guest (never carries hp_project) and an
+        // unmarked first-tick pane are all hidden.
+        assert!(!visible(
+            &filter,
+            &pane(&[("hp_project", "beta"), ("hp_role", "coordinator")])
+        ));
+        assert!(!visible(&filter, &pane(&[("hp_role", "guest")])));
+        assert!(!visible(&filter, &pane(&[])));
     }
 }
