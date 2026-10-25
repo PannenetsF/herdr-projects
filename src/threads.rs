@@ -158,6 +158,9 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             let prefix = coordinator::current_prefix(&ctx.root)?;
             return Err(coordinator::stranger_refusal(&prefix, slug, &pane));
         }
+        coordinator::Caller::Unverified { pane } => {
+            return Err(coordinator::unverified_refusal(slug, &pane));
+        }
     };
     let (settings, _) = project.read_project_md()?;
     // Without a running ticker nothing launches.
@@ -601,6 +604,7 @@ pub fn require_owner(ctx: &Ctx, project: &Project, record: &Thread, action: &str
             let prefix = coordinator::current_prefix(&ctx.root)?;
             Err(coordinator::stranger_refusal(&prefix, &project.slug, &pane))
         }
+        coordinator::Caller::Unverified { pane } => Err(coordinator::unverified_refusal(&project.slug, &pane)),
         coordinator::Caller::Coordinator { name, .. } => {
             if record.owner == name {
                 Ok(())
@@ -631,24 +635,28 @@ pub fn assign(ctx: &Ctx, slug: &str, id: &str, coordinator_name: &str) -> Result
     if !crate::names::is_coordinator_name(slug, coordinator_name) {
         bail!("`{coordinator_name}` is not a coordinator name of `{slug}` (the `hpc-{slug}` family; `open --new` or `coordinator adopt` allocates one)");
     }
-    // Only a registered, live coordinator can receive work: nudges route to a
-    // live pane. An unregistered agent in the folder must not assign threads
-    // to itself or anyone else.
-    let view = require_session(ctx, &project)?;
-    let dir = project.canonical_dir().to_string_lossy().into_owned();
-    if !view.agents.iter().any(|a| a.name == coordinator_name && coordinator::is_coordinator(slug, &dir, a)) {
-        bail!("no registered coordinator `{coordinator_name}` is live in `{slug}`; open or adopt one first (`herdr agent list` shows names)");
-    }
     match coordinator::caller(ctx, &project) {
         coordinator::Caller::Stranger { pane } => {
             let prefix = coordinator::current_prefix(&ctx.root)?;
             return Err(coordinator::stranger_refusal(&prefix, slug, &pane));
         }
+        coordinator::Caller::Unverified { pane } => {
+            return Err(coordinator::unverified_refusal(slug, &pane));
+        }
         coordinator::Caller::Human | coordinator::Caller::Coordinator { .. } => {}
     }
+    // Idempotent before the liveness requirement: re-asserting the recorded
+    // owner must succeed even when that coordinator is momentarily gone.
     if record.owner == coordinator_name {
         println!("{id} is already owned by `{coordinator_name}`");
         return Ok(());
+    }
+    // Only a registered, LIVE coordinator can receive new work: nudges route
+    // to a live pane.
+    let view = require_session(ctx, &project)?;
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    if !view.agents.iter().any(|a| a.name == coordinator_name && coordinator::is_coordinator(slug, &dir, a)) {
+        bail!("no registered coordinator `{coordinator_name}` is live in `{slug}`; open or adopt one first (`herdr agent list` shows names)");
     }
     let previous = if record.owner.is_empty() { "unassigned".to_string() } else { format!("`{}`", record.owner) };
     thread::update(&project, id, |t| t.owner = coordinator_name.to_string())?;
@@ -762,6 +770,10 @@ pub fn keys(ctx: &Ctx, slug: &str, id: &str, keys: &[String], text: Option<&str>
     if keys.iter().any(|k| k.trim().is_empty()) {
         bail!("a key name is empty");
     }
+    // Arbitrary keystrokes steer the agent exactly like a prompt: owner only.
+    let project = Project::load(&ctx.root, slug)?;
+    let record = thread::load(&project, id)?;
+    require_owner(ctx, &project, &record, "send keys to")?;
     let pane = pane_agent(ctx, slug, id)?;
     let fail = |error: crate::herdr::HerdrError| anyhow::anyhow!("{error}");
     // With `trust_screens = user`, a trust answer is the user's alone.
@@ -796,6 +808,9 @@ pub fn brief(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     if record.status != Status::Open {
         bail!("{id} is {}; `thread restart` brings it back", format!("{:?}", record.status).to_lowercase());
     }
+    // Delivering the brief by hand is steering the thread: owner only (the
+    // ticker's own delivery goes through brief::deliver, not this command).
+    require_owner(ctx, &project, &record, "send the brief to")?;
     let pane = pane_agent(ctx, slug, id).map_err(|e| anyhow::anyhow!("{e:#}; the ticker launches the agent on its next pass"))?;
     match pane.state.as_str() {
         "blocked" => bail!("{id}'s pane shows a prompt: `thread read` shows it, `thread keys` answers it; then run `thread brief` again"),
@@ -834,6 +849,10 @@ pub fn prompt_state(record: &Thread, agents: &[Agent]) -> Result<String> {
 
 pub fn ack(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
+    let record = thread::load(&project, id)?;
+    // Acking moves the owner's Ready-for-review row; a foreign coordinator
+    // must not silently change another one's board.
+    require_owner(ctx, &project, &record, "acknowledge the report of")?;
     let record = thread::update(&project, id, |t| t.acked_report_hash = t.report_hash.clone())?;
     if record.report_hash.is_empty() {
         println!("{id} has no report yet; nothing to acknowledge");

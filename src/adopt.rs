@@ -59,6 +59,9 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
             let prefix = coordinator::current_prefix(&ctx.root)?;
             return Err(coordinator::stranger_refusal(&prefix, slug, &pane));
         }
+        coordinator::Caller::Unverified { pane } => {
+            return Err(coordinator::unverified_refusal(slug, &pane));
+        }
     };
     let record = project.coordinator().with_context(|| format!("`{slug}` has never been opened; run `open {slug}` first"))?;
     ticker::start(ctx)?;

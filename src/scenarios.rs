@@ -2238,7 +2238,9 @@ fn a_thread_started_from_a_bare_shell_is_owner_less_and_omits_owner_from_its_rec
         move |_| Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"{}"}}}}}}"#, folder.display()))),
     );
     world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
-    // The scrubbed World env is not a Herdr pane: no `pane current` call happens.
+    // The scrubbed World env is not a Herdr pane. With no controlling tty
+    // (cargo test runs detached) the fallback probe does not fire either;
+    // either way the thread starts owner-less.
     let t = threads::start(
         &world.ctx(),
         "demo",
@@ -2247,7 +2249,6 @@ fn a_thread_started_from_a_bare_shell_is_owner_less_and_omits_owner_from_its_rec
     .unwrap();
     assert!(t.owner.is_empty());
     assert_eq!(thread::load(&project, "t-0001").unwrap().owner, "");
-    assert_eq!(world.runner.count("pane current"), 0);
 }
 
 #[test]
@@ -3136,6 +3137,93 @@ fn nudges_route_to_the_owning_coordinators_pane_and_skip_unassigned_threads() {
     assert!(state.nudged.contains_key("hpc-demo") && state.nudged.contains_key("hpc-demo-1"));
     assert!(!state.nudged.contains_key("t-0003"));
     assert!(!nudges(&world).iter().any(|n| n.contains("t-0003")));
+}
+
+#[test]
+fn an_ownerless_legacy_checkout_note_still_nudges_project_wide_exactly_once() {
+    // The REAL upgrade shape: every pre-pf.5 checkout record deserializes
+    // owner-less. Its one-time note must reach a coordinator (global nudge),
+    // not hide forever in `context`'s Unassigned area.
+    let (world, project, _env_a, _env_b) = two_coordinator_world();
+    set_front_matter(&project, "nudge = true");
+    let old = world.home.path().join("old-checkout");
+    std::fs::create_dir(&old).unwrap();
+    let t = thread::allocate(&project, |t| {
+        t.id = "t-0009".into();
+        t.title = "Legacy".into();
+        t.kind = Kind::Checkout;
+        t.status = Status::Open;
+        t.owner = String::new(); // a genuine pf.4 record
+        t.worktree_path = String::new();
+        t.pane_id = "w6:p1".into();
+        t.cwd = old.to_string_lossy().into_owned();
+    })
+    .unwrap();
+
+    let ctx = world.ctx();
+    let mut memory = crate::steps::Memory::new(&ctx);
+    ticker::tick_for_test(&ctx, &mut memory); // writes the note, discovers coordinators
+    let notes: Vec<_> = inbox::unhandled(&project).into_iter().filter(|i| i.event == "checkout thread (legacy)").collect();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].subject, t.id);
+    assert!(notes[0].owner.is_none(), "owner-less on disk; routing follows the live record");
+
+    idle_for_a_minute(&project);
+    ticker::tick_for_test(&ctx, &mut memory); // box first seen empty
+    let mut state = crate::steps::load_state(&project);
+    for wait in state.boxes.values_mut() {
+        wait.since = "2026-01-01T00:00:00Z".into();
+    }
+    crate::steps::save_state(&project, &state).unwrap();
+    ticker::tick_for_test(&ctx, &mut memory); // global nudge goes to the primary pane
+
+    let got = nudges(&world);
+    assert!(got.iter().any(|n| n.contains("checkout thread (legacy)")), "{got:?}");
+    // Deduped in the nudged map under the GLOBAL key and never repeated.
+    let before = got.len();
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(nudges(&world).len(), before);
+    state = crate::steps::load_state(&project);
+    assert!(state.nudged.contains_key("_"));
+    assert!(state.checkout_noted.contains("t-0009"));
+}
+
+#[test]
+fn an_item_of_an_assigned_then_resolved_thread_displays_to_the_current_owner_only() {
+    let (world, project, _env_a, env_b) = two_coordinator_world();
+    let mut t = thread::allocate(&project, |t| {
+        t.title = "Task".into();
+        t.status = Status::Open;
+        t.owner = "hpc-demo".into();
+    })
+    .unwrap();
+    inbox::write_thread(&project, &t, "thread-state", "new report", "s", "").unwrap();
+    threads::assign(&world.ctx(), "demo", &t.id, "hpc-demo-1").unwrap();
+    t = thread::update(&project, &t.id, |t| t.status = Status::Resolved).unwrap();
+
+    // The new owner B sees it (and so may clear it); A no longer does.
+    let item = inbox::unhandled(&project).into_iter().find(|i| i.subject == t.id).unwrap();
+    let (text_b, shown_b) = coordinator::digest_for(&world.ctx(), &project, "hp", Some("hpc-demo-1")).unwrap();
+    let (text_a, shown_a) = coordinator::digest_for(&world.ctx(), &project, "hp", Some("hpc-demo")).unwrap();
+    assert!(shown_b.contains(&item.id), "{text_b}");
+    assert!(!shown_a.contains(&item.id), "{text_a}");
+}
+
+#[test]
+fn assigning_a_thread_back_to_its_recorded_owner_is_idempotent_without_liveness() {
+    let (mut world, project, _env_a, env_b) = two_coordinator_world();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    // Only hpc-demo-1 is live now; the recorded owner hpc-demo is gone.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w2", "w2:t1", "w2:p1", &dir, "hpc-demo-1", "idle"));
+    let t = thread::allocate(&project, |t| {
+        t.title = "Task".into();
+        t.status = Status::Open;
+        t.owner = "hpc-demo".into();
+    })
+    .unwrap();
+    let ctx_b = Ctx { env: &env_b, ..world.ctx() };
+    threads::assign(&ctx_b, "demo", &t.id, "hpc-demo").unwrap(); // no "not live" error
+    assert_eq!(thread::load(&project, &t.id).unwrap().owner, "hpc-demo");
 }
 
 #[test]

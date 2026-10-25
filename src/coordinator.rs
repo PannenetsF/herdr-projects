@@ -186,46 +186,114 @@ fn recorded_profile(record: &Coordinator) -> &str {
 /// Whoever invoked a command in this process, by the Herdr pane it runs in.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Caller {
-    /// No live Herdr pane can be identified (a bare shell, CI, a pane the
-    /// session no longer lists): a person at a terminal. Person callers keep
-    /// every power, including touching owner-less threads.
+    /// A genuine terminal outside any live Herdr pane: a real person, CI.
+    /// Person callers keep every power, including touching owner-less threads.
     Human,
     /// A registered coordinator of this project working in its folder; the
     /// string is its registered name and `pane` its Herdr pane id.
     Coordinator { name: String, pane: String },
-    /// A live agent sitting in the project folder without a registered
-    /// coordinator name. It must neither read the digest nor drive threads.
+    /// A live agent that belongs to THIS project's machinery but is not a
+    /// coordinator — a worker thread (`hp-…-t-…`) running in its thread
+    /// folder, or an agent still carrying a coordinator family name outside
+    /// the project home. It may use the read/report surface its harness
+    /// needs, but may not read the coordinator digest or drive threads.
     Stranger { pane: String },
+    /// A command that demonstrably runs inside a live Herdr pane whose agent
+    /// the project cannot account for — the pane markers are present (or were
+    /// deliberately stripped) but no agent row exists, or the row carries no
+    /// project name. Fail CLOSED: treating this as Human let any coordinator
+    /// opt out of ownership by `env -u HERDR_ENV`, and must not.
+    Unverified { pane: String },
 }
 
-/// Identifies the caller from the process's Herdr pane env. Any lookup miss is
-/// [`Caller::Human`], like `context`'s registration gate: a pane outside a
-/// live session is a person, never refused.
+/// Identifies the caller from the Herdr pane the process runs in.
+///
+/// Identity is the agent's REGISTERED name; the pane's working directory only
+/// decides what an unnamed/foreign agent is. Fail CLOSED whenever pane markers
+/// prove the process is inside Herdr but the agent cannot be accounted for:
+/// the old "every lookup miss is a Human" rule let a coordinator drive any
+/// thread with `env -u HERDR_ENV`, opting out of ownership entirely.
 pub fn caller(ctx: &Ctx, project: &Project) -> Caller {
-    let Some(current) = crate::progress::current(ctx.env, ctx.runner) else {
-        return Caller::Human;
+    // The injected pane env is the normal path; a controlling-tty fallback
+    // (`pane current --current`) catches a caller whose pane markers were
+    // stripped — an agent's shell-tool child has piped stdin but still shares
+    // the pane's controlling terminal, unlike a setsid-detached ticker, a
+    // pipe or CI.
+    let marked = ctx.env.var("HERDR_ENV").as_deref() == Some("1");
+    let Some((pane_id, socket)) = identify_pane(ctx) else {
+        return if marked {
+            // Claims to run in a pane, but neither env nor tty says which.
+            Caller::Unverified { pane: String::new() }
+        } else {
+            // No pane anywhere: a real terminal, a script, CI, the ticker.
+            Caller::Human
+        };
     };
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &current.socket, ctx.runner);
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
     let Ok(agents) = herdr.agent_list() else {
+        return Caller::Unverified { pane: pane_id };
+    };
+    let Some(agent) = agents.iter().find(|a| a.pane_id == pane_id) else {
+        // The pane exists but runs no agent: a person typing in a Herdr shell.
         return Caller::Human;
     };
-    let Some(agent) = agents.iter().find(|a| a.pane_id == current.pane_id) else {
-        return Caller::Human;
-    };
-    let dir = project.canonical_dir().to_string_lossy().into_owned();
-    if is_coordinator(&project.slug, &dir, agent) {
-        return Caller::Coordinator { name: agent.name.clone(), pane: current.pane_id.clone() };
+    classify(&project.slug, &project.canonical_dir().to_string_lossy(), &pane_id, agent)
+}
+
+/// The pure identity decision for a live agent row. A coordinator family
+/// name wins over cwd (a coordinator in a worktree stays one); any
+/// project-machine agent in the project home, a worker (`hp-…-t-…`) or
+/// another `hpc-`/`hp-` family is a Stranger; an unrelated agent elsewhere is
+/// just a person in another tab.
+pub(crate) fn classify(slug: &str, dir: &str, pane_id: &str, agent: &Agent) -> Caller {
+    if names::is_coordinator_name(slug, &agent.name) {
+        return Caller::Coordinator { name: agent.name.clone(), pane: pane_id.to_string() };
     }
-    if agent.works_in(&dir) {
-        return Caller::Stranger { pane: current.pane_id.clone() };
+    if agent.works_in(dir) || agent.name.starts_with("hpc-") || names::is_thread_name(slug, &agent.name) {
+        return Caller::Stranger { pane: pane_id.to_string() };
     }
     Caller::Human
 }
 
+/// Whether this process has a controlling terminal. A shell-tool child an
+/// agent spawns keeps the pane's terminal even with piped stdin, while a
+/// setsid-detached ticker, a plain pipe and CI have none — this is the seam
+/// the stripped-env fallback keys on.
+fn has_controlling_tty() -> bool {
+    std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").is_ok()
+}
+
+/// `(pane id, socket to reach it)`: injected env first, controlling-tty
+/// fallback (interactive terminals only). An empty socket means "the CLI's
+/// own default socket".
+fn identify_pane(ctx: &Ctx) -> Option<(String, std::path::PathBuf)> {
+    if let Some(current) = crate::progress::current(ctx.env, ctx.runner) {
+        return Some((current.pane_id, std::path::PathBuf::from(current.socket)));
+    }
+    if !has_controlling_tty() {
+        return None;
+    }
+    // No injected identity; ask the CLI from the tty, without overriding its
+    // socket resolution. A terminal Herdr does not own simply gets no answer.
+    let herdr = Herdr::new(ctx.env.herdr_bin(), std::path::PathBuf::new(), ctx.runner);
+    let result = herdr.call(&["pane", "current", "--current"], Duration::from_secs(2)).ok()?;
+    let pane_id = result.get("pane")?.get("pane_id")?.as_str()?;
+    Some((pane_id.to_string(), std::path::PathBuf::new()))
+}
 /// The refusal an unregistered agent in the project folder gets.
 pub fn stranger_refusal(prefix: &str, slug: &str, pane: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "pane {pane} is in the `{slug}` project folder but is NOT a registered coordinator; this session must not drive the project. Register it with `{prefix} coordinator adopt {slug} --pane {pane}`, then run the command again"
+    )
+}
+
+/// The fail-closed refusal: the process is clearly inside a Herdr pane, but
+/// no accountable project agent could be identified for it. This never tells
+/// the caller how to "fix" it by adopting: an unidentifiable pane gets no
+/// project powers at all.
+pub fn unverified_refusal(slug: &str, pane: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "refused: this command is running inside a Herdr pane {pane} but no registered agent of `{slug}` is accountable for it, so it cannot act as a person or coordinator. Run project commands from the agent's own pane, or from a real terminal outside Herdr"
     )
 }
 
@@ -817,6 +885,7 @@ pub fn inbox_done(ctx: &Ctx, slug: &str, ids: &[String], all: bool) -> Result<us
             let prefix = current_prefix(&ctx.root)?;
             return Err(stranger_refusal(&prefix, slug, &pane));
         }
+        Caller::Unverified { pane } => return Err(unverified_refusal(slug, &pane)),
         Caller::Coordinator { name, .. } => name,
     };
     let items = inbox::unhandled(&project);
@@ -868,6 +937,7 @@ pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     // flat, person-shaped digest.
     let reader = match caller(ctx, &project) {
         Caller::Stranger { pane } => return Err(stranger_refusal(&prefix, slug, &pane)),
+        Caller::Unverified { pane } => return Err(unverified_refusal(slug, &pane)),
         Caller::Coordinator { name, .. } => Some(name),
         Caller::Human => None,
     };
@@ -984,7 +1054,11 @@ pub(crate) fn digest_for(ctx: &Ctx, project: &Project, prefix: &str, reader: Opt
         }
     }
 
-    let threads: Vec<_> = open.iter().map(|r| r.thread.clone()).collect();
+    // Item ownership is resolved against EVERY thread, including resolved
+    // ones: an item written while A owned the thread, assigned to B and then
+    // resolved must display to B — the coordinator allowed to clear it. The
+    // open-threads listing above intentionally keeps only live rows.
+    let threads: Vec<_> = crate::thread::list(&project);
     let items = inbox::unhandled(project);
     out.push_str(&inbox_section(&items, reader, &threads));
     let (routines, broken) = crate::routine::load_all(project);
@@ -1093,6 +1167,27 @@ fn inbox_section(items: &[inbox::Item], reader: Option<&str>, threads: &[crate::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn family_name_decides_identity_even_outside_the_project_home() {
+        let dir = "/proj/demo";
+        let worktree = "/proj/demo/.herdr/worktrees/nix-hm/hp-demo-t-0007";
+        // A coordinator that cd'd into a thread worktree stays a coordinator.
+        let c = named("hpc-demo", agent("w1:p1", worktree, "idle", 1));
+        assert_eq!(classify("demo", dir, "w1:p1", &c), Caller::Coordinator { name: "hpc-demo".into(), pane: "w1:p1".into() });
+        // A worker in its own worktree is a stranger to the digest/drive.
+        let w = named("hp-demo-t-0007", agent("w3:p1", worktree, "working", 2));
+        assert_eq!(classify("demo", dir, "w3:p1", &w), Caller::Stranger { pane: "w3:p1".into() });
+        // Another project's coordinator anywhere is a stranger.
+        let other = named("hpc-other", agent("w4:p1", "/proj/other", "idle", 1));
+        assert_eq!(classify("demo", dir, "w4:p1", &other), Caller::Stranger { pane: "w4:p1".into() });
+        // Hand-started oddly-named session inside the home is a stranger.
+        let hand = named("explorer", agent("w5:p1", dir, "idle", 1));
+        assert_eq!(classify("demo", dir, "w5:p1", &hand), Caller::Stranger { pane: "w5:p1".into() });
+        // Unrelated agent elsewhere is just a person in another tab.
+        let elsewhere = named("whatever", agent("w6:p1", "/tmp", "idle", 1));
+        assert_eq!(classify("demo", dir, "w6:p1", &elsewhere), Caller::Human);
+    }
 
     #[test]
     fn prefix_has_the_fixed_shape_and_quotes_spaces() {
