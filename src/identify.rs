@@ -231,6 +231,9 @@ fn bin_candidates(home: &Path) -> Vec<PathBuf> {
 
 /// Prefixes a resolved herdr executable may legitimately sit under. A symlink
 /// in a trusted dir that resolves into /tmp (or anywhere else) is rejected.
+/// `home` is already canonicalized here: on some hosts (e.g. boe) `/home/<u>`
+/// is a symlink to `/data00/home/<u>`, so the resolved binary lives under a
+/// different spelling than `getpwuid` returns.
 fn trusted_resolved_prefix(path: &Path, home: &Path) -> bool {
     const SYSTEM: &[&str] = &["/opt/homebrew/", "/usr/local/", "/nix/store/"];
     SYSTEM.iter().any(|p| path.starts_with(p))
@@ -240,33 +243,39 @@ fn trusted_resolved_prefix(path: &Path, home: &Path) -> bool {
 
 /// The first absolute candidate that exists, resolves under a trusted prefix
 /// and reports a supported version with a scrubbed environment.
-fn trusted_herdr_bin(ctx: &Ctx, home: &Path) -> Option<String> {
+fn trusted_herdr_bin(ctx: &Ctx, raw_home: &Path) -> Option<String> {
     // Tests script the binary explicitly; when they do not, there is no
     // trusted binary (the candidate scan is production-only so a test host's
     // real Homebrew install can't make identity nondeterministic).
     #[cfg(test)]
-    return ctx.env.var("HP_TEST_HERDR_BIN").map(str::to_string);
+    {
+        let _ = raw_home;
+        return ctx.env.var("HP_TEST_HERDR_BIN").map(str::to_string);
+    }
 
     #[cfg(not(test))]
-    for candidate in bin_candidates(home) {
-        let Ok(resolved) = std::fs::canonicalize(&candidate) else {
-            continue;
-        };
-        if !resolved.is_file() || !trusted_resolved_prefix(&resolved, home) {
-            continue;
-        }
-        let cmd = scrub(Cmd::new(resolved.to_string_lossy().as_ref(), QUERY_TIMEOUT).arg("--version"));
-        let Ok(out) = ctx.runner.run(&cmd) else {
-            continue;
-        };
-        let text = [out.stdout.trim(), out.stderr.trim()].into_iter().find(|t| !t.is_empty()).unwrap_or("");
-        if let Some(version) = crate::herdr::parse_version(text) {
-            if version >= MIN_VERSION {
-                return Some(resolved.to_string_lossy().into_owned());
+    {
+        let home = std::fs::canonicalize(raw_home).unwrap_or_else(|_| raw_home.to_path_buf());
+        for candidate in bin_candidates(raw_home) {
+            let Ok(resolved) = std::fs::canonicalize(&candidate) else {
+                continue;
+            };
+            if !resolved.is_file() || !trusted_resolved_prefix(&resolved, &home) {
+                continue;
+            }
+            let cmd = scrub(Cmd::new(resolved.to_string_lossy().as_ref(), QUERY_TIMEOUT).arg("--version"));
+            let Ok(out) = ctx.runner.run(&cmd) else {
+                continue;
+            };
+            let text = [out.stdout.trim(), out.stderr.trim()].into_iter().find(|t| !t.is_empty()).unwrap_or("");
+            if let Some(version) = crate::herdr::parse_version(text) {
+                if version >= MIN_VERSION {
+                    return Some(resolved.to_string_lossy().into_owned());
+                }
             }
         }
+        None
     }
-    None
 }
 
 /// Scrubs loader-interposition and shell-hijack variables from a command.
