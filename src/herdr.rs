@@ -98,14 +98,13 @@ impl<'a> Herdr<'a> {
         }
     }
 
-    /// `HERDR_SESSION` is removed so an inherited value can never compete with
-    /// the socket this project recorded.
+    /// Every call is pinned to the session this object was built for. We set
+    /// the socket explicitly rather than trusting an inherited
+    /// `HERDR_SOCKET_PATH` — identity checks must talk to a trusted session,
+    /// not one an agent redirected via its environment — and `HERDR_SESSION`
+    /// is removed for the same reason.
     pub fn cmd(&self, timeout: Duration) -> Cmd {
         let mut cmd = Cmd::new(&self.bin, timeout);
-        // An empty socket means "let the CLI resolve its own XDG default":
-        // used by the tty fallback that identifies the pane after an agent
-        // stripped HERDR_SOCKET_PATH. The CLI ignores that var and finds the
-        // server itself; setting it to a real path only selects a session.
         if !self.socket.as_os_str().is_empty() {
             cmd = cmd.env("HERDR_SOCKET_PATH", self.socket.to_string_lossy());
         }

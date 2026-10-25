@@ -22,6 +22,21 @@ pub struct World {
     /// JSON arrays served for `agent list` and `pane list`, changeable mid-test.
     pub agents: Rc<RefCell<String>>,
     pub panes: Rc<RefCell<String>>,
+    /// JSON array served by a cleaned-environment `herdr session list --json`.
+    pub sessions: Rc<RefCell<String>>,
+    /// Raw table served for the identity checker's `ps -ax …` probe: "" makes
+    /// the process unprovable (a bare terminal / CI).
+    pub ps_table: Rc<RefCell<String>>,
+    /// pane_id → process_info JSON the trusted server answers; queries for an
+    /// unlisted pane get `procinfo_fallback`.
+    pub procinfo: Rc<RefCell<Vec<(String, String)>>>,
+    /// The pane `process-info --current` reports (the CLI resolves it by tty;
+    /// scenarios script which pane that is).
+    pub current: Rc<RefCell<String>>,
+    pub procinfo_fallback: Rc<RefCell<Output>>,
+    /// Gates the identity protocol's scripted defaults: off, their matchers
+    /// decline so a test's own `ps`/`session list`/`process-info` rule wins.
+    pub identity_enabled: Rc<std::cell::Cell<bool>>,
     /// The styled screen `agent read --format ansi` serves for every pane.
     pub screen: Rc<RefCell<String>>,
 }
@@ -47,6 +62,12 @@ impl World {
             runner: FakeRunner::new(),
             agents: Rc::new(RefCell::new("[]".into())),
             panes: Rc::new(RefCell::new("[]".into())),
+            sessions: Rc::new(RefCell::new("[]".into())),
+            ps_table: Rc::new(RefCell::new(String::new())),
+            procinfo: Rc::new(RefCell::new(Vec::new())),
+            current: Rc::new(RefCell::new(String::new())),
+            procinfo_fallback: Rc::new(RefCell::new(fail(1, r#"{"error":{"code":"pane_not_found"}}"#))),
+            identity_enabled: Rc::new(std::cell::Cell::new(false)),
             screen: Rc::new(RefCell::new(claude_screen(None))),
             home,
         };
@@ -64,6 +85,49 @@ impl World {
         world.runner.on_fn(
             |cmd| cmd.display().contains("pane list"),
             move |_| Ok(ok(&format!(r#"{{"result":{{"panes":{}}}}}"#, panes.borrow()))),
+        );
+        // Identity protocol: the process table, the trusted session registry
+        // and per-pane process info are all scripted per scenario. They stay
+        // dormant until a scenario enables them, so unrelated tests keep
+        // supplying their own rules for these commands.
+        let ps_table = world.ps_table.clone();
+        let ps_enabled = world.identity_enabled.clone();
+        world.runner.on_fn(
+            move |cmd| {
+                ps_enabled.get()
+                    && cmd.display().contains("ps ")
+                    && cmd.display().contains("pid=,ppid=,pgid=,comm=")
+            },
+            move |_| Ok(ok(&ps_table.borrow())),
+        );
+        let sessions = world.sessions.clone();
+        let sess_enabled = world.identity_enabled.clone();
+        world.runner.on_fn(
+            move |cmd| sess_enabled.get() && cmd.display().contains("session list"),
+            move |_| Ok(ok(&format!(r#"{{"sessions":{}}}"#, sessions.borrow()))),
+        );
+        let procinfo = world.procinfo.clone();
+        let current = world.current.clone();
+        let fallback = world.procinfo_fallback.clone();
+        let pi_enabled = world.identity_enabled.clone();
+        world.runner.on_fn(
+            move |cmd| pi_enabled.get() && cmd.display().contains("pane process-info"),
+            move |cmd| {
+                let pane = if cmd.args.iter().any(|a| a == "--current") {
+                    current.borrow().clone()
+                } else {
+                    cmd.args
+                        .iter()
+                        .position(|a| a == "--pane")
+                        .and_then(|i| cmd.args.get(i + 1))
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                if let Some((_, json)) = procinfo.borrow().iter().find(|(p, _)| p == &pane) {
+                    return Ok(ok(json));
+                }
+                Ok(fallback.borrow().clone())
+            },
         );
         world.runner.on("report-metadata", ok(r#"{"result":{}}"#));
         world
@@ -100,6 +164,61 @@ impl World {
 
     pub fn coordinator_pane(&self, project: &Project) -> String {
         pane_json("w1", "w1:t1", "w1:p1", &project.canonical_dir().to_string_lossy())
+    }
+
+    /// Pids the scripted process table uses for the identity protocol. Each
+    /// pane has its own Herdr terminal host, shell and agent; a command can
+    /// appear in exactly one pane's foreground group. Seeds 9000/9100 pick
+    /// the chain in [`live_pane_env`]/the per-test envs.
+    pub fn script_inside_herdr(&self, sockets: &[&str]) {
+        self.identity_enabled.set(true);
+        *self.ps_table.borrow_mut() = "\
+     1     0     1 /sbin/launchd
+   100     1   100 /opt/homebrew/bin/herdr
+   200   100   200 -zsh
+   201   200   500 claude
+  9000   201   500 sh
+   102     1   102 /opt/homebrew/bin/herdr
+   202   102   202 -zsh
+   203   202   502 claude
+  9100   203   502 sh
+"
+        .into();
+        let listed = sockets
+            .iter()
+            .map(|s| format!(r#"{{"name":"s","default":{def},"running":true,"socket_path":"{s}"}}"#, def = s.ends_with("herdr.sock")))
+            .collect::<Vec<_>>()
+            .join(",");
+        *self.sessions.borrow_mut() = format!("[{listed}]");
+    }
+
+    /// Makes the trusted server's process-info for `pane` place `fg_pid` in
+    /// that pane's foreground group under `shell_pid`. The first pane set is
+    /// also what `process-info --current` reports.
+    pub fn procinfo_proves(&self, pane: &str, shell_pid: u32, fg_pid: u32, group: u32) {
+        let json = format!(
+            r#"{{"result":{{"process_info":{{"pane_id":"{pane}","shell_pid":{shell_pid},"foreground_process_group_id":{group},"foreground_processes":[{{"pid":{fg_pid},"name":"sh"}}]}}}}}}"#
+        );
+        let mut list = self.procinfo.borrow_mut();
+        if !list.iter().any(|(p, _)| p == pane) {
+            list.push((pane.to_string(), json));
+        }
+        drop(list);
+        if self.current.borrow().is_empty() {
+            *self.current.borrow_mut() = pane.to_string();
+        }
+    }
+
+    /// A process table with no Herdr ancestor: a command in a plain terminal.
+    pub fn script_plain_terminal(&self) {
+        self.identity_enabled.set(true);
+        *self.ps_table.borrow_mut() = "\
+     1     0     1 /sbin/launchd
+   300     1   300 Terminal.app
+   301   300   301 -zsh
+  9000   301   301 sh
+"
+        .into();
     }
 
     /// A thread record placed in pane `w2:p1`, working directory `cwd`. It is
@@ -2160,9 +2279,15 @@ fn a_legacy_checkout_thread_gets_one_inbox_note_that_routes_to_its_owner() {
 #[test]
 fn a_coordinator_started_thread_is_owned_by_its_registered_name_and_persists_it() {
     let world = World::new();
-    default_socket(&world);
+    let socket_a = default_socket(&world);
+    let socket_b = world.home.path().join("b.sock");
     let project = world.project("demo", "a.sock");
     let dir = project.canonical_dir().to_string_lossy().into_owned();
+    // Both sessions are trusted (real-home session registry); the process
+    // table and per-pane process-info prove which pane the command is in.
+    world.script_inside_herdr(&[&socket_a, &socket_b.to_string_lossy()]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
+    world.procinfo_proves("w2:p1", 202, 9100, 502);
     *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
     *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
     world.runner.on_fn(
@@ -2211,11 +2336,16 @@ fn a_coordinator_started_thread_is_owned_by_its_registered_name_and_persists_it(
         |cmd| cmd.display().contains("tab create"),
         move |_| Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w2","tab_id":"w2:t2","pane_id":"w2:p2","cwd":"{created2}"}}}}}}"#))),
     );
-    let socket2 = world.home.path().join("b.sock");
-    std::fs::write(&socket2, b"").unwrap();
+    std::fs::write(&socket_b, b"").unwrap();
     let env2 = Env::for_test(
         world.home.path(),
-        &[("HERDR_ENV", "1"), ("HERDR_PANE_ID", "w2:p1"), ("HERDR_SOCKET_PATH", socket2.to_str().unwrap())],
+        &[
+            ("HERDR_ENV", "1"),
+            ("HERDR_PANE_ID", "w2:p1"),
+            ("HERDR_SOCKET_PATH", socket_b.to_str().unwrap()),
+            ("HP_TEST_SELF_PID", "9100"),
+            ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+        ],
     );
     let ctx2 = Ctx { env: &env2, ..world.ctx() };
     let t2 = threads::start(
@@ -2254,9 +2384,11 @@ fn a_thread_started_from_a_bare_shell_is_owner_less_and_omits_owner_from_its_rec
 #[test]
 fn an_unregistered_agent_in_the_project_folder_cannot_start_threads() {
     let world = World::new();
-    default_socket(&world);
+    let socket = default_socket(&world);
     let project = world.project("demo", "a.sock");
     let dir = project.canonical_dir().to_string_lossy().into_owned();
+    world.script_inside_herdr(&[&socket]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
     *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "", "idle"));
     world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term-1"}}}"#));
     let env = live_pane_env(&world, "w1:p1");
@@ -2274,6 +2406,154 @@ fn an_unregistered_agent_in_the_project_folder_cannot_start_threads() {
     assert!(thread::list(&project).is_empty());
     assert!(!project.dir().join("threads/t-0001.task.md").exists());
     assert_eq!(world.runner.count("tab create"), 0);
+}
+
+/// Env with every Herdr pane marker stripped: the attacker model is a
+/// coordinator running `env -u HERDR_ENV -u HERDR_PANE_ID …`. Only the
+/// scripted process facts (seed pid) and passwd home remain.
+fn stripped_caller_env(world: &World, self_pid: &str) -> Env {
+    Env::for_test(
+        world.home.path(),
+        &[
+            ("HP_TEST_SELF_PID", self_pid),
+            ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+        ],
+    )
+}
+
+#[test]
+fn stripping_pane_markers_cannot_downgrade_a_coordinator_to_a_human() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    world.script_inside_herdr(&[&socket]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
+    world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term-1"}}}"#));
+
+    let env = stripped_caller_env(&world, "9000");
+    let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
+    assert!(matches!(caller, coordinator::Caller::Coordinator { ref name, .. } if name == "hpc-demo"), "{caller:?}");
+}
+
+#[test]
+fn a_socket_outside_the_trusted_set_cannot_answer_identity_questions() {
+    let world = World::new();
+    let _trusted = default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    // Process facts show a Herdr pane, but the real-home session registry is
+    // empty and the trusted (recorded) socket proves no pane: the attacker's
+    // fake socket must never be consulted.
+    world.script_inside_herdr(&[]);
+    *world.sessions.borrow_mut() = "[]".into();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
+    let fake = world.home.path().join("fake.sock");
+    let env = Env::for_test(
+        world.home.path(),
+        &[
+            ("HERDR_ENV", "1"),
+            ("HERDR_PANE_ID", "w1:p1"),
+            ("HERDR_SOCKET_PATH", fake.to_str().unwrap()),
+            ("HP_TEST_SELF_PID", "9000"),
+            ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+        ],
+    );
+    let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
+    assert!(matches!(caller, coordinator::Caller::Unverified { .. }), "{caller:?}");
+    let queried_fake = world.runner.calls.borrow().iter().any(|c| {
+        c.display().contains("process-info")
+            && c.env.iter().any(|(k, v)| k == "HERDR_SOCKET_PATH" && v.ends_with("fake.sock"))
+    });
+    assert!(!queried_fake, "identity must never be proven by the env-supplied socket");
+}
+
+#[test]
+fn the_focused_pane_fallback_for_a_foreign_tty_is_not_accepted_as_proof() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    world.script_inside_herdr(&[&socket]);
+    // The trusted server's `pane current` falls back to a focused pane whose
+    // process-info places unrelated pids there; no pane's process info proves
+    // this command. Unmarked, it is an unplaceable (plain) process: Human.
+    world.procinfo.borrow_mut().push((
+        "w9:p9".into(),
+        ok(r#"{"result":{"process_info":{"pane_id":"w9:p9","shell_pid":4242,"foreground_process_group_id":4242,"foreground_processes":[{"pid":4242,"name":"zsh"}]}}}"#).stdout,
+    ));
+    *world.current.borrow_mut() = "w9:p9".into();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w9", "w9:t1", "w9:p9", &dir, "hpc-demo", "idle"));
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w9", "w9:t1", "w9:p9", &dir));
+    world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w9:p9","terminal_id":"term-x"}}}"#));
+
+    let env = stripped_caller_env(&world, "9000");
+    assert_eq!(
+        coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project),
+        coordinator::Caller::Human
+    );
+
+    // The same unprovable process WITH the pane marker fails closed instead.
+    let marked = Env::for_test(
+        world.home.path(),
+        &[
+            ("HERDR_ENV", "1"),
+            ("HERDR_PANE_ID", "w9:p9"),
+            ("HERDR_SOCKET_PATH", &socket),
+            ("HP_TEST_SELF_PID", "9000"),
+            ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+        ],
+    );
+    assert!(matches!(
+        coordinator::caller(&Ctx { env: &marked, ..world.ctx() }, &project),
+        coordinator::Caller::Unverified { .. }
+    ));
+}
+
+#[test]
+fn a_wrong_hint_pane_cannot_hijack_identity_the_real_pane_still_wins() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    world.script_inside_herdr(&[&socket]);
+    // The tty resolves to an unrelated pane w9 (the focused-pane fallback),
+    // but the command's process facts place it in w1:p1, the coordinator.
+    world.procinfo.borrow_mut().push((
+        "w9:p9".into(),
+        ok(r#"{"result":{"process_info":{"pane_id":"w9:p9","shell_pid":4242,"foreground_process_group_id":4242,"foreground_processes":[{"pid":4242,"name":"zsh"}]}}}"#).stdout,
+    ));
+    *world.current.borrow_mut() = "w9:p9".into();
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"),
+        agent_json("w9", "w9:t1", "w9:p9", "/elsewhere", "someone-else", "idle")
+    );
+    world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w9:p9","terminal_id":"term-x"}}}"#));
+    // Exhaustive `pane list` enumeration, which makes the real pane provable.
+    *world.panes.borrow_mut() = format!(
+        "[{},{}]",
+        pane_json("w1", "w1:t1", "w1:p1", &dir),
+        pane_json("w9", "w9:t1", "w9:p9", "/elsewhere")
+    );
+
+    let env = stripped_caller_env(&world, "9000");
+    let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
+    assert!(matches!(caller, coordinator::Caller::Coordinator { ref name, .. } if name == "hpc-demo"), "{caller:?}");
+}
+
+#[test]
+fn a_plain_terminal_without_markers_is_a_human_anywhere_on_disk() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    world.script_plain_terminal();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
+    let env = stripped_caller_env(&world, "9000");
+    let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
+    assert_eq!(caller, coordinator::Caller::Human, "{caller:?}");
 }
 
 #[test]
@@ -2812,16 +3092,30 @@ fn adopt_is_idempotent_and_refuses_every_invalid_pane() {
 }
 
 /// An env that looks like a command running live inside Herdr pane `pane`.
+/// Tests that need the caller PROVEN to be that pane must also script the
+/// identity protocol: [`World::script_inside_herdr`] plus a `pane current`
+/// answer; this helper only carries the markers.
 fn live_pane_env(world: &World, pane: &str) -> Env {
-    Env::for_test(world.home.path(), &[("HERDR_ENV", "1"), ("HERDR_PANE_ID", pane), ("HERDR_SOCKET_PATH", &default_socket(world))])
+    Env::for_test(
+        world.home.path(),
+        &[
+            ("HERDR_ENV", "1"),
+            ("HERDR_PANE_ID", pane),
+            ("HERDR_SOCKET_PATH", &default_socket(world)),
+            ("HP_TEST_SELF_PID", "9000"),
+            ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+        ],
+    )
 }
 
 #[test]
 fn context_is_refused_for_an_unregistered_root_pane_and_marks_nothing() {
     let world = World::new();
-    default_socket(&world);
+    let socket = default_socket(&world);
     let project = project::create(&world.root, "demo", "", vec![]).unwrap();
     let dir = project.canonical_dir().to_string_lossy().into_owned();
+    world.script_inside_herdr(&[&socket]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
     inbox::write(&project, "routine", "r", "due", "Prompt", "").unwrap();
     *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "", "idle"));
     world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term-1"}}}"#));
@@ -2850,19 +3144,23 @@ fn context_is_refused_for_an_unregistered_root_pane_and_marks_nothing() {
 #[test]
 fn context_serves_a_subfolder_pane_and_a_bare_shell_without_the_registration_gate() {
     let world = World::new();
-    default_socket(&world);
+    let socket = default_socket(&world);
     let project = project::create(&world.root, "demo", "", vec![]).unwrap();
     let sub = project.canonical_dir().join("threads/t-0001").to_string_lossy().into_owned();
     std::fs::create_dir_all(&sub).unwrap();
     inbox::write(&project, "routine", "r", "due", "Prompt", "").unwrap();
 
     // A live pane in a SUBfolder (a thread pane) is not gated, named or not.
+    world.script_inside_herdr(&[&socket]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
     *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &sub, "", "idle"));
     world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term-1"}}}"#));
     let ctx = Ctx { env: &live_pane_env(&world, "w1:p1"), ..world.ctx() };
     coordinator::context(&ctx, "demo", false).unwrap();
 
-    // No live pane at all (bare shell): the old flat digest works too.
+    // No Herdr ancestor and no markers (a bare shell outside Herdr): the old
+    // flat digest works too.
+    world.script_plain_terminal();
     *world.agents.borrow_mut() = "[]".into();
     coordinator::context(&world.ctx(), "demo", true).unwrap();
 }
@@ -3011,8 +3309,32 @@ fn two_coordinator_world() -> (World, Project, Env, Env) {
         },
     );
     world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
-    let env_a = Env::for_test(world.home.path(), &[("HERDR_ENV", "1"), ("HERDR_PANE_ID", "w1:p1"), ("HERDR_SOCKET_PATH", socket_a.to_str().unwrap())]);
-    let env_b = Env::for_test(world.home.path(), &[("HERDR_ENV", "1"), ("HERDR_PANE_ID", "w2:p1"), ("HERDR_SOCKET_PATH", socket_b.to_str().unwrap())]);
+    world.script_inside_herdr(&[
+        &socket_a.to_string_lossy(),
+        &socket_b.to_string_lossy(),
+    ]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
+    world.procinfo_proves("w2:p1", 202, 9100, 502);
+    let env_a = Env::for_test(
+        world.home.path(),
+        &[
+            ("HERDR_ENV", "1"),
+            ("HERDR_PANE_ID", "w1:p1"),
+            ("HERDR_SOCKET_PATH", socket_a.to_str().unwrap()),
+            ("HP_TEST_SELF_PID", "9000"),
+            ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+        ],
+    );
+    let env_b = Env::for_test(
+        world.home.path(),
+        &[
+            ("HERDR_ENV", "1"),
+            ("HERDR_PANE_ID", "w2:p1"),
+            ("HERDR_SOCKET_PATH", socket_b.to_str().unwrap()),
+            ("HP_TEST_SELF_PID", "9100"),
+            ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+        ],
+    );
     (world, project, env_a, env_b)
 }
 
@@ -3190,7 +3512,7 @@ fn an_ownerless_legacy_checkout_note_still_nudges_project_wide_exactly_once() {
 
 #[test]
 fn an_item_of_an_assigned_then_resolved_thread_displays_to_the_current_owner_only() {
-    let (world, project, _env_a, env_b) = two_coordinator_world();
+    let (world, project, _env_a, _env_b) = two_coordinator_world();
     let mut t = thread::allocate(&project, |t| {
         t.title = "Task".into();
         t.status = Status::Open;
@@ -3211,7 +3533,7 @@ fn an_item_of_an_assigned_then_resolved_thread_displays_to_the_current_owner_onl
 
 #[test]
 fn assigning_a_thread_back_to_its_recorded_owner_is_idempotent_without_liveness() {
-    let (mut world, project, _env_a, env_b) = two_coordinator_world();
+    let (world, project, _env_a, env_b) = two_coordinator_world();
     let dir = project.canonical_dir().to_string_lossy().into_owned();
     // Only hpc-demo-1 is live now; the recorded owner hpc-demo is gone.
     *world.agents.borrow_mut() = format!("[{}]", agent_json("w2", "w2:t1", "w2:p1", &dir, "hpc-demo-1", "idle"));

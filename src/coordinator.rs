@@ -209,35 +209,16 @@ pub enum Caller {
 /// Identifies the caller from the Herdr pane the process runs in.
 ///
 /// Identity is the agent's REGISTERED name; the pane's working directory only
-/// decides what an unnamed/foreign agent is. Fail CLOSED whenever pane markers
-/// prove the process is inside Herdr but the agent cannot be accounted for:
-/// the old "every lookup miss is a Human" rule let a coordinator drive any
-/// thread with `env -u HERDR_ENV`, opting out of ownership entirely.
+/// decides what an unnamed/foreign agent is. The proof that a process really
+/// runs in a given pane is its process ancestry/group cross-checked against a
+/// TRUSTED server — never the strippable `HERDR_*` markers or an
+/// attacker-redirectable socket. Fail CLOSED whenever the process is
+/// demonstrably inside Herdr (marked, or with a Herdr terminal ancestor) but
+/// no pane can be proven: the old "every lookup miss is a Human" rule let a
+/// coordinator drive any thread with `env -u HERDR_ENV`.
 pub fn caller(ctx: &Ctx, project: &Project) -> Caller {
-    // The injected pane env is the normal path; a controlling-tty fallback
-    // (`pane current --current`) catches a caller whose pane markers were
-    // stripped — an agent's shell-tool child has piped stdin but still shares
-    // the pane's controlling terminal, unlike a setsid-detached ticker, a
-    // pipe or CI.
     let marked = ctx.env.var("HERDR_ENV").as_deref() == Some("1");
-    let Some((pane_id, socket)) = identify_pane(ctx) else {
-        return if marked {
-            // Claims to run in a pane, but neither env nor tty says which.
-            Caller::Unverified { pane: String::new() }
-        } else {
-            // No pane anywhere: a real terminal, a script, CI, the ticker.
-            Caller::Human
-        };
-    };
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
-    let Ok(agents) = herdr.agent_list() else {
-        return Caller::Unverified { pane: pane_id };
-    };
-    let Some(agent) = agents.iter().find(|a| a.pane_id == pane_id) else {
-        // The pane exists but runs no agent: a person typing in a Herdr shell.
-        return Caller::Human;
-    };
-    classify(&project.slug, &project.canonical_dir().to_string_lossy(), &pane_id, agent)
+    crate::identify::identify(ctx, project, marked)
 }
 
 /// The pure identity decision for a live agent row. A coordinator family
@@ -253,32 +234,6 @@ pub(crate) fn classify(slug: &str, dir: &str, pane_id: &str, agent: &Agent) -> C
         return Caller::Stranger { pane: pane_id.to_string() };
     }
     Caller::Human
-}
-
-/// Whether this process has a controlling terminal. A shell-tool child an
-/// agent spawns keeps the pane's terminal even with piped stdin, while a
-/// setsid-detached ticker, a plain pipe and CI have none — this is the seam
-/// the stripped-env fallback keys on.
-fn has_controlling_tty() -> bool {
-    std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").is_ok()
-}
-
-/// `(pane id, socket to reach it)`: injected env first, controlling-tty
-/// fallback (interactive terminals only). An empty socket means "the CLI's
-/// own default socket".
-fn identify_pane(ctx: &Ctx) -> Option<(String, std::path::PathBuf)> {
-    if let Some(current) = crate::progress::current(ctx.env, ctx.runner) {
-        return Some((current.pane_id, std::path::PathBuf::from(current.socket)));
-    }
-    if !has_controlling_tty() {
-        return None;
-    }
-    // No injected identity; ask the CLI from the tty, without overriding its
-    // socket resolution. A terminal Herdr does not own simply gets no answer.
-    let herdr = Herdr::new(ctx.env.herdr_bin(), std::path::PathBuf::new(), ctx.runner);
-    let result = herdr.call(&["pane", "current", "--current"], Duration::from_secs(2)).ok()?;
-    let pane_id = result.get("pane")?.get("pane_id")?.as_str()?;
-    Some((pane_id.to_string(), std::path::PathBuf::new()))
 }
 /// The refusal an unregistered agent in the project folder gets.
 pub fn stranger_refusal(prefix: &str, slug: &str, pane: &str) -> anyhow::Error {
