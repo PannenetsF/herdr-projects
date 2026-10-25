@@ -141,6 +141,18 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     if args.task.trim().is_empty() {
         bail!("the task is empty");
     }
+    // Who is starting this: a registered coordinator owns it; a person's
+    // shell leaves it owner-less (it lands in Unassigned until `thread
+    // assign`). An unnamed agent in the project folder is turned away before
+    // anything is created, as `context` turns it away.
+    let owner = match coordinator::caller(ctx, &project) {
+        coordinator::Caller::Coordinator { name, .. } => Some(name),
+        coordinator::Caller::Human => None,
+        coordinator::Caller::Stranger { pane } => {
+            let prefix = coordinator::current_prefix(&ctx.root)?;
+            return Err(coordinator::stranger_refusal(&prefix, slug, &pane));
+        }
+    };
     let (settings, _) = project.read_project_md()?;
     // Without a running ticker nothing launches.
     ticker::start(ctx)?;
@@ -183,6 +195,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         t.kind = kind;
         t.repo = repo.clone();
         t.machine = machine.clone();
+        t.owner = owner.unwrap_or_default();
         profile.apply(t);
         t.base = args.base.clone().unwrap_or_default();
     })?;

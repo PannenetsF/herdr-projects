@@ -89,6 +89,13 @@ pub struct Thread {
     pub branch: String,
     pub base: String,
     pub machine: String,
+    /// The registered coordinator name (`hpc-<slug>` family) that spawned the
+    /// thread; empty for a thread a person started from a bare shell and for
+    /// threads made before pf.5. The owner alone is shown the thread in
+    /// `context`, may prompt it and send its Next, and receives its nudges;
+    /// an owner-less thread sits in every coordinator's Unassigned area until
+    /// `thread assign` names an owner.
+    pub owner: String,
     pub worktree_path: String,
     pub thread_dir: String,
     pub workspace_id: String,

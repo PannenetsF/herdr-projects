@@ -52,6 +52,14 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
     if title.trim().is_empty() {
         bail!("--title may not be empty");
     }
+    let owner = match coordinator::caller(ctx, &project) {
+        coordinator::Caller::Coordinator { name, .. } => Some(name),
+        coordinator::Caller::Human => None,
+        coordinator::Caller::Stranger { pane } => {
+            let prefix = coordinator::current_prefix(&ctx.root)?;
+            return Err(coordinator::stranger_refusal(&prefix, slug, &pane));
+        }
+    };
     let record = project.coordinator().with_context(|| format!("`{slug}` has never been opened; run `open {slug}` first"))?;
     ticker::start(ctx)?;
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
@@ -69,6 +77,7 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
     let created = thread::allocate(&project, |t| {
         t.title = title.trim().to_string();
         t.kind = Kind::Adopted;
+        t.owner = owner.unwrap_or_default();
         t.repo = repo;
         t.branch = branch;
         t.origin = origin;

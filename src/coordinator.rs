@@ -183,6 +183,52 @@ fn recorded_profile(record: &Coordinator) -> &str {
     if record.profile.is_empty() { &record.agent } else { &record.profile }
 }
 
+/// Whoever invoked a command in this process, by the Herdr pane it runs in.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Caller {
+    /// No live Herdr pane can be identified (a bare shell, CI, a pane the
+    /// session no longer lists): a person at a terminal. Person callers keep
+    /// every power, including touching owner-less threads.
+    Human,
+    /// A registered coordinator of this project working in its folder; the
+    /// string is its registered name and `pane` its Herdr pane id.
+    Coordinator { name: String, pane: String },
+    /// A live agent sitting in the project folder without a registered
+    /// coordinator name. It must neither read the digest nor drive threads.
+    Stranger { pane: String },
+}
+
+/// Identifies the caller from the process's Herdr pane env. Any lookup miss is
+/// [`Caller::Human`], like `context`'s registration gate: a pane outside a
+/// live session is a person, never refused.
+pub fn caller(ctx: &Ctx, project: &Project) -> Caller {
+    let Some(current) = crate::progress::current(ctx.env, ctx.runner) else {
+        return Caller::Human;
+    };
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &current.socket, ctx.runner);
+    let Ok(agents) = herdr.agent_list() else {
+        return Caller::Human;
+    };
+    let Some(agent) = agents.iter().find(|a| a.pane_id == current.pane_id) else {
+        return Caller::Human;
+    };
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    if is_coordinator(&project.slug, &dir, agent) {
+        return Caller::Coordinator { name: agent.name.clone(), pane: current.pane_id.clone() };
+    }
+    if agent.works_in(&dir) {
+        return Caller::Stranger { pane: current.pane_id.clone() };
+    }
+    Caller::Human
+}
+
+/// The refusal an unregistered agent in the project folder gets.
+pub fn stranger_refusal(prefix: &str, slug: &str, pane: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "pane {pane} is in the `{slug}` project folder but is NOT a registered coordinator; this session must not drive the project. Register it with `{prefix} coordinator adopt {slug} --pane {pane}`, then run the command again"
+    )
+}
+
 pub struct OpenOptions {
     pub session: SessionFlags,
     pub rebind: bool,

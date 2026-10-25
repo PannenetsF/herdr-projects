@@ -2075,6 +2075,124 @@ fn a_tab_thread_with_a_repo_gets_its_brief_seconds_after_its_agent_is_ready() {
 }
 
 #[test]
+fn a_coordinator_started_thread_is_owned_by_its_registered_name_and_persists_it() {
+    let world = World::new();
+    default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("pane current"),
+        |cmd| {
+            // The fake answers as pane w2:p1 only on the second pane's socket.
+            let second = cmd.env.iter().any(|(k, v)| k == "HERDR_SOCKET_PATH" && v.ends_with("b.sock"));
+            let (pane, term) = if second { ("w2:p1", "term-2") } else { ("w1:p1", "term-1") };
+            Ok(ok(&format!(r#"{{"result":{{"pane":{{"pane_id":"{pane}","terminal_id":"{term}"}}}}}}"#)))
+        },
+    );
+    let cwd = project.canonical_dir().join("threads/t-0001").to_string_lossy().into_owned();
+    let created = cwd.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("tab create"),
+        move |_| Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"{created}"}}}}}}"#))),
+    );
+    world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+
+    let env = live_pane_env(&world, "w1:p1");
+    let ctx = Ctx { env: &env, ..world.ctx() };
+    let t = threads::start(
+        &ctx,
+        "demo",
+        StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() },
+    )
+    .unwrap();
+    assert_eq!(t.owner, "hpc-demo");
+    let saved = std::fs::read_to_string(thread::record_path(&project, "t-0001")).unwrap();
+    assert!(saved.contains("owner = \"hpc-demo\""), "{saved}");
+
+    // A second coordinator name on the same project is recorded as-is.
+    *world.agents.borrow_mut() = format!(
+        "[{},{}]",
+        agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"),
+        agent_json("w2", "w2:t1", "w2:p1", &dir, "hpc-demo-1", "idle")
+    );
+    *world.panes.borrow_mut() = format!(
+        "[{},{}]",
+        world.coordinator_pane(&project),
+        pane_json("w2", "w2:t1", "w2:p1", &dir)
+    );
+    let cwd2 = project.canonical_dir().join("threads/t-0002").to_string_lossy().into_owned();
+    let created2 = cwd2.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("tab create"),
+        move |_| Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w2","tab_id":"w2:t2","pane_id":"w2:p2","cwd":"{created2}"}}}}}}"#))),
+    );
+    let socket2 = world.home.path().join("b.sock");
+    std::fs::write(&socket2, b"").unwrap();
+    let env2 = Env::for_test(
+        world.home.path(),
+        &[("HERDR_ENV", "1"), ("HERDR_PANE_ID", "w2:p1"), ("HERDR_SOCKET_PATH", socket2.to_str().unwrap())],
+    );
+    let ctx2 = Ctx { env: &env2, ..world.ctx() };
+    let t2 = threads::start(
+        &ctx2,
+        "demo",
+        StartArgs { title: "More".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look too.".into() },
+    )
+    .unwrap();
+    assert_eq!(t2.owner, "hpc-demo-1");
+}
+
+#[test]
+fn a_thread_started_from_a_bare_shell_is_owner_less_and_omits_owner_from_its_record() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let folder = project.dir().join("threads/t-0001");
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("tab create"),
+        move |_| Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"{}"}}}}}}"#, folder.display()))),
+    );
+    world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    // The scrubbed World env is not a Herdr pane: no `pane current` call happens.
+    let t = threads::start(
+        &world.ctx(),
+        "demo",
+        StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() },
+    )
+    .unwrap();
+    assert!(t.owner.is_empty());
+    assert_eq!(thread::load(&project, "t-0001").unwrap().owner, "");
+    assert_eq!(world.runner.count("pane current"), 0);
+}
+
+#[test]
+fn an_unregistered_agent_in_the_project_folder_cannot_start_threads() {
+    let world = World::new();
+    default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "", "idle"));
+    world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term-1"}}}"#));
+    let env = live_pane_env(&world, "w1:p1");
+    let ctx = Ctx { env: &env, ..world.ctx() };
+    let error = threads::start(
+        &ctx,
+        "demo",
+        StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("NOT a registered coordinator"), "{error}");
+    assert!(error.contains("coordinator adopt demo --pane w1:p1"), "{error}");
+    // The refusal created neither a record nor a task file.
+    assert!(thread::list(&project).is_empty());
+    assert!(!project.dir().join("threads/t-0001.task.md").exists());
+    assert_eq!(world.runner.count("tab create"), 0);
+}
+
+#[test]
 fn a_tab_thread_gets_a_brief_with_the_project_header_and_prompts_are_recorded() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
