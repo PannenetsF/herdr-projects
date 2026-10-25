@@ -210,7 +210,7 @@ fn give_up(project: &Project, t: &mut Thread, why: &str) -> Result<Outcome> {
             "{}: its brief did not get through ({why}). `thread read {} {}` shows the pane; `thread brief` sends it once the input box is empty",
             t.id, project.slug, t.id
         );
-        inbox::write_origin(project, "thread-state", &t.id, "brief not delivered", &summary, "", &t.origin_pane())?;
+        inbox::write_thread(project, t, "thread-state", "brief not delivered", &summary, "")?;
     }
     Ok(Outcome::Stuck)
 }

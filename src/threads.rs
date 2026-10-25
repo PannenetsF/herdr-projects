@@ -541,6 +541,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     if record.prompt_pending {
         bail!("{id} has not received its brief yet; the ticker sends it once the agent is ready, and `thread brief` sends it now");
     }
+    require_owner(ctx, &project, &record, "post a prompt")?;
     let view = require_session(ctx, &project)?;
     let (agents, _) = lists_for(&view, &record)?;
     let state = prompt_state(&record, &agents)?;
@@ -578,12 +579,79 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     Ok(state)
 }
 
+/// Refuses when a live coordinator is not the thread's owner. A person at a
+/// terminal (no live pane) is always allowed; an owner-less thread is refused
+/// to every coordinator until `thread assign` names an owner.
+pub fn require_owner(ctx: &Ctx, project: &Project, record: &Thread, action: &str) -> Result<()> {
+    match coordinator::caller(ctx, project) {
+        coordinator::Caller::Human => Ok(()),
+        coordinator::Caller::Stranger { pane } => {
+            let prefix = coordinator::current_prefix(&ctx.root)?;
+            Err(coordinator::stranger_refusal(&prefix, &project.slug, &pane))
+        }
+        coordinator::Caller::Coordinator { name, .. } => {
+            if record.owner == name {
+                Ok(())
+            } else if record.owner.is_empty() {
+                bail!(
+                    "{action}: {} is unassigned; claim it first with `hp thread assign {} {} --coordinator {name}`",
+                    record.id,
+                    project.slug,
+                    record.id
+                )
+            } else {
+                bail!("{action}: {} is owned by coordinator `{}`; only that coordinator may drive it (claim it with `hp thread assign {} {} --coordinator <your-name>`)", record.id, record.owner, project.slug, record.id)
+            }
+        }
+    }
+}
+
+/// `thread assign <id> --coordinator <name>`: the one way an owner-less (or
+/// any) thread changes owner. A registered coordinator of this project, a
+/// person's shell, or another registered coordinator may run it; the target
+/// name must be a live registered coordinator of this project. Assigning
+/// also moves the thread's already-written inbox items, since their routing
+/// follows the live record.
+pub fn assign(ctx: &Ctx, slug: &str, id: &str, coordinator_name: &str) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    thread::validate_id(id)?;
+    let record = thread::load(&project, id)?;
+    if !crate::names::is_coordinator_name(slug, coordinator_name) {
+        bail!("`{coordinator_name}` is not a coordinator name of `{slug}` (the `hpc-{slug}` family; `open --new` or `coordinator adopt` allocates one)");
+    }
+    // Only a registered, live coordinator can receive work: nudges route to a
+    // live pane. An unregistered agent in the folder must not assign threads
+    // to itself or anyone else.
+    let view = require_session(ctx, &project)?;
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    if !view.agents.iter().any(|a| a.name == coordinator_name && coordinator::is_coordinator(slug, &dir, a)) {
+        bail!("no registered coordinator `{coordinator_name}` is live in `{slug}`; open or adopt one first (`herdr agent list` shows names)");
+    }
+    match coordinator::caller(ctx, &project) {
+        coordinator::Caller::Stranger { pane } => {
+            let prefix = coordinator::current_prefix(&ctx.root)?;
+            return Err(coordinator::stranger_refusal(&prefix, slug, &pane));
+        }
+        coordinator::Caller::Human | coordinator::Caller::Coordinator { .. } => {}
+    }
+    if record.owner == coordinator_name {
+        println!("{id} is already owned by `{coordinator_name}`");
+        return Ok(());
+    }
+    let previous = if record.owner.is_empty() { "unassigned".to_string() } else { format!("`{}`", record.owner) };
+    thread::update(&project, id, |t| t.owner = coordinator_name.to_string())?;
+    println!("{id} reassigned from {previous} to `{coordinator_name}`; its open inbox items route with it");
+    Ok(())
+}
+
 /// `thread next`: forward line N of the thread's Next list as a prompt, or add
 /// a line the coordinator wants on that list.
 pub fn next(ctx: &Ctx, slug: &str, id: &str, line: Option<usize>, add: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    thread::load(&project, id)?;
+    let record = thread::load(&project, id)?;
     if let Some(text) = add {
+        // Adding to the Next list is driving the thread: owner only.
+        require_owner(ctx, &project, &record, "add a Next line")?;
         let text = text.trim();
         if text.is_empty() || text.contains('\n') {
             bail!("a Next line is one non-empty line");
@@ -823,7 +891,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     for note in &notes {
         println!("  - {note}");
     }
-    crate::inbox::write_origin(&project, "thread-state", id, "resolved", &format!("{id} \"{}\" was resolved: {}", resolved.title, notes.join("; ")), "", &resolved.origin_pane())?;
+    crate::inbox::write_thread(&project, &resolved, "thread-state", "resolved", &format!("{id} \"{}\" was resolved: {}", resolved.title, notes.join("; ")), "")?;
     Ok(())
 }
 
@@ -940,7 +1008,7 @@ fn last_pr_lookup(ctx: &Ctx, project: &Project, t: &Thread) -> Option<crate::pr:
             r.pr_state = state;
             r.pr_review = review;
         });
-        let _ = crate::inbox::write_origin(project, "pr", &t.id, "PR found at resolve", &format!("{}: pull request {} (found at resolve)", crate::steps::thread_label(t), pr::describe_change(None, &summary)), "", &t.origin_pane());
+        let _ = crate::inbox::write_thread(project, t, "pr", "PR found at resolve", &format!("{}: pull request {} (found at resolve)", crate::steps::thread_label(t), pr::describe_change(None, &summary)), "");
     }
     Some(summary)
 }

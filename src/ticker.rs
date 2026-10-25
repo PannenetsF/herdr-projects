@@ -748,7 +748,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
                         t.id,
                         refused.join(" "),
                     );
-                    inbox::write_origin(project, "thread-state", &t.id, "launched without some flags", &summary, "", &t.origin_pane())?;
+                    inbox::write_thread(project, &t, "thread-state", "launched without some flags", &summary, "")?;
                 }
                 let builtin = config.get(&t.agent).filter(|p| p.builtin).map(|p| crate::profiles::launch_args(&p, &safety.thread_agent_args, &legacy)).unwrap_or_default();
                 (t.agent.clone(), [builtin, model].concat())
@@ -884,8 +884,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         let mut state = steps::load_state(project);
         let before = state.clone();
         let now = jiff::Timestamp::now();
-        let target = coordinator::nudge_target(&coordinators, now, &record.pane_id, &state.nudge_session);
-        if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, target, now) {
+        if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, &coordinators, &record.pane_id, now) {
             first_error = first_error.or(Some(error.context("nudge")));
         }
         if state != before {

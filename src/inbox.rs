@@ -23,6 +23,12 @@ pub struct Item {
     /// The pane the owning thread ran in; thread-derived events only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_pane: Option<String>,
+    /// The registered coordinator that owned the thread when the item was
+    /// written; thread-derived events only. The live thread record is
+    /// re-checked at read time, so assigning a thread moves even items
+    /// written before the assignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// Empty except for `routine` items.
     #[serde(skip)]
     pub body: String,
@@ -56,16 +62,37 @@ pub fn safe_subject(subject: &str) -> String {
 /// tick never share a name. `event` is a fixed phrase from this binary. `body`
 /// is empty except for `routine` items.
 pub fn write(project: &Project, kind: &str, subject: &str, event: &str, summary: &str, body: &str) -> Result<String> {
-    write_item(project, kind, subject, event, summary, body, None)
+    write_item(project, kind, subject, event, summary, body, None, None)
 }
 
 /// Like [`write`], for an event derived from a thread: records the pane the
-/// thread ran in. An empty pane id is treated as absent.
+/// thread ran in. An empty pane id is treated as absent. Thread-derived
+/// items written by the binary itself go through [`write_thread`], which
+/// also inherits the owner; this remains for tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn write_origin(project: &Project, kind: &str, subject: &str, event: &str, summary: &str, body: &str, origin_pane: &str) -> Result<String> {
-    write_item(project, kind, subject, event, summary, body, (!origin_pane.is_empty()).then(|| origin_pane.to_string()))
+    write_item(project, kind, subject, event, summary, body, (!origin_pane.is_empty()).then(|| origin_pane.to_string()), None)
 }
 
-fn write_item(project: &Project, kind: &str, subject: &str, event: &str, summary: &str, body: &str, origin_pane: Option<String>) -> Result<String> {
+/// Like [`write_origin`], and inherits the thread's owner: the registered
+/// coordinator the item must be shown and nudged to. Every ticker item about
+/// a thread goes through here, so two coordinators can never split one
+/// thread's events.
+pub fn write_thread(project: &Project, t: &crate::thread::Thread, kind: &str, event: &str, summary: &str, body: &str) -> Result<String> {
+    let pane = t.origin_pane();
+    write_item(
+        project,
+        kind,
+        &t.id,
+        event,
+        summary,
+        body,
+        (!pane.is_empty()).then(|| pane),
+        (!t.owner.is_empty()).then(|| t.owner.clone()),
+    )
+}
+
+fn write_item(project: &Project, kind: &str, subject: &str, event: &str, summary: &str, body: &str, origin_pane: Option<String>, owner: Option<String>) -> Result<String> {
     let _lock = project.lock()?;
     let counter_path = project.state_dir().join("inbox-counter.json");
     let n: u64 = project::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
@@ -81,6 +108,7 @@ fn write_item(project: &Project, kind: &str, subject: &str, event: &str, summary
         summary: summary.chars().map(|c| if c.is_control() { ' ' } else { c }).collect(),
         event: event.to_string(),
         origin_pane,
+        owner,
         body: String::new(),
     };
     let mut text = format!("+++\n{}+++\n", toml::to_string(&item)?);
@@ -127,22 +155,124 @@ pub fn unhandled(project: &Project) -> Vec<Item> {
     items
 }
 
-pub fn seen(project: &Project) -> BTreeSet<String> {
-    project::read_json(&project.state_dir().join("inbox-seen.json")).unwrap_or_default()
+/// The owner an item is routed to right now: its thread's current owner when
+/// the item is thread-derived and that thread still exists (so `thread
+/// assign` moves items already on disk), else the owner baked into the item.
+/// Owner-less for items without a thread (routines, outages, session notes).
+pub fn effective_owner(item: &Item, threads: &[crate::thread::Thread]) -> Option<String> {
+    if crate::thread::validate_id(&item.subject).is_ok()
+        && let Some(t) = threads.iter().find(|t| t.id == item.subject)
+        && !t.owner.is_empty()
+    {
+        return Some(t.owner.clone());
+    }
+    item.owner.clone()
 }
 
-/// Records that `context` showed these items, so they are nudged once only.
-pub fn mark_seen(project: &Project, ids: &[String]) -> Result<()> {
+/// Per-coordinator seen ids live in `.state/inbox-seen/<name>.json`. This is
+/// the shared bucket the pre-pf.5 global file is migrated into, and where a
+/// reader without a coordinator name (a person's bare shell) marks items:
+/// unioned into every coordinator's seen set, it keeps the old "seen once,
+/// nudged never again" behavior for owner-less items.
+pub const LEGACY_BUCKET: &str = "_legacy";
+
+fn seen_dir(project: &Project) -> PathBuf {
+    project.state_dir().join("inbox-seen")
+}
+
+fn valid_bucket(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+fn bucket_path(project: &Project, name: &str) -> PathBuf {
+    seen_dir(project).join(format!("{name}.json"))
+}
+
+fn read_bucket(project: &Project, name: &str) -> BTreeSet<String> {
+    project::read_json(&bucket_path(project, name)).unwrap_or_default()
+}
+
+/// The one-time migration of the project-global `inbox-seen.json`: its ids
+/// become the shared legacy bucket, which every coordinator's seen set
+/// includes. Callers hold the project lock.
+fn migrate_seen_locked(project: &Project) -> Result<()> {
+    let legacy = project.state_dir().join("inbox-seen.json");
+    let target = bucket_path(project, LEGACY_BUCKET);
+    if legacy.is_file() && !target.is_file() {
+        let ids: BTreeSet<String> = project::read_json(&legacy).unwrap_or_default();
+        std::fs::create_dir_all(seen_dir(project))?;
+        project::write_json(&target, &ids)?;
+        std::fs::remove_file(&legacy)?;
+    }
+    Ok(())
+}
+
+/// Runs the one-time migration under the project lock; safe to call often.
+pub fn ensure_buckets(project: &Project) -> Result<()> {
+    let _lock = project.lock()?;
+    migrate_seen_locked(project)
+}
+
+/// Ids this coordinator was already shown: its own bucket plus the shared
+/// legacy baseline. `None` is the reader-less baseline itself.
+pub fn seen(project: &Project, coordinator: Option<&str>) -> BTreeSet<String> {
+    let _ = ensure_buckets(project);
+    let mut all = read_bucket(project, LEGACY_BUCKET);
+    if let Some(name) = coordinator {
+        if valid_bucket(name) {
+            all.extend(read_bucket(project, name));
+        }
+    }
+    all
+}
+
+/// Ids shown by ANY coordinator: legacy baseline plus every name bucket.
+/// Owner-less items are nudged once project-wide, the way the global seen
+/// file worked before the buckets.
+pub fn seen_union(project: &Project) -> BTreeSet<String> {
+    let _ = ensure_buckets(project);
+    let dir = seen_dir(project);
+    let mut all = read_bucket(project, LEGACY_BUCKET);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
+                    if name != LEGACY_BUCKET {
+                        all.extend(read_bucket(project, name));
+                    }
+                }
+            }
+        }
+    }
+    all
+}
+
+/// Records that `context` showed these items to this coordinator, so they
+/// are nudged to it once only. `None` marks the shared baseline.
+pub fn mark_seen(project: &Project, coordinator: Option<&str>, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
+    if let Some(name) = coordinator {
+        if !valid_bucket(name) {
+            bail!("`{name}` is not a coordinator seen bucket");
+        }
+    }
     let _lock = project.lock()?;
-    let mut all = seen(project);
+    migrate_seen_locked(project)?;
+    let bucket = coordinator.unwrap_or(LEGACY_BUCKET);
+    let mut all = read_bucket(project, bucket);
     all.extend(ids.iter().cloned());
-    // Ids of items that no longer exist are dropped so the file stays small.
+    // Ids of items that no longer exist are dropped so the files stay small.
     let live: BTreeSet<String> = unhandled(project).into_iter().map(|i| i.id).collect();
     all.retain(|id| live.contains(id));
-    project::write_json(&project.state_dir().join("inbox-seen.json"), &all)
+    std::fs::create_dir_all(seen_dir(project))?;
+    project::write_json(&bucket_path(project, bucket), &all)
 }
 
 /// An item id is also a file name, so it is checked before any path is built.
@@ -205,8 +335,8 @@ mod tests {
         assert!(items[0].id.ends_with("-1"));
         assert_eq!(items[1].body, "body text");
 
-        mark_seen(&project, &[items[0].id.clone()]).unwrap();
-        assert_eq!(seen(&project).len(), 1);
+        mark_seen(&project, Some("hpc-demo"), &[items[0].id.clone()]).unwrap();
+        assert_eq!(seen(&project, Some("hpc-demo")).len(), 1);
 
         assert_eq!(done(&project, &[items[0].id.clone()], false).unwrap(), 1);
         assert_eq!(unhandled(&project).len(), 1);
@@ -283,5 +413,120 @@ mod tests {
         let text = std::fs::read_to_string(inbox_dir(&project).join(format!("{empty}.md"))).unwrap();
         assert!(!text.contains("origin_pane"), "{text}");
         assert_eq!(unhandled(&project).iter().find(|i| i.id == empty).unwrap().origin_pane, None);
+    }
+
+    fn owned_thread(project: &Project, owner: &str, pane: &str) -> crate::thread::Thread {
+        crate::thread::allocate(project, |t| {
+            t.title = "Task".into();
+            t.kind = crate::thread::Kind::Worktree;
+            t.status = crate::thread::Status::Open;
+            t.owner = owner.to_string();
+            t.pane_id = pane.to_string();
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn thread_items_inherit_the_thread_owner_and_origin_pane() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let t = owned_thread(&project, "hpc-demo", "w2:p3");
+        let id = write_thread(&project, &t, "thread-state", "new report", "s", "").unwrap();
+        let text = std::fs::read_to_string(inbox_dir(&project).join(format!("{id}.md"))).unwrap();
+        assert!(text.contains("owner = \"hpc-demo\""), "{text}");
+        assert!(text.contains("origin_pane = \"w2:p3\""), "{text}");
+        let item = unhandled(&project).into_iter().find(|i| i.id == id).unwrap();
+        assert_eq!(item.owner.as_deref(), Some("hpc-demo"));
+        assert_eq!(item.origin_pane.as_deref(), Some("w2:p3"));
+
+        // An owner-less thread writes neither field.
+        let u = crate::thread::allocate(&project, |t| {
+            t.title = "Loose".into();
+            t.kind = crate::thread::Kind::Tab;
+            t.status = crate::thread::Status::Open;
+        })
+        .unwrap();
+        let id2 = write_thread(&project, &u, "thread-state", "idle", "s", "").unwrap();
+        let text = std::fs::read_to_string(inbox_dir(&project).join(format!("{id2}.md"))).unwrap();
+        assert!(!text.contains("owner"), "{text}");
+        assert!(!text.contains("origin_pane"), "{text}");
+    }
+
+    #[test]
+    fn effective_owner_follows_the_live_thread_record() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let t = owned_thread(&project, "", "w2:p3");
+        let id = write_thread(&project, &t, "thread-state", "new report", "s", "").unwrap();
+        let item = unhandled(&project).into_iter().find(|i| i.id == id).unwrap();
+
+        // Written owner-less, it still routes to whoever owns the thread now.
+        let threads = crate::thread::list(&project);
+        assert_eq!(effective_owner(&item, &threads).as_deref(), None);
+        crate::thread::update(&project, "t-0001", |t| t.owner = "hpc-demo-1".into()).unwrap();
+        let threads = crate::thread::list(&project);
+        assert_eq!(effective_owner(&item, &threads).as_deref(), Some("hpc-demo-1"));
+
+        // A routine item never gains an owner from a same-id-less record.
+        let rid = write(&project, "routine", "nightly", "due", "due", "").unwrap();
+        let routine = unhandled(&project).into_iter().find(|i| i.id == rid).unwrap();
+        assert_eq!(effective_owner(&routine, &threads).as_deref(), None);
+    }
+
+    #[test]
+    fn seen_buckets_are_isolated_between_coordinators() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let a = write(&project, "thread-state", "t-0001", "idle", "one", "").unwrap();
+        let b = write(&project, "thread-state", "t-0002", "idle", "two", "").unwrap();
+        mark_seen(&project, Some("hpc-demo"), &[a.clone()]).unwrap();
+        mark_seen(&project, Some("hpc-demo-1"), &[b.clone()]).unwrap();
+
+        assert!(seen(&project, Some("hpc-demo")).contains(&a));
+        assert!(!seen(&project, Some("hpc-demo")).contains(&b));
+        assert!(seen(&project, Some("hpc-demo-1")).contains(&b));
+        assert!(!seen(&project, Some("hpc-demo-1")).contains(&a));
+        // A reader without a name sees only the shared baseline.
+        assert!(seen(&project, None).is_empty());
+        // The union (owner-less nudge routing) sees both.
+        let union = seen_union(&project);
+        assert!(union.contains(&a) && union.contains(&b));
+        // The old global file is gone; buckets live in the new directory.
+        assert!(!project.state_dir().join("inbox-seen.json").exists());
+        assert!(project.state_dir().join("inbox-seen/hpc-demo.json").is_file());
+    }
+
+    #[test]
+    fn the_global_seen_file_is_migrated_once_into_the_legacy_bucket() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let item = write(&project, "routine", "r", "due", "due", "").unwrap();
+        // Pre-pf.5 state: one project-global seen file.
+        project::write_json(&project.state_dir().join("inbox-seen.json"), &[item.clone()].into_iter().collect::<BTreeSet<_>>()).unwrap();
+
+        // Every coordinator's seen set includes the migrated ids...
+        assert!(seen(&project, Some("hpc-demo")).contains(&item));
+        assert!(seen(&project, Some("hpc-demo-2")).contains(&item));
+        assert!(seen(&project, None).contains(&item));
+        // ...exactly once, as the legacy bucket, with the global file removed.
+        assert!(!project.state_dir().join("inbox-seen.json").exists());
+        let legacy = project.state_dir().join("inbox-seen/_legacy.json");
+        assert!(legacy.is_file());
+        let before = std::fs::read_to_string(&legacy).unwrap();
+        // New marks stay in their own buckets; the migration never repeats.
+        let other = write(&project, "routine", "r2", "due", "due", "").unwrap();
+        mark_seen(&project, Some("hpc-demo"), &[other]).unwrap();
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), before);
+    }
+
+    #[test]
+    fn reader_less_marks_go_to_the_shared_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let id = write(&project, "routine", "r", "due", "due", "").unwrap();
+        mark_seen(&project, None, &[id.clone()]).unwrap();
+        assert!(seen(&project, Some("hpc-demo")).contains(&id));
+        assert!(seen(&project, None).contains(&id));
+        assert!(project.state_dir().join("inbox-seen/_legacy.json").is_file());
     }
 }

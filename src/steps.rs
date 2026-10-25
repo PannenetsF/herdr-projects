@@ -40,20 +40,34 @@ pub struct State {
     pub routines: routine::States,
     /// Hashes of files a `config-error` item was already written for.
     pub config_errors: BTreeSet<String>,
-    /// Hash of the set of unseen item ids that was last nudged.
-    pub nudged: String,
-    /// The coordinator pane whose input box was seen empty since
-    /// `box_empty_since`, while a nudge waits for it.
-    pub box_pane: String,
-    pub box_empty_since: String,
-    /// The native agent session the last nudge went to: nudges stick to it
-    /// while it remains a live coordinator, so a second coordinator that
-    /// briefly looks more active never receives the other one's inbox.
+    /// Routing key -> hash of the unseen item set last nudged on it. A key is
+    /// an owning coordinator name, or [`GLOBAL_NUDGE`] for project-wide items.
     #[serde(default)]
-    pub nudge_session: String,
+    pub nudged: BTreeMap<String, String>,
+    /// Routing key -> the input box pane currently observed going quiet, and
+    /// since when.
+    #[serde(default)]
+    pub boxes: BTreeMap<String, BoxWait>,
+    /// Routing key -> the native agent session the last nudge went to. Owner
+    /// nudges stick to that coordinator; project-wide nudges stick by the old
+    /// project rule while that session is a live coordinator.
+    #[serde(default)]
+    pub nudge_sessions: BTreeMap<String, String>,
     pub session_item_written: bool,
     /// thread id -> when the ticker first saw its pull request merged.
     pub merged_seen: BTreeMap<String, String>,
+}
+
+/// Routing key for items with no thread owner (routines, outages, session
+/// notes): any ready coordinator may receive them, once project-wide.
+pub const GLOBAL_NUDGE: &str = "_";
+
+/// The input-box wait recorded for one routing key.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct BoxWait {
+    pub pane: String,
+    pub since: String,
 }
 
 pub fn load_state(project: &Project) -> State {
@@ -222,7 +236,7 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
                 summary.push_str(&format!(" on machine `{}` (reach it with `herdr --remote <ssh target>`, or select the machine in herdr's sidebar)", t.machine));
             }
         }
-        inbox::write_origin(project, "thread-state", &t.id, transition_event(change), &summary, "", &t.origin_pane())?;
+        inbox::write_thread(project, &t, "thread-state", transition_event(change), &summary, "")?;
         if change.to == Group::WaitingOnYou {
             // An internal confirmation point (fresh harness permission prompt,
             // self-reported question) keeps its inbox item for the coordinator,
@@ -251,7 +265,7 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
         if let Some(notes) = copy_notes.get(&t.id) {
             summary.push_str(&format!("; not everything was copied: {}", notes.join("; ")));
         }
-        inbox::write_origin(project, "thread-state", &t.id, "new report", &summary, "", &t.origin_pane())?;
+        inbox::write_thread(project, &t, "thread-state", "new report", &summary, "")?;
         notifier.send(&t.id, &format!("review · new report: {}", t.title), crate::notify::Sound::Done, false);
         let hash = t.report_hash.clone();
         thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
@@ -322,32 +336,77 @@ fn hash_ids(ids: &BTreeSet<String>) -> String {
     thread::sha256_hex(ids.iter().cloned().collect::<Vec<_>>().join("\n").as_bytes())
 }
 
-/// Step 6. A given set of unseen items is announced once; there is no timed
-/// re-nudge. With `nudge = false` the user gets a herdr notification instead
-/// of a prompt in the coordinator; with no live coordinator the same.
-/// `coordinator_ready` is a coordinator idle long enough to be prompted (see
-/// `coordinator::nudge_target`). A prompt is typed only into an input box
-/// that has looked empty for `NUDGE_QUIET_SECS`, so it never merges with text
-/// someone is typing; until then the nudge waits for a later tick.
-pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&crate::coordinator::LivePane>, now: jiff::Timestamp) -> Result<()> {
-    let seen = inbox::seen(project);
-    let unseen: Vec<inbox::Item> = inbox::unhandled(project).into_iter().filter(|i| !seen.contains(&i.id)).collect();
-    let hash = hash_ids(&unseen.iter().map(|i| i.id.clone()).collect());
-    if unseen.is_empty() || hash == state.nudged {
-        forget_box(state);
-        return Ok(());
+/// Step 6. Items are routed per owner: a coordinator is nudged only about
+/// items of threads it owns; project-wide items (routines, outages, session
+/// notes) go to any ready coordinator once project-wide; owner-less thread
+/// items are never nudged (they sit in Unassigned until `thread assign`). A
+/// given set is announced once per routing key; there is no timed re-nudge.
+/// With `nudge = false`, or with no live coordinator, items wait for the
+/// next `context` turn instead. A prompt is typed only into an input box
+/// that has looked empty for `NUDGE_QUIET_SECS`, so it never merges with
+/// text someone is typing.
+pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinators: &[crate::coordinator::LivePane], primary_pane: &str, now: jiff::Timestamp) -> Result<()> {
+    let threads = thread::list(project);
+    let items = inbox::unhandled(project);
+    // Routing key -> the items waiting on it. Owner keys get that owner's
+    // thread items; the global key gets items about no thread.
+    let mut queues: BTreeMap<String, Vec<inbox::Item>> = BTreeMap::new();
+    for item in items {
+        if crate::thread::validate_id(&item.subject).is_ok() {
+            // An owner-less thread item is claimed manually, never nudged.
+            if let Some(owner) = inbox::effective_owner(&item, &threads) {
+                queues.entry(owner).or_default().push(item);
+            }
+        } else {
+            queues.entry(GLOBAL_NUDGE.to_string()).or_default().push(item);
+        }
     }
-    // The user already got a specific notification per event; this step only
-    // wakes a coordinator. Without one (or with `nudge = false`) the items
-    // wait for its next turn.
-    let no_coordinator = crate::coordinator::live(project).is_empty();
-    if settings.nudge && !no_coordinator {
-        let Some(pane) = coordinator_ready else {
-            forget_box(state);
-            return Ok(()); // not idle long enough: try again on a later tick
+
+    if coordinators.is_empty() {
+        // Every pin dies with its coordinators; hashes still move forward
+        // below so nothing is replayed once one returns.
+        state.nudge_sessions.clear();
+    }
+    let global_seen = inbox::seen_union(project);
+
+    for (key, queued) in queues {
+        let seen: BTreeSet<String> = if key == GLOBAL_NUDGE {
+            global_seen.clone()
+        } else {
+            inbox::seen(project, Some(&key))
         };
-        if !box_quiet(state, herdr, pane, now)? {
-            return Ok(());
+        let unseen: Vec<inbox::Item> = queued.into_iter().filter(|i| !seen.contains(&i.id)).collect();
+        let hash = hash_ids(&unseen.iter().map(|i| i.id.clone()).collect());
+        if unseen.is_empty() {
+            state.boxes.remove(&key);
+            state.nudged.remove(&key);
+            continue;
+        }
+        if state.nudged.get(&key).is_some_and(|h| h == &hash) {
+            continue;
+        }
+        if !settings.nudge || coordinators.is_empty() {
+            // Notifications per event already happened; record the set so it
+            // is not dumped into a coordinator when nudging is re-enabled.
+            state.boxes.remove(&key);
+            state.nudged.insert(key, hash);
+            continue;
+        }
+        // Owner keys target exactly their name's pane; the global key keeps
+        // the old primary-preferred, sticky choice across all coordinators.
+        let candidates: Vec<crate::coordinator::LivePane> = if key == GLOBAL_NUDGE {
+            coordinators.to_vec()
+        } else {
+            coordinators.iter().filter(|p| p.name == key).cloned().collect()
+        };
+        let sticky = state.nudge_sessions.get(&key).cloned().unwrap_or_default();
+        let preferred = if key == GLOBAL_NUDGE { primary_pane } else { "" };
+        let Some(pane) = crate::coordinator::nudge_target(&candidates, now, preferred, &sticky) else {
+            state.boxes.remove(&key);
+            continue; // nobody idle long enough: try again on a later tick
+        };
+        if !box_quiet(state, herdr, &key, pane, now)? {
+            continue;
         }
         // `agent_blocked` and other errors are returned, logged by the caller,
         // and the nudge is retried on a later tick.
@@ -355,39 +414,31 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
         // Pin follow-up nudges to this agent session (an empty id — old herdr,
         // missing data — never overwrites a real pin).
         if !pane.agent_session.is_empty() {
-            state.nudge_session = pane.agent_session.clone();
+            state.nudge_sessions.insert(key.clone(), pane.agent_session.clone());
         }
+        state.boxes.remove(&key);
+        state.nudged.insert(key, hash);
     }
-    if no_coordinator {
-        // The pin dies with its coordinator.
-        state.nudge_session.clear();
-    }
-    state.nudged = hash;
-    forget_box(state);
     Ok(())
 }
 
-fn forget_box(state: &mut State) {
-    state.box_pane.clear();
-    state.box_empty_since.clear();
-}
-
-/// True once the pane's input box has been seen empty on this tick and on an
-/// earlier one at least `NUDGE_QUIET_SECS` before, with nothing typed seen in
-/// between. A box that holds text, or that the screen does not show, starts
-/// the wait over.
-fn box_quiet(state: &mut State, herdr: &Herdr, pane: &crate::coordinator::LivePane, now: jiff::Timestamp) -> Result<bool> {
+/// True once the pane's input box for this routing key has been seen empty on
+/// this tick and on an earlier one at least `NUDGE_QUIET_SECS` before, with
+/// nothing typed seen in between. A box that holds text, or that the screen
+/// does not show, starts the wait over.
+fn box_quiet(state: &mut State, herdr: &Herdr, key: &str, pane: &crate::coordinator::LivePane, now: jiff::Timestamp) -> Result<bool> {
     let screen = herdr.agent_screen(&pane.pane_id).map_err(|error| anyhow::anyhow!("{error}"))?;
     if crate::prompt_box::check(&pane.agent, &screen) != crate::prompt_box::Draft::Empty {
-        forget_box(state);
+        state.boxes.remove(key);
         return Ok(false);
     }
-    if state.box_pane != pane.pane_id || state.box_empty_since.is_empty() {
-        state.box_pane = pane.pane_id.clone();
-        state.box_empty_since = now.to_string();
+    let started_elsewhere = state.boxes.get(key).is_none_or(|w| w.pane != pane.pane_id || w.since.is_empty());
+    if started_elsewhere {
+        state.boxes.insert(key.to_string(), BoxWait { pane: pane.pane_id.clone(), since: now.to_string() });
         return Ok(false);
     }
-    Ok(thread::seconds_since(&state.box_empty_since, now) >= NUDGE_QUIET_SECS)
+    let since = state.boxes.get(key).map(|w| w.since.clone()).unwrap_or_default();
+    Ok(thread::seconds_since(&since, now) >= NUDGE_QUIET_SECS)
 }
 
 /// Step 2, every two minutes.
@@ -453,7 +504,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             Err(note) => {
                 if state.pr_line_noted.get(&t.id) != Some(&t.report_hash) {
                     state.pr_line_noted.insert(t.id.clone(), t.report_hash.clone());
-                    errors.extend(inbox::write(project, "pr", &t.id, "bad PR: line", &format!("{}: {note}", thread_label(&t)), "").err());
+                    errors.extend(inbox::write_thread(project, &t, "pr", "bad PR: line", &format!("{}: {note}", thread_label(&t)), "").err());
                 }
                 String::new()
             }
@@ -500,7 +551,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             Ok(pr::Checked::Ignored(reason)) => {
                 if state.pr_ignored.get(&t.id) != Some(&url) {
                     state.pr_ignored.insert(t.id.clone(), url.clone());
-                    errors.extend(inbox::write(project, "pr", &t.id, "PR ignored", &format!("{}: the pull request in its report is ignored: {reason}", thread_label(&t)), "").err());
+                    errors.extend(inbox::write_thread(project, &t, "pr", "PR ignored", &format!("{}: the pull request in its report is ignored: {reason}", thread_label(&t)), "").err());
                 }
             }
             Ok(pr::Checked::Summary(summary)) => {
@@ -519,7 +570,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
                     memory.gh_login = pr::own_login(ctx.runner, &t.origin);
                 }
                 let events = pr_events(old.as_ref(), &summary, memory.gh_login.as_deref());
-                errors.extend(inbox::write(project, "pr", &t.id, pr_event(&events, &summary), &format!("{}: pull request {change}", thread_label(&t)), "").err());
+                errors.extend(inbox::write_thread(project, &t, "pr", pr_event(&events, &summary), &format!("{}: pull request {change}", thread_label(&t)), "").err());
                 let number = url.rsplit('/').next().unwrap_or("");
                 if merged {
                     notifier.send(&t.id, &format!("PR #{number} merged"), crate::notify::Sound::Done, false);
@@ -651,7 +702,7 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str, me
     let complete = copied.outcome == CopyOutcome::Complete;
     let notes = threads::clean(ctx, project, &resolved, &threads::Clean { keep_worktree: false, copy_complete: complete, merged_head });
     let why = if reason == "auto" { "it was idle for `auto_resolve_days` and was resolved automatically; `thread resolve --reopen` undoes it".to_string() } else { format!("resolved ({reason})") };
-    inbox::write_origin(project, "thread-state", &t.id, "resolved", &format!("{}: {why}: {}", thread_label(t), notes.join("; ")), "", &t.origin_pane())?;
+    inbox::write_thread(project, &resolved, "thread-state", "resolved", &format!("{}: {why}: {}", thread_label(t), notes.join("; ")), "")?;
     Ok(true)
 }
 

@@ -47,7 +47,7 @@ fn peek_records_nothing_and_context_records_seen_items() {
     assert!(hp(home.path(), &["--root", root_arg, "new", "demo"]).status.success());
     let item = "+++\nid = \"20260917T000000Z-routine-r-1\"\nkind = \"routine\"\nsubject = \"r\"\ncreated = \"x\"\nsummary = \"s\"\n+++\n";
     std::fs::write(root.join("demo/inbox/20260917T000000Z-routine-r-1.md"), item).unwrap();
-    let seen = root.join("demo/.state/inbox-seen.json");
+    let seen = root.join("demo/.state/inbox-seen/_legacy.json");
 
     assert!(hp(home.path(), &["--root", root_arg, "context", "demo", "--peek"]).status.success());
     assert!(!seen.exists());

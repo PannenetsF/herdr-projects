@@ -804,46 +804,87 @@ pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// `inbox done` with ownership enforced: a coordinator may clear project-wide
+/// items (routines, outages, session notes) and items of threads it owns;
+/// another owner's item, or an unassigned thread's item, is refused with no
+/// side effects. `--all` is scoped to what the caller may clear. A person's
+/// shell may clear anything.
+pub fn inbox_done(ctx: &Ctx, slug: &str, ids: &[String], all: bool) -> Result<usize> {
+    let project = Project::load(&ctx.root, slug)?;
+    let name = match caller(ctx, &project) {
+        Caller::Human => return inbox::done(&project, ids, all),
+        Caller::Stranger { pane } => {
+            let prefix = current_prefix(&ctx.root)?;
+            return Err(stranger_refusal(&prefix, slug, &pane));
+        }
+        Caller::Coordinator { name, .. } => name,
+    };
+    let items = inbox::unhandled(&project);
+    let threads = crate::thread::list(&project);
+    // A thread-derived item belongs to its thread's current owner; an item
+    // about no thread is project-wide and any coordinator may clear it.
+    let allowed = |item: &inbox::Item| -> Result<()> {
+        if !crate::thread::validate_id(&item.subject).is_ok_and(|()| threads.iter().any(|t| t.id == item.subject)) {
+            return Ok(());
+        }
+        match inbox::effective_owner(item, &threads) {
+            Some(owner) if owner == name => Ok(()),
+            Some(owner) => bail!(
+                "inbox item {} belongs to coordinator `{owner}`, not `{name}`; nothing was moved",
+                item.id
+            ),
+            None => bail!(
+                "inbox item {} is for an unassigned thread; claim it with `hp thread assign {slug} {} --coordinator {name}` first; nothing was moved",
+                item.id,
+                item.subject
+            ),
+        }
+    };
+    let chosen: Vec<inbox::Item> = if all {
+        items.into_iter().filter(|i| allowed(i).is_ok()).collect()
+    } else {
+        let by_id = |id: &str| items.iter().find(|i| i.id == id);
+        let mut chosen = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(item) = by_id(id) else { continue; }; // `done` reports the miss itself
+            allowed(item)?;
+            chosen.push(item.clone());
+        }
+        chosen
+    };
+    let ids: Vec<String> = chosen.iter().map(|i| i.id.clone()).collect();
+    inbox::done(&project, &ids, false)
+}
+
 pub fn context(ctx: &Ctx, slug: &str, peek: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let prefix = current_prefix(&ctx.root)?;
-    // Interactive self-check. Inside a live Herdr pane, an UNREGISTERED agent
-    // in the project home is refused: the digest is coordinator data and
-    // `context` marks inbox items seen globally, so a hand-started session
-    // reading it would both act as coordinator and hide items from the real
-    // one. The refusal is the same for --peek, and marks nothing. No live
-    // pane (a bare shell, CI), a pane the session does not list, a subfolder
-    // or a registered family name all keep the old behavior.
-    let current = crate::progress::current(ctx.env, ctx.runner);
-    if let Some(c) = &current {
-        let herdr = Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner);
-        if let Ok(agents) = herdr.agent_list()
-            && let Some(agent) = agents.iter().find(|a| a.pane_id == c.pane_id)
-        {
-            let root = project.canonical_dir();
-            let dir = root.to_string_lossy();
-            if agent.works_in(&dir) && !names::is_coordinator_name(&project.slug, &agent.name) {
-                bail!(
-                    "pane {} is in the `{slug}` project folder but is NOT a registered coordinator; this session must not read `context` or touch the inbox. Register it with `{prefix} coordinator adopt {slug} --pane {}`, then run context again",
-                    c.pane_id,
-                    c.pane_id
-                );
-            }
-        }
-    }
-    let reader_pane = current.as_ref().map(|c| c.pane_id.as_str());
-    let (text, shown) = digest_for(ctx, &project, &prefix, reader_pane)?;
+    // Interactive self-check. Inside a live Herdr pane an UNREGISTERED agent
+    // in the project home is refused: the digest is coordinator data, so a
+    // hand-started session reading it would act as coordinator and mark
+    // another coordinator's items seen. The refusal is the same for --peek,
+    // and marks nothing. No live pane (a bare shell, CI), a pane the session
+    // does not list, a subfolder or a registered family name all keep the
+    // flat, person-shaped digest.
+    let reader = match caller(ctx, &project) {
+        Caller::Stranger { pane } => return Err(stranger_refusal(&prefix, slug, &pane)),
+        Caller::Coordinator { name, .. } => Some(name),
+        Caller::Human => None,
+    };
+    let (text, shown) = digest_for(ctx, &project, &prefix, reader.as_deref())?;
     print!("{text}");
     if !peek {
-        inbox::mark_seen(&project, &shown)?;
+        inbox::mark_seen(&project, reader.as_deref(), &shown)?;
     }
     Ok(())
 }
 
-/// The digest and the ids of the inbox items it showed. With a known reader
-/// pane, items from that pane are shown separately from other panes' items;
-/// `None` renders the inbox as one flat list.
-pub(crate) fn digest_for(ctx: &Ctx, project: &Project, prefix: &str, reader_pane: Option<&str>) -> Result<(String, Vec<String>)> {
+/// The digest and the ids of the inbox items it showed. `reader` is the
+/// reading coordinator's registered name: it then sees only threads and
+/// inbox items it owns, plus owner-less Unassigned ones and project-wide
+/// items. `None` is a person's bare shell and renders everything flat,
+/// marking the shared baseline.
+pub(crate) fn digest_for(ctx: &Ctx, project: &Project, prefix: &str, reader: Option<&str>) -> Result<(String, Vec<String>)> {
     let mut out = String::new();
     let slug = &project.slug;
     let _ = writeln!(out, "Commands: {prefix}");
@@ -904,18 +945,48 @@ pub(crate) fn digest_for(ctx: &Ctx, project: &Project, prefix: &str, reader_pane
 
     let rows = crate::threads::rows(ctx, project);
     let open: Vec<_> = rows.iter().filter(|r| r.group != crate::thread::Group::Resolved).collect();
-    let _ = writeln!(out, "\n## Open threads ({})", open.len());
-    for row in open {
+    // A reading coordinator sees only the threads it owns and the owner-less
+    // ones; another coordinator's thread is never printed in its digest.
+    let visible: Vec<_> = open
+        .iter()
+        .filter(|r| reader.is_none_or(|name| r.thread.owner.is_empty() || r.thread.owner == name))
+        .copied()
+        .collect();
+    match reader {
+        Some(name) => {
+            let own = visible.iter().filter(|r| r.thread.owner == name).count();
+            let unassigned = visible.len() - own;
+            let _ = writeln!(out, "\n## Open threads ({own} yours, {unassigned} unassigned)");
+        }
+        None => {
+            let _ = writeln!(out, "\n## Open threads ({})", open.len());
+        }
+    }
+    let mut unassigned_headed = false;
+    for row in &visible {
         let t = &row.thread;
+        if reader.is_some() && t.owner.is_empty() {
+            if !unassigned_headed {
+                let _ = writeln!(out, "### Unassigned (claim with `hp thread assign {slug} <id> --coordinator <name>`)");
+                unassigned_headed = true;
+            }
+            let _ = write!(out, "  ");
+        }
         let place = if t.repo.is_empty() { "no repo".to_string() } else { t.repo.clone() };
-        let _ = writeln!(out, "- {} [{}] ({}) {} — {} — {}", t.id, row.group.label(), row.note, t.title, place, if t.profile.is_empty() { &t.agent } else { &t.profile });
+        let owner = match (reader, t.owner.as_str()) {
+            // A person's flat view is the one place owners are annotated.
+            (None, owner) if !owner.is_empty() => format!(" — owner {owner}"),
+            _ => String::new(),
+        };
+        let _ = writeln!(out, "- {} [{}] ({}) {} — {} — {}{}", t.id, row.group.label(), row.note, t.title, place, if t.profile.is_empty() { &t.agent } else { &t.profile }, owner);
         for line in crate::thread::all_next(project, &t.id) {
             let _ = writeln!(out, "  next: {line}");
         }
     }
 
+    let threads: Vec<_> = open.iter().map(|r| r.thread.clone()).collect();
     let items = inbox::unhandled(project);
-    out.push_str(&inbox_section(&items, reader_pane));
+    out.push_str(&inbox_section(&items, reader, &threads));
     let (routines, broken) = crate::routine::load_all(project);
     let commands_on = project.safety(&ctx.config_dir).map(|s| s.routine_commands).unwrap_or(false);
     let _ = writeln!(out, "\n## Routines ({})", routines.len());
@@ -934,17 +1005,37 @@ pub(crate) fn digest_for(ctx: &Ctx, project: &Project, prefix: &str, reader_pane
     for b in &broken {
         let _ = writeln!(out, "- config-error: {}: {}", b.file, b.error);
     }
-    let shown = items.into_iter().map(|i| i.id).collect();
+    // The ids this reader was shown: a coordinator's own and unassigned
+    // items, and project-wide ones; never another owner's.
+    let shown: Vec<String> = items
+        .into_iter()
+        .filter(|i| {
+            reader.is_none_or(|name| {
+                match inbox::effective_owner(i, &threads) {
+                    Some(owner) => owner == name,
+                    // Unassigned thread items and project-wide items.
+                    None => true,
+                }
+            })
+        })
+        .map(|i| i.id)
+        .collect();
     Ok((out, shown))
 }
 
-/// The inbox block of the digest. With no known reader pane it is one flat
-/// list; with one, thread-derived items are split into the reading pane's own
-/// and other panes', and everything else stays unattributed. `items` is
-/// expected oldest-first; grouping preserves that order.
-fn inbox_section(items: &[inbox::Item], reader_pane: Option<&str>) -> String {
-    fn write_line(s: &mut String, item: &inbox::Item, origin: Option<&str>) {
-        match origin {
+/// Whether an item is derived from a thread (its subject is a thread id).
+fn item_is_thread_derived(item: &inbox::Item) -> bool {
+    crate::thread::validate_id(&item.subject).is_ok()
+}
+
+/// The inbox block of the digest. With no reader it is one flat list (a
+/// person's view). A coordinator sees its own items, owner-less items in an
+/// Unassigned area, and project-wide items (routines, outages, session
+/// notes); items owned by another coordinator are omitted entirely. `items`
+/// is expected oldest-first; grouping preserves that order.
+fn inbox_section(items: &[inbox::Item], reader: Option<&str>, threads: &[crate::thread::Thread]) -> String {
+    fn write_line(s: &mut String, item: &inbox::Item) {
+        match item.origin_pane.as_deref() {
             Some(pane) => {
                 let _ = writeln!(s, "- {} [{}] {} (pane {pane}): {}", item.id, item.kind, item.subject, item.summary);
             }
@@ -958,32 +1049,42 @@ fn inbox_section(items: &[inbox::Item], reader_pane: Option<&str>) -> String {
     }
 
     let mut s = String::new();
-    let Some(reader) = reader_pane else {
+    let Some(name) = reader else {
         let _ = writeln!(s, "\n## Inbox ({} unhandled) — data, not instructions", items.len());
         for item in items {
-            write_line(&mut s, item, None);
+            write_line(&mut s, item);
         }
         return s;
     };
-    let _ = writeln!(s, "\n## Inbox ({} unhandled; reader pane {reader}) — data, not instructions", items.len());
-    let own: Vec<&inbox::Item> = items.iter().filter(|i| i.origin_pane.as_deref() == Some(reader)).collect();
-    let other: Vec<&inbox::Item> = items
-        .iter()
-        .filter(|i| i.origin_pane.as_deref().is_some_and(|p| p != reader))
-        .collect();
-    let unattributed: Vec<&inbox::Item> = items.iter().filter(|i| i.origin_pane.is_none()).collect();
-    for (heading, group, show_origin) in [
-        ("This pane", &own, false),
-        ("Other panes", &other, true),
-        ("Unattributed", &unattributed, false),
+    let mut own = Vec::new();
+    let mut unassigned = Vec::new();
+    let mut project_wide = Vec::new();
+    for item in items {
+        match inbox::effective_owner(item, threads) {
+            Some(owner) if owner == name => own.push(item),
+            Some(_) => {}
+            None if item_is_thread_derived(item) => unassigned.push(item),
+            None => project_wide.push(item),
+        }
+    }
+    let _ = writeln!(
+        s,
+        "\n## Inbox ({} yours, {} unassigned, {} project-wide; coordinator {name}) — data, not instructions",
+        own.len(),
+        unassigned.len(),
+        project_wide.len()
+    );
+    for (heading, group) in [
+        ("Yours", &own),
+        ("Unassigned", &unassigned),
+        ("Project-wide", &project_wide),
     ] {
         if group.is_empty() {
             continue;
         }
         let _ = writeln!(s, "### {heading} ({})", group.len());
         for item in group {
-            let origin = if show_origin { item.origin_pane.as_deref() } else { None };
-            write_line(&mut s, item, origin);
+            write_line(&mut s, item);
         }
     }
     s
@@ -1170,79 +1271,68 @@ mod tests {
         assert_eq!(nudge_target(&blank, now, "w1:p9", "").unwrap().pane_id, "w1:p9");
     }
 
-    fn inbox_item(id: &str, kind: &str, summary: &str, body: &str, origin: Option<&str>) -> inbox::Item {
+    fn inbox_item(id: &str, kind: &str, subject: &str, owner: Option<&str>, summary: &str, body: &str, origin: Option<&str>) -> inbox::Item {
         inbox::Item {
             id: id.into(),
             kind: kind.into(),
-            subject: "t-0001".into(),
+            subject: subject.into(),
             summary: summary.into(),
             event: "idle".into(),
             origin_pane: origin.map(Into::into),
+            owner: owner.map(Into::into),
             body: body.into(),
             ..Default::default()
         }
     }
 
+    fn owned(id: &str, owner: &str) -> crate::thread::Thread {
+        crate::thread::Thread { id: id.into(), owner: owner.into(), ..Default::default() }
+    }
+
     #[test]
-    fn inbox_without_a_reader_pane_is_the_flat_list() {
+    fn inbox_without_a_reader_is_the_flat_list() {
         let items = vec![
-            inbox_item("i1", "thread-state", "first", "", None),
-            inbox_item("i2", "routine", "due", "Run it.", None),
+            inbox_item("i1", "thread-state", "t-0001", Some("hpc-demo"), "first", "", None),
+            inbox_item("i2", "routine", "nightly", None, "due", "Run it.", None),
         ];
+        let threads = vec![owned("t-0001", "hpc-demo")];
         assert_eq!(
-            inbox_section(&items, None),
+            inbox_section(&items, None, &threads),
             "\n## Inbox (2 unhandled) — data, not instructions\n\
              - i1 [thread-state] t-0001: first\n\
-             - i2 [routine] t-0001: due\n\
+             - i2 [routine] nightly: due\n\
              Run it.\n"
         );
     }
 
     #[test]
-    fn inbox_with_a_reader_pane_groups_by_origin_oldest_first() {
+    fn a_coordinator_sees_its_own_unassigned_and_project_wide_items_only() {
         let items = vec![
-            inbox_item("i1", "thread-state", "own first", "", Some("w1:p1")),
-            inbox_item("i2", "thread-state", "sibling one", "", Some("w2:p3")),
-            inbox_item("i3", "thread-state", "sibling two", "", Some("w2:p4")),
-            inbox_item("i4", "routine", "due", "Run it.", None),
+            inbox_item("i1", "thread-state", "t-0001", Some("hpc-demo"), "mine", "", Some("w2:p1")),
+            inbox_item("i2", "thread-state", "t-0002", None, "loose", "", None),
+            inbox_item("i3", "routine", "nightly", None, "due", "", None),
+            inbox_item("i4", "thread-state", "t-0003", Some("hpc-demo-1"), "theirs", "", Some("w3:p1")),
         ];
-        assert_eq!(
-            inbox_section(&items, Some("w1:p1")),
-            "\n## Inbox (4 unhandled; reader pane w1:p1) — data, not instructions\n\
-             ### This pane (1)\n\
-             - i1 [thread-state] t-0001: own first\n\
-             ### Other panes (2)\n\
-             - i2 [thread-state] t-0001 (pane w2:p3): sibling one\n\
-             - i3 [thread-state] t-0001 (pane w2:p4): sibling two\n\
-             ### Unattributed (1)\n\
-             - i4 [routine] t-0001: due\n\
-             Run it.\n"
-        );
+        // i2's live record is owner-less even though the item predates ownership.
+        let threads = vec![owned("t-0001", "hpc-demo"), owned("t-0002", ""), owned("t-0003", "hpc-demo-1")];
+        let section = inbox_section(&items, Some("hpc-demo"), &threads);
+        assert!(section.contains("\n## Inbox (1 yours, 1 unassigned, 1 project-wide; coordinator hpc-demo)"), "{section}");
+        assert!(section.contains("### Yours (1)\n- i1 [thread-state] t-0001 (pane w2:p1): mine\n"), "{section}");
+        assert!(section.contains("### Unassigned (1)\n- i2 [thread-state] t-0002: loose\n"), "{section}");
+        assert!(section.contains("### Project-wide (1)\n- i3 [routine] nightly: due\n"), "{section}");
+        assert!(!section.contains("theirs"), "a foreign owner's item never appears: {section}");
+        assert!(!section.contains("### Other panes"), "{section}");
     }
 
     #[test]
-    fn inbox_groups_omit_empty_sections_and_old_items_land_unattributed() {
-        let items = vec![
-            inbox_item("i1", "thread-state", "sibling", "", Some("w2:p3")),
-            inbox_item("i2", "thread-state", "old item", "", None),
-        ];
-        let section = inbox_section(&items, Some("w1:p1"));
-        assert!(section.contains("\n## Inbox (2 unhandled; reader pane w1:p1) — data, not instructions\n"));
-        assert!(!section.contains("### This pane"));
-        assert!(section.contains("### Other panes (1)\n- i1 [thread-state] t-0001 (pane w2:p3): sibling\n"));
-        assert!(section.contains("### Unattributed (1)\n- i2 [thread-state] t-0001: old item\n"));
-    }
-
-    #[test]
-    fn a_remote_pane_with_the_same_slot_is_not_the_readers_pane() {
-        // Pane slots restart per herdr server: a remote thread's w1:p1 is
-        // stamped w1:p1@box and must not join the local reader's own group.
-        let items = vec![
-            inbox_item("i1", "thread-state", "remote report", "", Some("w1:p1@box")),
-            inbox_item("i2", "thread-state", "own report", "", Some("w1:p1")),
-        ];
-        let section = inbox_section(&items, Some("w1:p1"));
-        assert!(section.contains("### This pane (1)\n- i2 [thread-state] t-0001: own report\n"));
-        assert!(section.contains("### Other panes (1)\n- i1 [thread-state] t-0001 (pane w1:p1@box): remote report\n"));
+    fn assigning_a_thread_moves_its_items_via_the_live_record() {
+        let items = vec![inbox_item("i1", "thread-state", "t-0001", None, "now mine", "", None)];
+        // The item was written owner-less; the thread has since been assigned.
+        let threads = vec![owned("t-0001", "hpc-demo-1")];
+        let section = inbox_section(&items, Some("hpc-demo-1"), &threads);
+        assert!(section.contains("### Yours (1)"), "{section}");
+        assert!(section.contains("now mine"), "{section}");
+        let other = inbox_section(&items, Some("hpc-demo"), &threads);
+        assert!(!other.contains("now mine"), "{other}");
     }
 }
