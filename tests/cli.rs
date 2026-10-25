@@ -18,7 +18,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 /// because the intermediate's exit hides it from the test process.
 fn hp(home: &Path, args: &[&str]) -> std::process::Output {
     let status_file = tempfile::NamedTempFile::new_in(home).unwrap();
-    let status_path = status_file.path().to_str().unwrap();
+    let status_path = shell_escape(status_file.path().to_str().unwrap());
     let mut quoted: Vec<String> =
         std::iter::once(BIN.to_string()).chain(args.iter().map(|a| shell_escape(a))).collect();
     quoted.push(format!("; printf '%s' $? > {status_path}"));
