@@ -108,6 +108,12 @@ pub(crate) const IDENTITY_ENV_SCRUB: &[&str] = &[
     "HERDR_BIN_PATH",
     // Older/alternate herdr client var that also redirects the socket.
     "HERDR_CLIENT_SOCKET_PATH",
+    // Config redirect: can point the client at another server's settings.
+    "HERDR_CONFIG_PATH",
+    // The XDG location herdr resolves its socket/config from when no socket
+    // is pinned; identity pins the socket but must not inherit a foreign
+    // config tree either.
+    "XDG_CONFIG_HOME",
 ];
 
 impl<'a> Herdr<'a> {
@@ -359,6 +365,17 @@ impl<'a> Herdr<'a> {
 
     pub fn agent_list(&self) -> Result<Vec<Agent>, HerdrError> {
         self.call_as(&["agent", "list"], "agents")
+    }
+
+    /// Like `agent_list` but bounded by the identity loop's deadline: a
+    /// session that answers process-info yet stalls on agent list must not
+    /// pin a caller-identity command for the full `CALL_TIMEOUT`.
+    pub fn agent_list_within(&self, timeout: Duration) -> Result<Vec<Agent>, HerdrError> {
+        let result = self.call(&["agent", "list"], timeout)?;
+        serde_json::from_value(result["agents"].clone()).map_err(|e| HerdrError {
+            code: "failed".into(),
+            message: format!("`herdr agent list` reply changed: {e}"),
+        })
     }
 
     pub fn workspace_list(&self) -> Result<Vec<Workspace>, HerdrError> {

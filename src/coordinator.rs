@@ -221,11 +221,16 @@ pub fn caller(ctx: &Ctx, project: &Project) -> Caller {
     crate::identify::identify(ctx, project, marked)
 }
 
-/// The pure identity decision for a live agent row. A coordinator family
-/// name wins over cwd (a coordinator in a worktree stays one); any
-/// project-machine agent in the project home, a worker (`hp-…-t-…`) or
-/// another `hpc-`/`hp-` family is a Stranger; an unrelated agent elsewhere is
-/// just a person in another tab.
+/// The pure identity decision for a live agent row in a PROVEN pane.
+///
+/// A coordinator family name wins over cwd (a coordinator in a worktree
+/// stays one); any project-machine agent in the project home, a worker
+/// (`hp-…-t-…`) or another `hpc-`/`hp-` family is a Stranger. Every other
+/// row — including an UNNAMED hand-started agent and any custom name — is
+/// Unverified, never Human: this pane is demonstrably inside Herdr with a
+/// live agent that another coordinator can steer with `agent prompt`/
+/// `send-text`, so its owner-gated powers must not pass as a person's. A
+/// real person runs from a terminal Herdr lists no pane for.
 pub(crate) fn classify(slug: &str, dir: &str, pane_id: &str, agent: &Agent) -> Caller {
     if names::is_coordinator_name(slug, &agent.name) {
         return Caller::Coordinator { name: agent.name.clone(), pane: pane_id.to_string() };
@@ -239,7 +244,9 @@ pub(crate) fn classify(slug: &str, dir: &str, pane_id: &str, agent: &Agent) -> C
     if agent.works_in(dir) || other_projects_machine || names::is_thread_name(slug, &agent.name) {
         return Caller::Stranger { pane: pane_id.to_string() };
     }
-    Caller::Human
+    // Proven pane, live agent row, no project-recognised name: an unnamed
+    // hand-started tab or a custom-named agent. Fail closed.
+    Caller::Unverified { pane: pane_id.to_string() }
 }
 /// The refusal an unregistered agent in the project folder gets.
 pub fn stranger_refusal(prefix: &str, slug: &str, pane: &str) -> anyhow::Error {
@@ -1142,12 +1149,21 @@ mod tests {
         // Another project's coordinator anywhere is a stranger.
         let other = named("hpc-other", agent("w4:p1", "/proj/other", "idle", 1));
         assert_eq!(classify("demo", dir, "w4:p1", &other), Caller::Stranger { pane: "w4:p1".into() });
+        // Another project's worker (`hp-<other>-t-…`) must not fall through to
+        // Human via a custom cwd even though its slug never matches this one.
+        let other_worker = named("hp-other-t-0001", agent("w4b:p1", "/tmp/x", "working", 2));
+        assert_eq!(classify("demo", dir, "w4b:p1", &other_worker), Caller::Stranger { pane: "w4b:p1".into() });
         // Hand-started oddly-named session inside the home is a stranger.
         let hand = named("explorer", agent("w5:p1", dir, "idle", 1));
         assert_eq!(classify("demo", dir, "w5:p1", &hand), Caller::Stranger { pane: "w5:p1".into() });
-        // Unrelated agent elsewhere is just a person in another tab.
+        // An unnamed or custom-named agent ANYWHERE is fail-closed, never
+        // Human: another coordinator can steer it with `agent prompt`. A
+        // real person reaches Human through identify()'s no-proven-pane path,
+        // never through classify() (which only sees proven agent rows).
         let elsewhere = named("whatever", agent("w6:p1", "/tmp", "idle", 1));
-        assert_eq!(classify("demo", dir, "w6:p1", &elsewhere), Caller::Human);
+        assert_eq!(classify("demo", dir, "w6:p1", &elsewhere), Caller::Unverified { pane: "w6:p1".into() });
+        let unnamed = named("", agent("w7:p1", "/tmp", "idle", 1));
+        assert_eq!(classify("demo", dir, "w7:p1", &unnamed), Caller::Unverified { pane: "w7:p1".into() });
     }
 
     #[test]

@@ -23,8 +23,10 @@
 //!
 //! Residual threats this client cannot settle (same uid is not a security
 //! boundary against Herdr itself): a genuinely installed rogue `herdr
-//! --session`, and a fully double-forked orphan indistinguishable from a
-//! launchd job. Both need server-side ownership rules; see COORDINATOR.md.
+//! --session`, renaming one's own pane to an `hpc-<slug>` family name with
+//! the server's own `agent rename`, and a fully double-forked orphan
+//! indistinguishable from a launchd job. All three need server-side
+//! ownership rules; see COORDINATOR.md.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -54,19 +56,21 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
         }
     };
 
-    let deadline = Instant::now() + IDENTITY_BUDGET;
+    // Discovery (ps, real home, trusted binary, registry) runs with its own
+    // generous timeouts: the tools are absolute/scrubbed, and a loaded box
+    // must not turn an overrun into fail-open Human. The shared budget below
+    // bounds only the per-socket pane queries.
+    let Some(facts) = Facts::gather(ctx, QUERY_TIMEOUT) else {
+        return fail(marked);
+    };
+    let Some(home) = real_home(ctx, QUERY_TIMEOUT) else {
+        return fail(marked);
+    };
+    let Some(bin) = trusted_herdr_bin(ctx, &home) else {
+        return fail(marked);
+    };
 
-    let Some(facts) = Facts::gather(ctx, remaining(&deadline)) else {
-        return fail(marked);
-    };
-    let Some(home) = real_home(ctx, remaining(&deadline)) else {
-        return fail(marked);
-    };
-    let Some(bin) = trusted_herdr_bin(ctx, &home, &deadline) else {
-        return fail(marked);
-    };
-
-    let sockets = registry_sockets(ctx, &bin, &home, remaining(&deadline));
+    let sockets = registry_sockets(ctx, &bin, &home, QUERY_TIMEOUT);
     if sockets.is_empty() {
         return fail(marked);
     }
@@ -85,13 +89,16 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
         }
     }
 
+    let deadline = Instant::now() + IDENTITY_BUDGET;
     for socket in ordered_sockets {
         let herdr = Herdr::for_identity(&bin, &socket, ctx.runner);
         // Fast path: the pane owning this tty, its shell and foreground pids
         // in one call. A foreign tty resolves to the focused pane, whose pids
         // fail the proof.
         if let Ok(info) = herdr.call(&["pane", "process-info", "--current"], remaining(&deadline)) {
-            if let Some(caller) = proven_identity(&herdr, project, info.get("process_info"), &facts) {
+            if let Some(caller) =
+                proven_identity(&herdr, project, info.get("process_info"), &facts, remaining(&deadline))
+            {
                 return caller;
             }
         }
@@ -101,9 +108,13 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
                 if let Ok(info) =
                     herdr.call(&["pane", "process-info", "--pane", pane], remaining(&deadline))
                 {
-                    if let Some(caller) =
-                        proven_identity(&herdr, project, info.get("process_info"), &facts)
-                    {
+                    if let Some(caller) = proven_identity(
+                        &herdr,
+                        project,
+                        info.get("process_info"),
+                        &facts,
+                        remaining(&deadline),
+                    ) {
                         return caller;
                     }
                 }
@@ -124,7 +135,13 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
             else {
                 continue;
             };
-            if let Some(caller) = proven_identity(&herdr, project, info.get("process_info"), &facts) {
+            if let Some(caller) = proven_identity(
+                &herdr,
+                project,
+                info.get("process_info"),
+                &facts,
+                remaining(&deadline),
+            ) {
                 return caller;
             }
         }
@@ -143,6 +160,7 @@ fn proven_identity(
     project: &Project,
     info: Option<&serde_json::Value>,
     facts: &Facts,
+    timeout: Duration,
 ) -> Option<Caller> {
     let info = info?;
     let pane = info["pane_id"].as_str()?;
@@ -155,7 +173,7 @@ fn proven_identity(
     if !facts.proves_pane(shell_pid, &foreground) {
         return None;
     }
-    let Ok(agents) = herdr.agent_list() else {
+    let Ok(agents) = herdr.agent_list_within(timeout) else {
         return Some(Caller::Unverified { pane: pane.to_string() });
     };
     let Some(agent) = agents.iter().find(|a| a.pane_id == pane) else {
@@ -241,13 +259,13 @@ fn trusted_resolved_prefix(path: &Path, home: &Path) -> bool {
 
 /// The first absolute candidate that exists, resolves under a trusted prefix
 /// and reports a supported version with a scrubbed environment.
-fn trusted_herdr_bin(ctx: &Ctx, raw_home: &Path, deadline: &Instant) -> Option<String> {
+fn trusted_herdr_bin(ctx: &Ctx, raw_home: &Path) -> Option<String> {
     // Tests script the binary explicitly; when they do not, there is no
     // trusted binary (the candidate scan is production-only so a test host's
     // real Homebrew install can't make identity nondeterministic).
     #[cfg(test)]
     {
-        let _ = (raw_home, deadline);
+        let _ = raw_home;
         return ctx.env.var("HP_TEST_HERDR_BIN").map(str::to_string);
     }
 
@@ -255,9 +273,6 @@ fn trusted_herdr_bin(ctx: &Ctx, raw_home: &Path, deadline: &Instant) -> Option<S
     {
         let home = std::fs::canonicalize(raw_home).unwrap_or_else(|_| raw_home.to_path_buf());
         for candidate in bin_candidates(raw_home) {
-            if deadline.elapsed() >= IDENTITY_BUDGET {
-                break;
-            }
             let Ok(resolved) = std::fs::canonicalize(&candidate) else {
                 continue;
             };
@@ -266,7 +281,7 @@ fn trusted_herdr_bin(ctx: &Ctx, raw_home: &Path, deadline: &Instant) -> Option<S
             }
             let cmd = scrub(Cmd::new(
                 resolved.to_string_lossy().as_ref(),
-                remaining(deadline),
+                QUERY_TIMEOUT,
             )
             .arg("--version"));
             let Ok(out) = ctx.runner.run(&cmd) else {

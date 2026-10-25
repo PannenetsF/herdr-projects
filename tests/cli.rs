@@ -1,17 +1,66 @@
 //! End-to-end checks of the built binary with a scrubbed environment.
 
+use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 
+/// Runs the binary as if from a real terminal OUTSIDE Herdr. `cargo test`
+/// itself descends from this shell's Herdr pane, and caller identity is
+/// proven from process ancestry/process-group, so an ordinary child would
+/// (correctly) be refused as an agentless proven pane. The spawned shell is
+/// double-forked in pre_exec: the intermediate starts a new session and exits
+/// at once, so the shell is reparented to pid 1 in a fresh process group and
+/// ps facts cannot tie the binary to any pane — the documented residual
+/// double-fork case. The shell records the binary's exit code in a temp file
+/// because the intermediate's exit hides it from the test process.
 fn hp(home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(BIN)
-        .env_clear()
+    let status_file = tempfile::NamedTempFile::new_in(home).unwrap();
+    let status_path = status_file.path().to_str().unwrap();
+    let mut quoted: Vec<String> =
+        std::iter::once(BIN.to_string()).chain(args.iter().map(|a| shell_escape(a))).collect();
+    quoted.push(format!("; printf '%s' $? > {status_path}"));
+    let script = quoted.join(" ");
+
+    let mut cmd = Command::new("/bin/sh");
+    cmd.env_clear()
         .env("HOME", home)
-        .args(args)
-        .output()
-        .unwrap()
+        .args(["-c", &script]);
+    // Safety: pre_exec is the one sanctioned fork-child context; setsid,
+    // fork and _exit are async-signal-safe. The intermediate must EXIT
+    // immediately (never wait): only then is the shell reparented to pid 1,
+    // severing the pane ancestry.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            match libc::fork() {
+                0 => Ok(()),
+                pid if pid > 0 => libc::_exit(0),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+    }
+    let mut out = cmd.output().unwrap();
+    // The intermediate's status is always 0 by construction; substitute the
+    // binary's real one from the status file.
+    let code = std::fs::read_to_string(status_file.path())
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(99);
+    out.status = ExitStatusExt::from_raw(if code == 0 { 0 } else { code << 8 });
+    out
+}
+
+fn shell_escape(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'/' | b'.' | b',' | b'=')) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 #[test]

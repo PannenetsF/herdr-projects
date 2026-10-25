@@ -2440,6 +2440,81 @@ fn stripping_pane_markers_cannot_downgrade_a_coordinator_to_a_human() {
 }
 
 #[test]
+fn a_foreign_projects_worker_row_is_a_stranger_even_from_an_unrelated_cwd() {
+    // The attacker coordinator prompts ANOTHER project's worker agent
+    // (`hp-<other>-t-…`, cwd nowhere near this project) to run an owner-gated
+    // command. The row exists and the pane is process-fact proven; it must be
+    // a Stranger regardless of cwd, even with markers stripped.
+    for marked in [false, true] {
+        let world = World::new();
+        let socket = default_socket(&world);
+        let project = world.project("demo", "a.sock");
+        world.script_inside_herdr(&[&socket]);
+        world.procinfo_proves("w1:p1", 200, 9000, 500);
+        *world.agents.borrow_mut() =
+            format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", "/tmp/other", "hp-other-t-0001", "working"));
+        world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term-1"}}}"#));
+        let env = if marked {
+            Env::for_test(
+                world.home.path(),
+                &[
+                    ("HERDR_ENV", "1"),
+                    ("HERDR_PANE_ID", "w1:p1"),
+                    ("HERDR_SOCKET_PATH", &socket),
+                    ("HP_TEST_SELF_PID", "9000"),
+                    ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+                    ("HP_TEST_HERDR_BIN", "herdr"),
+                ],
+            )
+        } else {
+            stripped_caller_env(&world, "9000")
+        };
+        let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
+        assert!(matches!(caller, coordinator::Caller::Stranger { .. }), "marked={marked} -> {caller:?}");
+    }
+}
+
+#[test]
+fn an_unnamed_or_custom_named_agent_row_never_classifies_as_a_person() {
+    // The release-blocking hole: a hostile coordinator opens a hand-started
+    // agent tab in an unrelated folder (empty row name) and `agent prompt`s
+    // an owner-gated command at it; a custom-named adopted agent is the same
+    // shape. Both are proven agent rows and must fail closed.
+    for row_name in ["", "my-agent"] {
+        for marked in [false, true] {
+            let world = World::new();
+            let socket = default_socket(&world);
+            let project = world.project("demo", "a.sock");
+            world.script_inside_herdr(&[&socket]);
+            world.procinfo_proves("w1:p1", 200, 9000, 500);
+            *world.agents.borrow_mut() =
+                format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", "/tmp/somewhere", row_name, "idle"));
+            world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term-1"}}}"#));
+            let env = if marked {
+                Env::for_test(
+                    world.home.path(),
+                    &[
+                        ("HERDR_ENV", "1"),
+                        ("HERDR_PANE_ID", "w1:p1"),
+                        ("HERDR_SOCKET_PATH", &socket),
+                        ("HP_TEST_SELF_PID", "9000"),
+                        ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+                        ("HP_TEST_HERDR_BIN", "herdr"),
+                    ],
+                )
+            } else {
+                stripped_caller_env(&world, "9000")
+            };
+            let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
+            assert!(
+                matches!(caller, coordinator::Caller::Unverified { .. }),
+                "row_name={row_name:?} marked={marked} -> {caller:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_socket_outside_the_trusted_set_cannot_answer_identity_questions() {
     let world = World::new();
     let _trusted = default_socket(&world);
@@ -3237,7 +3312,7 @@ fn context_is_refused_for_an_unregistered_root_pane_and_marks_nothing() {
 }
 
 #[test]
-fn context_serves_a_subfolder_pane_and_a_bare_shell_without_the_registration_gate() {
+fn an_unnamed_subfolder_agent_pane_is_gated_but_a_bare_shell_outside_herdr_is_served() {
     let world = World::new();
     let socket = default_socket(&world);
     let project = project::create(&world.root, "demo", "", vec![]).unwrap();
@@ -3245,13 +3320,17 @@ fn context_serves_a_subfolder_pane_and_a_bare_shell_without_the_registration_gat
     std::fs::create_dir_all(&sub).unwrap();
     inbox::write(&project, "routine", "r", "due", "Prompt", "").unwrap();
 
-    // A live pane in a SUBfolder (a thread pane) is not gated, named or not.
+    // A live AGENT pane in a subfolder with no registered name is fail-closed:
+    // the row makes it steerable via `agent prompt`, so it must not read the
+    // person's digest just from its working directory. works_in is an exact
+    // dir match, so a subfolder cwd lands on Unverified rather than Stranger.
     world.script_inside_herdr(&[&socket]);
     world.procinfo_proves("w1:p1", 200, 9000, 500);
     *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &sub, "", "idle"));
     world.runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term-1"}}}"#));
     let ctx = Ctx { env: &live_pane_env(&world, "w1:p1"), ..world.ctx() };
-    coordinator::context(&ctx, "demo", false).unwrap();
+    let error = coordinator::context(&ctx, "demo", false).unwrap_err().to_string();
+    assert!(error.contains("no registered agent of `demo` is accountable"), "{error}");
 
     // No Herdr ancestor and no markers (a bare shell outside Herdr): the old
     // flat digest works too.
