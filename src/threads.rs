@@ -69,8 +69,8 @@ pub struct StartArgs {
     /// The profile (`--profile`), default `thread_profile` in PROJECT.md;
     /// it must be on the project's allow-list.
     pub profile: Option<String>,
-    /// Placement (`--kind worktree|tab|checkout`); default worktree with a
-    /// repo, tab without one.
+    /// Placement (`--kind worktree|tab`); a repository always means a
+    /// worktree, no repo means a tab.
     pub kind: Option<Kind>,
     pub base: Option<String>,
     pub task: String,
@@ -112,14 +112,20 @@ pub fn thread_profile(ctx: &Ctx, project: &Project, machine: &str, requested: Op
     Ok(ThreadProfile { name: found.name, agent: found.agent, remote_args: Some(found.args) })
 }
 
-/// The placement of a new thread from what was asked and whether it has a repo.
+/// The placement of a new thread from what was asked and whether it has a
+/// repo. A repository always means a worktree: `--kind tab` is for a task
+/// with no repository and is refused together with `--repo`.
 pub fn placement(kind: Option<Kind>, has_repo: bool, remote: bool) -> Result<Kind> {
     match (kind, has_repo) {
         (None, true) => Ok(Kind::Worktree),
         (None, false) => Ok(Kind::Tab),
-        (Some(Kind::Worktree), false) | (Some(Kind::Checkout), false) => bail!("a worktree or checkout thread needs --repo"),
+        (Some(Kind::Worktree), false) => bail!("a worktree thread needs --repo"),
+        (Some(Kind::Tab), true) => bail!("a tab is for a task with no repository; a repository task always runs in its own worktree"),
         (Some(Kind::Adopted), _) => bail!("an adopted thread is made with `thread adopt`"),
-        (Some(Kind::Tab), _) | (Some(Kind::Checkout), _) if remote => bail!("a tab or checkout thread runs in the project's own workspace, which is local; a remote repo needs a worktree thread"),
+        // Unreachable from the CLI (`Kind::parse` no longer accepts it), kept
+        // explicit so a legacy record can never drive a new placement.
+        (Some(Kind::Checkout), _) => bail!("`--kind checkout` was removed; a repository task runs in a worktree"),
+        (Some(Kind::Tab), _) if remote => bail!("a tab runs in the project's own workspace, which is local; a remote repo needs a worktree thread"),
         (Some(kind), _) => Ok(kind),
     }
 }
@@ -500,7 +506,11 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
     };
 
     match restart_plan(&record, &live, branch_exists, now)? {
-        RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
+        RestartPlan::Create => {
+            let placed = place_and_brief(ctx, &project, &view, id, true)?;
+            let _ = crate::steps::note_one_legacy_checkout(&project, &placed);
+            return Ok(placed);
+        }
         RestartPlan::ReusePane => {}
         RestartPlan::Reopen => match record.kind {
             Kind::Worktree => {
@@ -524,7 +534,9 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
     }
     let placed = thread::load(&project, id)?;
     write_brief(ctx, &project, &placed, true)?;
-    finish_placement(&project, &view, id)
+    let placed = finish_placement(&project, &view, id)?;
+    let _ = crate::steps::note_one_legacy_checkout(&project, &placed);
+    Ok(placed)
 }
 
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
@@ -1336,14 +1348,35 @@ mod tests {
     fn placement_follows_the_request_then_the_repo() {
         assert_eq!(placement(None, true, false).unwrap(), Kind::Worktree);
         assert_eq!(placement(None, false, false).unwrap(), Kind::Tab);
-        assert_eq!(placement(Some(Kind::Tab), true, false).unwrap(), Kind::Tab);
-        assert_eq!(placement(Some(Kind::Checkout), true, false).unwrap(), Kind::Checkout);
-        assert!(placement(Some(Kind::Checkout), false, false).is_err());
+        assert_eq!(placement(Some(Kind::Tab), false, false).unwrap(), Kind::Tab);
+        // A repository task always lands in a worktree: tab+repo is refused,
+        // and the old checkout placement cannot be requested any more.
+        assert!(placement(Some(Kind::Tab), true, false).is_err());
+        assert!(placement(Some(Kind::Checkout), true, false).is_err());
         assert!(placement(Some(Kind::Worktree), false, false).is_err());
         assert!(placement(Some(Kind::Tab), true, true).is_err());
         assert!(placement(Some(Kind::Adopted), true, false).is_err());
-        assert_eq!(Kind::parse("checkout").unwrap(), Kind::Checkout);
+        assert!(Kind::parse("checkout").is_err());
         assert!(Kind::parse("popup").is_err());
+    }
+
+    #[test]
+    fn a_legacy_checkout_record_still_parses_and_restart_plans() {
+        // The record format keeps accepting the removed kind.
+        let text = r#"
+id = "t-0007"
+title = "Old"
+status = "open"
+kind = "checkout"
+repo = "/repo"
+"#;
+        let t: Thread = toml::from_str(text).unwrap();
+        assert_eq!(t.kind, Kind::Checkout);
+        // Restart still knows what to do with the tab it was.
+        let checkout = Thread { kind: Kind::Checkout, worktree_path: String::new(), ..worktree_thread() };
+        assert_eq!(restart_plan(&checkout, &gone(), false, now()).unwrap(), RestartPlan::Reopen);
+        let no_pane = Thread { kind: Kind::Checkout, pane_id: String::new(), worktree_path: String::new(), ..worktree_thread() };
+        assert_eq!(restart_plan(&no_pane, &gone(), false, now()).unwrap(), RestartPlan::Create);
     }
 
     #[test]

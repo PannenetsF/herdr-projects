@@ -2055,7 +2055,7 @@ fn open_new_starts_a_fresh_coordinator_beside_a_live_one_without_its_session() {
 }
 
 #[test]
-fn a_tab_thread_with_a_repo_gets_its_brief_seconds_after_its_agent_is_ready() {
+fn a_repo_less_tab_thread_gets_its_brief_seconds_after_its_agent_is_ready() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     let repo = world.home.path().join("repo");
@@ -2071,7 +2071,17 @@ fn a_tab_thread_with_a_repo_gets_its_brief_seconds_after_its_agent_is_ready() {
     world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
     *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
     let ctx = world.ctx();
-    let args = StartArgs { title: "Clean up".into(), repo: Some(repo.to_string_lossy().into_owned()), machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Tidy.".into() };
+    // A tab without a repo runs in the project workspace; a repository task
+    // can no longer be forced into a tab (it always gets its own worktree).
+    let refused = threads::start(
+        &ctx,
+        "demo",
+        StartArgs { title: "Clean up".into(), repo: Some(world.home.path().join("repo").to_string_lossy().into_owned()), machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Tidy.".into() },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(refused.contains("a tab is for a task with no repository"), "{refused}");
+    let args = StartArgs { title: "Clean up".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Tidy.".into() };
     let t = threads::start(&ctx, "demo", args).unwrap();
     assert_eq!((t.kind, t.cwd.as_str(), t.prompt_pending), (Kind::Tab, cwd.as_str(), true));
 
@@ -2107,6 +2117,44 @@ fn a_tab_thread_with_a_repo_gets_its_brief_seconds_after_its_agent_is_ready() {
     let mut memory = crate::steps::Memory::new(&ctx);
     assert!(ticker::tick_for_test(&ctx, &mut memory));
     assert_eq!((world.runner.count("agent start"), world.runner.count("agent prompt")), (1, 1));
+}
+
+#[test]
+fn a_legacy_checkout_thread_gets_one_inbox_note_that_routes_to_its_owner() {
+    let world = World::new();
+    default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    let old = world.home.path().join("old-checkout");
+    std::fs::create_dir(&old).unwrap();
+    // A record left by pf.4: the removed checkout kind, pane still recorded.
+    world.thread(&project, &old, |t| {
+        t.kind = Kind::Checkout;
+        t.worktree_path = String::new();
+        t.workspace_id = "w2".into();
+        t.tab_id = "w2:t1".into();
+        t.pane_id = "w2:p1".into();
+        t.cwd = old.to_string_lossy().into_owned();
+    });
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+    let mut memory = crate::steps::Memory::new(&ctx);
+
+    ticker::tick_for_test(&ctx, &mut memory);
+    let notes: Vec<_> = inbox::unhandled(&project).into_iter().filter(|i| i.event == "checkout thread (legacy)").collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].owner.as_deref(), Some("hpc-demo"), "the note inherits the thread owner");
+    assert!(notes[0].summary.contains("checkout thread made before pf.5"), "{}", notes[0].summary);
+    assert!(notes[0].summary.contains("thread resolve demo t-0001"), "{}", notes[0].summary);
+
+    // The note is delivered exactly once, ticker restart or not.
+    ticker::tick_for_test(&ctx, &mut memory);
+    ticker::tick_for_test(&ctx, &mut memory);
+    let again = inbox::unhandled(&project).into_iter().filter(|i| i.event == "checkout thread (legacy)").count();
+    assert_eq!(again, 1);
+    assert!(crate::steps::load_state(&project).checkout_noted.contains("t-0001"));
 }
 
 #[test]

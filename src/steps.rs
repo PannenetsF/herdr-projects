@@ -56,6 +56,9 @@ pub struct State {
     pub session_item_written: bool,
     /// thread id -> when the ticker first saw its pull request merged.
     pub merged_seen: BTreeMap<String, String>,
+    /// Legacy checkout threads the one-time pf.5 note was already written for.
+    #[serde(default)]
+    pub checkout_noted: BTreeSet<String>,
 }
 
 /// Routing key for items with no thread owner (routines, outages, session
@@ -271,6 +274,38 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
         thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
     }
     Ok(())
+}
+
+/// One-time note per still-live thread made with the removed `--kind
+/// checkout` placement: it keeps running in the repo's main checkout, and
+/// the note tells the coordinator how to replace it with a worktree thread.
+/// Deduped through `state.checkout_noted`, so it appears exactly once.
+pub fn note_legacy_checkouts(project: &Project, state: &mut State) -> Result<()> {
+    for t in thread::list(project) {
+        if t.kind != thread::Kind::Checkout || !matches!(t.status, Status::Open | Status::Starting | Status::Failed) {
+            continue;
+        }
+        if !state.checkout_noted.insert(t.id.clone()) {
+            continue;
+        }
+        let summary = format!(
+            "{}: this is a checkout thread made before pf.5: it runs in the repository's main checkout, a placement that was removed. Resolve it with `thread resolve {} {}` and start a new thread for the remaining work; repository tasks now always run in their own worktree",
+            thread_label(&t), project.slug, t.id
+        );
+        inbox::write_thread(project, &t, "thread-state", "checkout thread (legacy)", &summary, "")?;
+    }
+    Ok(())
+}
+
+/// Like [`note_legacy_checkouts`] for an on-demand path (`thread restart`):
+/// loads and saves the ticker state itself. No-op apart from the one note.
+pub fn note_one_legacy_checkout(project: &Project, record: &thread::Thread) -> Result<()> {
+    if record.kind != thread::Kind::Checkout {
+        return Ok(());
+    }
+    let mut state = load_state(project);
+    note_legacy_checkouts(project, &mut state)?;
+    save_state(project, &state)
 }
 
 /// A thread-state item's event, from the group it moved to.

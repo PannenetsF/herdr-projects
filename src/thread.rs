@@ -40,8 +40,11 @@ pub enum Kind {
     #[default]
     Worktree,
     Tab,
-    /// A tab in the project workspace whose working directory is the repo's
-    /// main checkout, asked for explicitly with `thread start --kind checkout`.
+    /// A tab in the project workspace whose working directory used to be the
+    /// repo's main checkout (`thread start --kind checkout`, removed in
+    /// pf.5: repository tasks always run in a worktree). Kept only so old
+    /// thread records still parse and can be resolved; new threads can never
+    /// get this kind from the CLI.
     Checkout,
     Adopted,
 }
@@ -51,8 +54,9 @@ impl Kind {
         match text {
             "worktree" => Ok(Kind::Worktree),
             "tab" => Ok(Kind::Tab),
-            "checkout" => Ok(Kind::Checkout),
-            other => bail!("`{other}` is not a thread kind (worktree, tab or checkout)"),
+            // Accepted by the record format for threads made before pf.5,
+            // never from the command line.
+            other => bail!("`{other}` is not a thread kind (worktree or tab)"),
         }
     }
 }
