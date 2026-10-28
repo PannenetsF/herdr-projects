@@ -450,16 +450,28 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
                         ("auto_resolve_days", s.auto_resolve_days.to_string()),
                         ("nudge", s.nudge.to_string()),
                         ("mute", s.mute.to_string()),
-                        ("repos.add", crate::settings::repos_text(&s)),
-                        ("repos.remove", crate::settings::repos_text(&s)),
                     ];
                     for (key, value) in values {
-                        let label = match key {
-                            "repos.add" => "repos (↵ add)".to_string(),
-                            "repos.remove" => "repos (↵ remove)".to_string(),
-                            k => k.to_string(),
-                        };
+                        let label = key;
                         rows.push(Row { header: false, text: format!("  {label:<22} {value}"), color: None, kind: RowKind::Setting { slug: slug.to_string(), key: key.to_string(), value } });
+                    }
+                    rows.push(header(format!("repositories ({}) · one repository per row", s.repos.len())));
+                    rows.push(Row {
+                        header: false, text: "  + Add repository (Enter)".into(), color: None,
+                        kind: RowKind::Setting { slug: slug.to_string(), key: "repos.add".into(), value: String::new() },
+                    });
+                    if s.repos.is_empty() {
+                        rows.push(header("  No repositories yet"));
+                    }
+                    for repo in &s.repos {
+                        let value = match &repo.machine {
+                            Some(machine) => format!("{}@{machine}", repo.path),
+                            None => repo.path.clone(),
+                        };
+                        rows.push(Row {
+                            header: false, text: format!("  - {value}  (Enter to remove)"), color: None,
+                            kind: RowKind::Setting { slug: slug.to_string(), key: "repos.remove".into(), value },
+                        });
                     }
                 }
             }
@@ -1218,14 +1230,11 @@ impl<'a> Popup<'a> {
                             Mode::Pick { label: name.clone(), options: vec![(value != "true").to_string(), value.clone()], selected: 0, action }
                         }
                         "repos.remove" => {
-                            let options: Vec<String> = value.split(", ").filter(|s| *s != "(none)").map(str::to_string).collect();
-                            if options.is_empty() {
-                                self.message = "no repos to remove".into();
-                                Mode::List
-                            } else {
-                                let mut action = action;
-                                action.push("{}".into());
-                                Mode::Pick { label: "remove repo".into(), options, selected: 0, action }
+                            let mut action = action;
+                            action.push(value.clone());
+                            Mode::Confirm {
+                                question: "Remove this repository from the project? Files are kept. y/N".into(),
+                                action, lines: vec![value],
                             }
                         }
                         "repos.add" => Mode::Edit { label: "add repo (PATH or PATH@MACHINE)".into(), buffer: String::new(), action },
@@ -1594,6 +1603,51 @@ pub fn run(ctx: &Ctx, scope: Option<String>, workspace: String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_rows_are_individual_exact_values_and_removal_requires_confirmation() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let path = "/srv/repo, with spaces";
+        let text = std::fs::read_to_string(project.project_md()).unwrap();
+        let text = crate::settings::set_in(&text, "repos.add", path).unwrap();
+        let text = crate::settings::set_in(&text, "repos.add", "/srv/remote@boe-fyq").unwrap();
+        std::fs::write(project.project_md(), &text).unwrap();
+        let ctx = world.ctx();
+        let mut popup = Popup::new(&ctx, Some("demo".into()), String::new());
+        popup.section = SECTIONS.iter().position(|s| *s == Section::Settings).unwrap();
+        popup.reload();
+        let repos: Vec<_> = popup.rows.iter().filter_map(|r| match &r.kind {
+            RowKind::Setting { key, value, .. } if key == "repos.remove" => Some(value.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(repos, vec![path, "/srv/remote@boe-fyq"]);
+        assert!(popup.rows.iter().any(|r| r.text.contains("repositories (2)")));
+        popup.selected = popup.rows.iter().position(|r| matches!(&r.kind, RowKind::Setting { key, value, .. } if key == "repos.remove" && value == path)).unwrap();
+        popup.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(&popup.mode, Mode::Confirm { action, lines, .. }
+            if action == &["set", "demo", "repos.remove", path] && lines == &[path]));
+        assert_eq!(std::fs::read_to_string(project.project_md()).unwrap(), text, "Enter alone cannot remove a repo");
+        popup.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(std::fs::read_to_string(project.project_md()).unwrap(), text);
+        popup.selected = popup.rows.iter().position(|r| matches!(&r.kind, RowKind::Setting { key, .. } if key == "repos.add")).unwrap();
+        popup.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(&popup.mode, Mode::Edit { buffer, action, .. } if buffer.is_empty() && action == &["set", "demo", "repos.add"]));
+        let remaining = crate::settings::set_in(&text, "repos.remove", "/srv/remote@boe-fyq").unwrap();
+        let (settings, _) = project::parse_project_md(&remaining).unwrap();
+        assert_eq!(settings.repos.len(), 1);
+        assert_eq!(settings.repos[0].path, path);
+    }
+
+    #[test]
+    fn empty_repository_list_still_has_one_add_action() {
+        let world = crate::scenarios::World::new();
+        world.project("demo", "a.sock");
+        let rows = build(&world.ctx(), Section::Settings, Some("demo"));
+        assert!(rows.iter().any(|r| r.text == "  No repositories yet"));
+        assert_eq!(rows.iter().filter(|r| matches!(&r.kind, RowKind::Setting { key, .. } if key == "repos.add")).count(), 1);
+        assert!(!rows.iter().any(|r| matches!(&r.kind, RowKind::Setting { key, .. } if key == "repos.remove")));
+    }
 
     #[test]
     fn tasks_parse_with_lists_owners_and_threads() {

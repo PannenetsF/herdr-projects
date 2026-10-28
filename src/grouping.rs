@@ -87,8 +87,13 @@ pub enum Role {
     Coordinator,
     /// A registered thread (`{slug}!1!…`).
     Thread,
-    /// An unregistered pane working in a project subfolder (`{slug}!2!…`).
+    /// An unregistered pane sharing a thread folder with a live registered
+    /// pane — a second harness (`{slug}!2!…`).
     Guest,
+    /// An unregistered pane working inside a project (root or subfolder) but
+    /// not a second harness: a hand-started session the human wants visible
+    /// (`{slug}!3!…`).
+    Session,
     /// Belongs to no project (`~!…`).
     Other,
 }
@@ -99,6 +104,7 @@ impl Role {
             Role::Coordinator => "coordinator",
             Role::Thread => "thread",
             Role::Guest => "guest",
+            Role::Session => "session",
             Role::Other => "other",
         }
     }
@@ -114,16 +120,19 @@ impl Role {
         match key.split('!').nth(1) {
             Some("0") => Role::Coordinator,
             Some("2") => Role::Guest,
+            Some("3") => Role::Session,
             _ => Role::Thread,
         }
     }
 
     /// Guest and other panes are automation/no-project panes: their
-    /// attention points are never for the human.
+    /// attention points are never for the human. Sessions are hand-started
+    /// and human-facing, so they claim no audience here (report_pane does
+    /// not run for them either; an unset hp_audience leaves them ungated).
     fn audience(self) -> Option<crate::thread::Audience> {
         match self {
             Role::Guest | Role::Other => Some(crate::thread::Audience::Internal),
-            Role::Coordinator | Role::Thread => None,
+            Role::Coordinator | Role::Thread | Role::Session => None,
         }
     }
 }
@@ -143,6 +152,13 @@ pub fn thread_key(slug: &str, rank: u8, id: &str) -> String {
 /// status — the only signal available for a pane the project does not track.
 pub fn guest_thread_key(slug: &str, rank: u8, pane: &str) -> String {
     format!("{slug}!2!{rank}!{pane}")
+}
+
+/// Hand-started session block (`!3!`): an unregistered pane inside a project
+/// that is not a second harness. Sorts after every tracked/guest row of the
+/// same project so it never steals a coordinator or thread slot.
+pub fn session_key(slug: &str, pane: &str) -> String {
+    format!("{slug}!3!{pane}")
 }
 
 fn guest_rank(status: &str) -> u8 {
@@ -194,24 +210,46 @@ pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace]) -> Plan {
         .iter()
         .map(|(slug, part)| (slug.as_str(), part.root.as_str(), part.home.as_str()))
         .collect();
+    // Registered panes whose cwd is a strict subfolder of their project root:
+    // these are live thread panes. Only they can "claim" an untracked pane as
+    // a second harness. A coordinator parked at the project root must not
+    // claim every pane under the project.
+    let mut claiming_cwds: Vec<&str> = Vec::new();
+    for part in parts.values() {
+        let root = part.root.as_str();
+        if root.is_empty() {
+            continue;
+        }
+        for row in &part.panes {
+            if let Some(a) = agents.iter().find(|a| a.pane_id == row.pane) {
+                let cwd = a.cwd.as_str();
+                if !cwd.is_empty() && cwd != root && Path::new(cwd).starts_with(root) {
+                    claiming_cwds.push(cwd);
+                }
+            }
+        }
+    }
     let mut rows: Vec<(String, &str, &str)> = agents
         .iter()
         .map(|a| match owner.get(a.pane_id.as_str()) {
             Some(row) => (row.key.clone(), a.pane_id.as_str(), row.sub.as_str()),
             None => {
-                // Untracked pane: a pane in a project's SUBfolder (a second
-                // harness in a thread dir, an ad-hoc shell there) is claimed
-                // as that project's guest. A pane whose cwd IS the project
-                // home but carries no registered coordinator name is NOT
-                // claimed into the coordinator segment — that would give a
-                // hand-started session the head slot and the focus_agent
-                // position; it joins the global "other" tail instead.
-                let claimed = roots
-                    .iter()
-                    .find(|(_, dir, _)| !dir.is_empty() && works_under(a, dir) && a.cwd != **dir && a.foreground_cwd != **dir)
-                    .map(|(slug, _, _)| guest_thread_key(slug, guest_rank(&a.agent_status), &a.pane_id));
-                match claimed {
-                    Some(key) => (key, a.pane_id.as_str(), ""),
+                // Untracked pane. A real second harness is an unregistered
+                // pane sharing a thread folder with a live registered pane:
+                // it stays hidden as `guest`. Any other pane inside a project
+                // (the project home, or a thread folder whose registered pane
+                // is gone) is a hand-started session the human wants visible,
+                // so it becomes `session`. A pane outside every project is
+                // `other`.
+                match roots.iter().find(|(_, dir, _)| !dir.is_empty() && works_under(a, dir)) {
+                    Some((slug, _, _)) => {
+                        let is_second_harness = claiming_cwds.iter().any(|c| works_under(a, c));
+                        if is_second_harness {
+                            (guest_thread_key(slug, guest_rank(&a.agent_status), &a.pane_id), a.pane_id.as_str(), "")
+                        } else {
+                            (session_key(slug, &a.pane_id), a.pane_id.as_str(), "")
+                        }
+                    }
                     // Keyed by the PANE ID, not by this tick's enumeration
                     // index: an ordinal rewritten every other pane's token
                     // whenever the agent list changes order, which produced
@@ -232,10 +270,14 @@ pub fn plan(parts: &Parts, agents: &[Agent], workspaces: &[Workspace]) -> Plan {
             ("hp_group".to_string(), Some(key.clone())),
             ("hp_role".to_string(), Some(role.token().to_string())),
         ];
-        // Guest/other panes own their audience here; tracked panes get theirs
-        // (or a clear) from `sidebar::report_pane`, so it is not touched.
-        if let Some(audience) = role.audience() {
-            tokens.push(("hp_audience".to_string(), Some(audience.token().to_string())));
+        // Untracked panes own their audience here. Guest/other are internal
+        // (never a human cue); sessions are hand-started and human-facing, so
+        // the token is cleared (a previous guest/other tick may have set it).
+        // Tracked panes get theirs (or a clear) from `sidebar::report_pane`.
+        match role.audience() {
+            Some(audience) => tokens.push(("hp_audience".to_string(), Some(audience.token().to_string()))),
+            None if role == Role::Session => tokens.push(("hp_audience".to_string(), None)),
+            None => {}
         }
         out.agents.push((pane.to_string(), tokens));
     }
@@ -494,10 +536,12 @@ mod tests {
     }
 
     #[test]
-    fn untracked_pane_working_in_a_project_folder_is_claimed_into_its_block() {
-        // One part with a disclosed root; the recorded pane is in one
-        // workspace, the stray harness in the SAME project folder but tracked
-        // nowhere — it must sort with the project, not in the global tail.
+    fn untracked_pane_working_in_a_project_folder_is_a_session_when_no_thread_shares_it() {
+        // One part with a disclosed root and only a coordinator registered; the
+        // stray pane works in a thread subfolder but that thread has no live
+        // registered pane, so it is NOT a second harness — it is a hand-started
+        // session the human wants visible. It still sorts inside the project
+        // block, not in the global tail.
         let mut parts = Parts::new();
         parts.insert(
             "alpha".into(),
@@ -508,16 +552,16 @@ mod tests {
                 spaces: vec!["wa".into()],
             },
         );
-        let guest = agent_in("a9", "/proj/alpha/threads/t-0007", "working");
+        let session = agent_in("a9", "/proj/alpha/threads/t-0007", "working");
         let outsider = agent_in("x1", "/elsewhere", "idle");
-        let layout = plan(&parts, &[agent("a1"), outsider, guest], &[]);
+        let layout = plan(&parts, &[agent("a1"), outsider, session], &[]);
         let order: Vec<&str> = layout.agents.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(order, ["a1", "a9", "x1"], "the guest sorts inside the project, before the outsider");
+        assert_eq!(order, ["a1", "a9", "x1"], "the session sorts inside the project, before the outsider");
         let t: HashMap<&str, &Tokens> = layout.agents.iter().map(|(p, t)| (p.as_str(), t)).collect();
-        let guest_key = get(t["a9"], "hp_group").unwrap();
-        assert!(guest_key.starts_with("alpha!2!4!a9"), "guest-thread segment, working rank 4, got {guest_key}");
-        assert_eq!(get(t["a9"], "hp_role"), Some("guest"));
-        assert_eq!(get(t["a9"], "hp_audience"), Some("internal"), "a guest is never a human cue");
+        let key = get(t["a9"], "hp_group").unwrap();
+        assert_eq!(key, "alpha!3!a9", "session segment, got {key}");
+        assert_eq!(get(t["a9"], "hp_role"), Some("session"));
+        assert_eq!(get(t["a9"], "hp_audience"), None, "a session is human-facing, no internal audience");
         assert_eq!(get(t["a1"], "hp_role"), Some("coordinator"));
         assert_eq!(get(t["a1"], "hp_audience"), None, "tracked panes leave the audience to report_pane");
         assert!(get(t["x1"], "hp_group").unwrap().starts_with('~'));
@@ -531,7 +575,35 @@ mod tests {
     }
 
     #[test]
-    fn untracked_pane_in_the_home_folder_falls_through_to_the_tail() {
+    fn untracked_pane_sharing_a_live_thread_folder_is_a_guest_second_harness() {
+        // A registered thread pane is live in t-0007; a second pane in the same
+        // folder is a real second harness and must stay hidden as guest.
+        let mut parts = Parts::new();
+        parts.insert(
+            "alpha".into(),
+            ProjectPart {
+                panes: vec![
+                    row("a1", coordinator_key("alpha", "a1"), ""),
+                    row("a8", thread_key("alpha", 2, "t-0007"), "sub"),
+                ],
+                root: "/proj/alpha".into(),
+                home: "wa".into(),
+                spaces: vec!["wa".into()],
+            },
+        );
+        let registered = agent_in("a8", "/proj/alpha/threads/t-0007", "idle");
+        let second = agent_in("a9", "/proj/alpha/threads/t-0007", "working");
+        let layout = plan(&parts, &[agent("a1"), registered, second], &[]);
+        let t: HashMap<&str, &Tokens> = layout.agents.iter().map(|(p, t)| (p.as_str(), t)).collect();
+        let key = get(t["a9"], "hp_group").unwrap();
+        assert!(key.starts_with("alpha!2!4!a9"), "guest-thread segment, working rank 4, got {key}");
+        assert_eq!(get(t["a9"], "hp_role"), Some("guest"));
+        assert_eq!(get(t["a9"], "hp_audience"), Some("internal"), "a guest is never a human cue");
+        assert_eq!(get(t["a8"], "hp_role"), Some("thread"));
+    }
+
+    #[test]
+    fn untracked_pane_in_the_home_folder_is_a_visible_session() {
         let mut parts = Parts::new();
         parts.insert(
             "alpha".into(),
@@ -539,12 +611,15 @@ mod tests {
         );
         // A hand-started session parked at the project root carries no
         // registered coordinator name, so it must never take the coordinator
-        // segment (and the focus_agent position); it lands in the tail.
+        // segment (and the focus_agent position); it becomes a visible
+        // session at the end of the project block, not the global tail.
         let stray = agent_in("a2", "/proj/alpha", "blocked");
         let layout = plan(&parts, &[agent("a1"), stray], &[]);
         let t: HashMap<&str, &Tokens> = layout.agents.iter().map(|(p, t)| (p.as_str(), t)).collect();
         assert!(get(t["a1"], "hp_group").unwrap().starts_with("alpha!0!"));
-        assert!(get(t["a2"], "hp_group").unwrap().starts_with('~'), "root-cwd stray goes to the tail: {:?}", get(t["a2"], "hp_group"));
+        assert_eq!(get(t["a2"], "hp_group"), Some("alpha!3!a2"), "root-cwd stray is a session: {:?}", get(t["a2"], "hp_group"));
+        assert_eq!(get(t["a2"], "hp_role"), Some("session"));
+        assert_eq!(get(t["a2"], "hp_audience"), None);
     }
 
     #[test]
@@ -602,13 +677,19 @@ mod tests {
             Role::from_key(&guest_thread_key("demo", 4, "w9:p2")),
             Role::Guest
         );
+        assert_eq!(
+            Role::from_key(&session_key("demo", "w9:p3")),
+            Role::Session
+        );
         assert_eq!(Role::from_key("~!0007"), Role::Other);
         // The values the hp_role token carries.
         assert_eq!(Role::Coordinator.token(), "coordinator");
         assert_eq!(Role::Thread.token(), "thread");
         assert_eq!(Role::Guest.token(), "guest");
+        assert_eq!(Role::Session.token(), "session");
         assert_eq!(Role::Other.token(), "other");
-        // Guests and others are internal; tracked roles claim no audience here.
+        // Guests and others are internal; tracked roles and hand-started
+        // sessions claim no audience here.
         assert_eq!(
             Role::Guest.audience(),
             Some(crate::thread::Audience::Internal)
@@ -619,6 +700,7 @@ mod tests {
         );
         assert_eq!(Role::Coordinator.audience(), None);
         assert_eq!(Role::Thread.audience(), None);
+        assert_eq!(Role::Session.audience(), None);
         // Every token this module writes is cleared (and counted in the chunk test).
         for name in ["hp_role", "hp_audience"] {
             assert!(tokens().iter().any(|t| t == name), "{name}");

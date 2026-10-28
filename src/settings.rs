@@ -231,14 +231,6 @@ pub fn system_open(ctx: &Ctx, target: &str) -> Result<()> {
     Ok(())
 }
 
-/// `set`'s array form for tests and the popup: the current repos as text.
-pub fn repos_text(settings: &Settings) -> String {
-    if settings.repos.is_empty() {
-        return "(none)".into();
-    }
-    settings.repos.iter().map(|r| match &r.machine { Some(m) => format!("{}@{m}", r.path), None => r.path.clone() }).collect::<Vec<_>>().join(", ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
