@@ -306,11 +306,8 @@ pub(crate) fn scrub(mut cmd: Cmd) -> Cmd {
     cmd
 }
 
-/// The passwd user's real home, found without trusting `HOME` (which may
-/// point at a second herdr server the attacker runs). A login shell expands
-/// `~` from the account database when `HOME` is unset — macOS bash and Linux
-/// dash both do this for a non-interactive `sh -c` — so ask a cleaned
-/// `/bin/sh` rather than parsing platform-specific `id -P` / `getent` output.
+/// The passwd user's real home, never the caller-controlled HOME. Dash leaves
+/// `~` unexpanded when HOME is unset, so shell expansion is not portable.
 fn real_home(ctx: &Ctx, timeout: Duration) -> Option<PathBuf> {
     // In tests the scripted world home stands in for the passwd home.
     #[cfg(test)]
@@ -320,17 +317,54 @@ fn real_home(ctx: &Ctx, timeout: Duration) -> Option<PathBuf> {
     }
     #[cfg(not(test))]
     {
-        let cmd = scrub(
-            Cmd::new("/bin/sh", timeout)
-                .args(["-c", "printf %s ~"])
-                .env_remove("HOME")
-                .env_remove("XDG_CONFIG_HOME"),
-        );
-        let out = ctx.runner.run(&cmd).ok()?;
-        let home = out.stdout.trim();
-        if !out.success() || home.is_empty() {
+        let _ = (ctx, timeout);
+        account_home()
+    }
+}
+
+fn account_home() -> Option<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut size = 4096;
+    loop {
+        let mut buffer = vec![0_u8; size];
+        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        // getpwuid_r owns no static storage: all returned strings live in
+        // buffer, and are copied before it is dropped.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && size < 1024 * 1024 {
+            size *= 2;
+            continue;
+        }
+        if rc != 0 || result.is_null() {
             return None;
         }
-        Some(PathBuf::from(home))
+        let entry = unsafe { entry.assume_init() };
+        if entry.pw_dir.is_null() {
+            return None;
+        }
+        let bytes = unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes();
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(bytes));
+        return path.is_absolute().then_some(path);
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    #[test]
+    fn account_home_is_absolute_without_shell_expansion() {
+        let home = super::account_home().expect("current uid must have an account home");
+        assert!(home.is_absolute(), "{home:?}");
+        assert_ne!(home, std::path::Path::new("~"));
     }
 }
