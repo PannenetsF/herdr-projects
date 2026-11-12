@@ -218,7 +218,27 @@ pub enum Caller {
 /// coordinator drive any thread with `env -u HERDR_ENV`.
 pub fn caller(ctx: &Ctx, project: &Project) -> Caller {
     let marked = ctx.env.var("HERDR_ENV").as_deref() == Some("1");
-    crate::identify::identify(ctx, project, marked)
+    match crate::identify::identify(ctx, project, marked) {
+        // `auto_adopt` on: a proven but unregistered pane in the project home
+        // registers itself instead of being refused. The adoption rules still
+        // reject thread panes, named agents and other projects, in which case
+        // the original Stranger decision stands (fail closed).
+        Caller::Stranger { pane } if project.safety(&ctx.config_dir).is_ok_and(|s| s.auto_adopt) => {
+            match auto_adopt(ctx, project, &pane) {
+                Ok(name) => Caller::Coordinator { name, pane },
+                Err(_) => Caller::Stranger { pane },
+            }
+        }
+        other => other,
+    }
+}
+
+/// Silent self-registration for `caller` when the `auto_adopt` safety setting
+/// is on. The pane is already proven by identify; `adopt_pane_agent` repeats
+/// every adoption check, so only an unnamed agent in the project home can
+/// succeed. Errors leave the caller a Stranger with no side effects.
+fn auto_adopt(ctx: &Ctx, project: &Project, pane: &str) -> Result<String> {
+    adopt_pane_agent(ctx, &project.slug, Some(pane), &crate::paths::SessionFlags::default(), true)
 }
 
 /// The pure identity decision for a live agent row in a PROVEN pane.
@@ -630,6 +650,13 @@ fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
 /// replaced); with a live primary it becomes an additional
 /// (`hpc-<slug>-N`) coordinator.
 pub fn adopt(ctx: &Ctx, slug: &str, pane_arg: Option<&str>, session_flags: &SessionFlags) -> Result<()> {
+    adopt_pane_agent(ctx, slug, pane_arg, session_flags, false).map(|_| ())
+}
+
+/// The adoption core. `silent` suppresses every person-facing line: the
+/// self-registration path from [`caller`] runs inside another command whose
+/// output the caller is waiting for.
+fn adopt_pane_agent(ctx: &Ctx, slug: &str, pane_arg: Option<&str>, session_flags: &SessionFlags, silent: bool) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
     if project.status() == Status::Archived {
         bail!("`{slug}` is archived; run `unarchive {slug}` first");
@@ -681,7 +708,9 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane_arg: Option<&str>, session_flags: &Sess
         }
     });
     if let Some(stale) = &stale_pane {
-        println!("the recorded primary pane {stale} no longer exists in this session; it will be replaced");
+        if !silent {
+            println!("the recorded primary pane {stale} no longer exists in this session; it will be replaced");
+        }
     }
     let existing = if stale_pane.is_some() { None } else { existing };
     let dir = project.canonical_dir().to_string_lossy().into_owned();
@@ -736,7 +765,7 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane_arg: Option<&str>, session_flags: &Sess
     if names::is_coordinator_name(slug, &agent.name) {
         // Idempotent adoption: named correctly already. Make sure the record
         // points at this pane (it is the primary when none existed).
-        return finish_adopt(ctx, &project, &existing, &herdr, &socket, session.name.as_deref().unwrap_or(""), &agent, &agent.name, &prefix, true);
+        return finish_adopt(ctx, &project, &existing, &herdr, &socket, session.name.as_deref().unwrap_or(""), &agent, &agent.name, &prefix, true, silent);
     }
     if !agent.name.is_empty() {
         bail!("pane {pane} already carries the unrelated name `{}`; it is never force-renamed. Rename it explicitly if that is intended (`herdr agent rename {pane} {}`).", agent.name, names::coordinator(slug, 0));
@@ -766,11 +795,12 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane_arg: Option<&str>, session_flags: &Sess
     // Reflect the rename for the record/finish path without re-listing.
     let mut renamed = agent.clone();
     renamed.name = name.clone();
-    finish_adopt(ctx, &project, &existing, &herdr, &socket, session.name.as_deref().unwrap_or(""), &renamed, &name, &prefix, false)
+    finish_adopt(ctx, &project, &existing, &herdr, &socket, session.name.as_deref().unwrap_or(""), &renamed, &name, &prefix, false, silent)
 }
 
 /// Writes (or leaves) the primary record, starts the ticker, colors the pane
 /// and tells the user what to run. `already_named` only changes the wording.
+/// Returns the registered coordinator name.
 fn finish_adopt(
     ctx: &Ctx,
     project: &Project,
@@ -782,7 +812,8 @@ fn finish_adopt(
     name: &str,
     prefix: &str,
     already_named: bool,
-) -> Result<()> {
+    silent: bool,
+) -> Result<String> {
     let slug = &project.slug;
     let dir = project.canonical_dir().to_string_lossy().into_owned();
     if existing.is_none() {
@@ -802,20 +833,28 @@ fn finish_adopt(
                 updated: String::new(),
             }
         })?;
-        println!("registered pane {} as the primary coordinator of `{slug}` (`{name}`)", agent.pane_id);
+        if !silent {
+            println!("registered pane {} as the primary coordinator of `{slug}` (`{name}`)", agent.pane_id);
+        }
     } else if existing.as_ref().is_some_and(|r| r.pane_id == agent.pane_id) {
-        println!("pane {} is already the registered primary coordinator of `{slug}` (`{name}`)", agent.pane_id);
+        if !silent {
+            println!("pane {} is already the registered primary coordinator of `{slug}` (`{name}`)", agent.pane_id);
+        }
     } else {
         // An additional coordinator; the primary record is untouched.
-        println!("registered pane {} as an additional coordinator of `{slug}` (`{name}`); the primary record is unchanged", agent.pane_id);
+        if !silent {
+            println!("registered pane {} as an additional coordinator of `{slug}` (`{name}`); the primary record is unchanged", agent.pane_id);
+        }
     }
     report_tokens(herdr, project, &agent.pane_id);
     ticker::start(ctx)?;
-    if already_named {
+    if already_named && !silent {
         println!("it was already registered as `{name}`");
     }
-    println!("let it read the project rules: run `{prefix} context {slug}` in that pane");
-    Ok(())
+    if !silent {
+        println!("let it read the project rules: run `{prefix} context {slug}` in that pane");
+    }
+    Ok(name.to_string())
 }
 
 /// `coordinator prompt`: a sentence to a coordinator (the popup's task keys

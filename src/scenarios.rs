@@ -3312,6 +3312,88 @@ fn context_is_refused_for_an_unregistered_root_pane_and_marks_nothing() {
 }
 
 #[test]
+fn auto_adopt_registers_an_unnamed_project_home_pane_on_the_first_gated_command() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let cfg = world.ctx().config_dir.to_path_buf();
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("config.toml"), "[safety.default]\nauto_adopt = true\n").unwrap();
+    world.script_inside_herdr(&[&socket]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "", "idle"));
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t1", "w1:p1", &dir));
+    world.runner.on("agent rename", ok(r#"{"result":{}}"#));
+    let env = live_pane_env(&world, "w1:p1");
+    let ctx = Ctx { env: &env, ..world.ctx() };
+
+    // The first owner-gated command both registers the pane and runs through.
+    coordinator::context(&ctx, "demo", true).unwrap();
+    assert_eq!(world.runner.count("agent rename w1:p1 hpc-demo"), 1);
+    let record = project.coordinator().expect("the self-adoption wrote a coordinator record");
+    assert_eq!((record.pane_id.as_str(), record.agent_name.as_str()), ("w1:p1", "hpc-demo"));
+
+    // A second command needs no further rename: the pane now classifies by name.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
+    coordinator::context(&ctx, "demo", true).unwrap();
+    assert_eq!(world.runner.count("agent rename"), 1);
+}
+
+#[test]
+fn auto_adopt_keeps_every_non_adoptable_pane_fail_closed() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    let other = project::create(&world.root, "other", "", vec![]).unwrap();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let cfg = world.ctx().config_dir.to_path_buf();
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("config.toml"), "[safety.default]\nauto_adopt = true\n").unwrap();
+    world.script_inside_herdr(&[&socket]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w1", "w1:t1", "w1:p1", &dir));
+    world.runner.on("agent rename", ok(r#"{"result":{}}"#));
+
+    for name in ["hp-demo-t-0001", "custom-name", "hpc-other"] {
+        *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, name, "idle"));
+        let env = live_pane_env(&world, "w1:p1");
+        let ctx = Ctx { env: &env, ..world.ctx() };
+        let error = coordinator::context(&ctx, "demo", true).unwrap_err().to_string();
+        assert!(error.contains("NOT a registered coordinator"), "{name}: {error}");
+        assert_eq!(world.runner.count("agent rename"), 0, "{name} must never be force-renamed");
+    }
+    assert!(project.coordinator().is_none());
+    assert!(other.coordinator().is_none());
+}
+
+#[test]
+fn auto_adopt_a_project_layer_off_overrides_the_default_on() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let cfg = world.ctx().config_dir.to_path_buf();
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        format!("[safety.default]\nauto_adopt = true\n\n[safety.\"{dir}\"]\nauto_adopt = false\n"),
+    )
+    .unwrap();
+    world.script_inside_herdr(&[&socket]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "", "idle"));
+    world.runner.on("agent rename", ok(r#"{"result":{}}"#));
+    let env = live_pane_env(&world, "w1:p1");
+    let ctx = Ctx { env: &env, ..world.ctx() };
+
+    let error = coordinator::context(&ctx, "demo", true).unwrap_err().to_string();
+    assert!(error.contains("NOT a registered coordinator"), "{error}");
+    assert_eq!(world.runner.count("agent rename"), 0);
+    assert!(project.coordinator().is_none());
+}
+
+#[test]
 fn an_unnamed_subfolder_agent_pane_is_gated_but_a_bare_shell_outside_herdr_is_served() {
     let world = World::new();
     let socket = default_socket(&world);

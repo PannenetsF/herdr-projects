@@ -1193,8 +1193,8 @@ impl<'a> Popup<'a> {
                         Mode::Pick { label: format!("{name} (default: use the all-projects value)"), options, selected: 0, action }
                     };
                     self.mode = match name.as_str() {
-                        "yolo" | "routine_commands" if value == "on" => pick(&["off", "on"]),
-                        "yolo" | "routine_commands" => pick(&["on", "off"]),
+                        "yolo" | "routine_commands" | "auto_adopt" if value == "on" => pick(&["off", "on"]),
+                        "yolo" | "routine_commands" | "auto_adopt" => pick(&["on", "off"]),
                         "start_threads" if value == "auto" => pick(&["propose", "auto"]),
                         "start_threads" => pick(&["auto", "propose"]),
                         "trust_screens" if value == "coordinator" => pick(&["user", "coordinator"]),

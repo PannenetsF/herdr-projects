@@ -18,10 +18,11 @@ use crate::project::{self, Project, SafetyLayer};
 pub const DEFAULT_TABLE: &str = "default";
 
 /// The keys `safety set` accepts, with what they hold.
-pub const KEYS: [(&str, &str); 6] = [
+pub const KEYS: [(&str, &str); 7] = [
     ("yolo", "on/off"),
     ("start_threads", "propose/auto"),
     ("trust_screens", "coordinator/user"),
+    ("auto_adopt", "on/off"),
     ("coordinator_agent_args", "arguments"),
     ("thread_agent_args", "arguments"),
     ("routine_commands", "on/off"),
@@ -111,7 +112,7 @@ fn value_item(key: &str, words: &[String]) -> Result<Option<Item>> {
         }
     };
     Ok(Some(match key {
-        "yolo" | "routine_commands" => toml_edit::value(parse_on_off(one()?)?),
+        "yolo" | "routine_commands" | "auto_adopt" => toml_edit::value(parse_on_off(one()?)?),
         "start_threads" => match one()? {
             value @ ("propose" | "auto") => toml_edit::value(value),
             other => bail!("start_threads is propose or auto, not `{other}`"),
@@ -246,6 +247,7 @@ pub fn rows(config_dir: &Path, target: &Target) -> Result<Vec<SafetyRow>> {
     let (yolo, yolo_source) = pick(&own.yolo, &default.yolo, own_source, false);
     let (start, start_source) = pick(&own.start_threads, &default.start_threads, own_source, "propose".to_string());
     let (trust, trust_source) = pick(&own.trust_screens, &default.trust_screens, own_source, project::default_trust_screens(yolo).to_string());
+    let (auto_adopt, auto_adopt_source) = pick(&own.auto_adopt, &default.auto_adopt, own_source, false);
     let (coordinator, coordinator_source) = pick(&own.coordinator_agent_args, &default.coordinator_agent_args, own_source, Vec::new());
     let (thread, thread_source) = pick(&own.thread_agent_args, &default.thread_agent_args, own_source, Vec::new());
     let (commands, commands_source) = pick(&own.routine_commands, &default.routine_commands, own_source, false);
@@ -263,6 +265,7 @@ pub fn rows(config_dir: &Path, target: &Target) -> Result<Vec<SafetyRow>> {
             source: trust_source,
             note: if trust_source == "built-in" { "follows yolo".into() } else { String::new() },
         },
+        SafetyRow { key: "auto_adopt", value: on_off(auto_adopt).into(), source: auto_adopt_source, note: String::new() },
         SafetyRow { key: "coordinator_agent_args", value: args(coordinator), source: coordinator_source, note: String::new() },
         SafetyRow { key: "thread_agent_args", value: args(thread), source: thread_source, note: String::new() },
         SafetyRow { key: "routine_commands", value: on_off(commands).into(), source: commands_source, note: String::new() },

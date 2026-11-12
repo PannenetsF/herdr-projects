@@ -114,6 +114,7 @@ yolo = true
 yolo = false                       # on: threads start without asking, agents skip permission prompts
 start_threads = "propose"          # or "auto": the coordinator starts threads without asking
 trust_screens = "user"             # or "coordinator": who answers trust screens in thread panes (unset: follows yolo)
+auto_adopt = false                 # on: a proven, unnamed pane in the project home registers itself as a coordinator on its first owner-gated command
 coordinator_agent_args = []        # extra arguments for every coordinator's agent CLI
 thread_agent_args = []             # extra arguments for every thread's agent CLI
 routine_commands = false           # true lets approved routines run shell commands
@@ -122,6 +123,8 @@ routine_commands = false           # true lets approved routines run shell comma
 **Yolo mode** is the one switch for "never stop to ask": `start_threads` becomes `auto` whatever it says, and every coordinator and thread launches with its own harness's skip-permissions flag, added after the profile's own arguments: Claude Code `--dangerously-skip-permissions`, Codex `--dangerously-bypass-approvals-and-sandbox`, Gemini CLI and Qwen Code `--yolo`, Cursor Agent `--force`, OpenCode `--auto`, Copilot CLI `--allow-all-tools`, Amp `--dangerously-allow-all`, Pi nothing (it never asks). Other kinds have no known flag: their agents still ask (`safety show` says so for the project's kinds). Routine commands are not part of yolo mode: a routine command runs with no agent in the loop, so it stays behind `routine_commands` and a per-command approval.
 
 **Trust screens** are an agent's "trust this folder?" dialog, its restricted-folder chooser, and its hooks or settings review (Codex's "Hooks need review"). The harness saves the answer for every later session in that folder, so `trust_screens` says who gives it: `coordinator` (it answers them with `thread keys` for the thread's own folder) or `user` (it tells you, and `thread keys` refuses while one shows). Unset, it follows yolo mode: on, the coordinator; off, you. Whatever the setting, nothing is typed into a trust screen: a thread's brief waits, and `thread prompt` refuses, while one shows, even when Herdr reads the pane as idle, and the thread shows `needs you`.
+
+**Auto-adopt** removes the manual `coordinator adopt` step: with `auto_adopt = on`, an agent pane that is proven to run in the project home but carries no registered name registers itself the first time it runs an owner-gated command (`context`, `thread start`, inbox commands), then the command runs as that coordinator. The existing adoption checks are unchanged, so this never widens who can register: thread panes (`hp-<slug>-t-*`), agents already carrying any name, and panes registered to another project stay refused, and adoption still requires the project home as the pane's working directory. It only changes who initiates the registration for a genuinely unnamed pane.
 
 A change reaches agents launched after it. Running agents keep the flags they started with until restarted: `r` on a thread in the popup, or quit the coordinator and `open` it again (it resumes its session). A running coordinator sees a new `start_threads` at its next `context`.
 

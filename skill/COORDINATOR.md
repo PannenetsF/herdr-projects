@@ -12,8 +12,8 @@ You coordinate. You never do the work yourself, so you are always free to answer
 
 The coordinator is a REGISTERED agent, not "whatever is running in this folder". You are the coordinator only when your Herdr agent name is this project's coordinator name, `hpc-<slug>` (or `hpc-<slug>-N` for a second one). Being started by hand in the project folder does NOT register you.
 
-- `hp context` enforces this. If it refuses with "... NOT a registered coordinator ...", stop: do not act as coordinator, do not try to read the inbox another way, and do not mark anything seen. Hand the user the exact line it prints — `hp coordinator adopt <slug> --pane <pane-id>` — and wait. They run it, your pane is renamed, and you run `hp context` again.
-- Never run `coordinator adopt` yourself to claim a pane, and never ask a thread to: adopting is the user's decision about which session coordinates the project.
+- `hp context` enforces this. If it refuses with "... NOT a registered coordinator ...", stop: do not act as coordinator, do not try to read the inbox another way, and do not mark anything seen. Hand the user the exact line it prints — `hp coordinator adopt <slug> --pane <pane-id>` — and wait. They run it, your pane is renamed, and you run `hp context` again. With the user's `auto_adopt` safety setting on, an unnamed pane is registered by the binary itself while serving that first command, so no refusal and no manual adopt occur; you still never run `coordinator adopt` yourself.
+- Never run `coordinator adopt` yourself to claim a pane, and never ask a thread to: adopting is the user's decision about which session coordinates the project. The `auto_adopt` path is the binary's own fail-closed mechanism, not an agent action.
 - A thread session (`hp-<slug>-t-…`, or any agent in a `threads/` worktree) must never run `hp context`: the digest and the inbox are the coordinator's, and from a thread pane it marks items seen in the shared legacy bucket, which can suppress a nudge the coordinator should get.
 - Multiple registered coordinators are possible; each coordinates, and each thread belongs to exactly one of them (see Thread ownership).
 

@@ -249,6 +249,10 @@ pub struct Safety {
     /// Who answers trust screens in thread panes: `coordinator` or `user`.
     /// Unset, it follows yolo (on: the coordinator; off: the user).
     pub trust_screens: String,
+    /// On: an unnamed, proven agent pane in the project home registers itself
+    /// as a coordinator on its first owner-gated command, instead of being
+    /// refused. Thread panes, named agents and other projects stay refused.
+    pub auto_adopt: bool,
     /// The profiles threads may use; `None`: every profile.
     pub thread_profiles: Option<Vec<String>>,
     pub coordinator_profiles: Option<Vec<String>>,
@@ -263,6 +267,7 @@ impl Default for Safety {
             routine_commands: false,
             yolo: false,
             trust_screens: crate::trust_screen::USER.into(),
+            auto_adopt: false,
             thread_profiles: None,
             coordinator_profiles: None,
         }
@@ -295,6 +300,7 @@ pub struct SafetyLayer {
     pub routine_commands: Option<bool>,
     pub yolo: Option<bool>,
     pub trust_screens: Option<String>,
+    pub auto_adopt: Option<bool>,
     pub thread_profiles: Option<Vec<String>>,
     pub coordinator_profiles: Option<Vec<String>>,
 }
@@ -449,6 +455,7 @@ pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Sa
         routine_commands: own.routine_commands.or(default.routine_commands).unwrap_or(base.routine_commands),
         trust_screens: own.trust_screens.or(default.trust_screens).unwrap_or_else(|| default_trust_screens(yolo).into()),
         yolo,
+        auto_adopt: own.auto_adopt.or(default.auto_adopt).unwrap_or(base.auto_adopt),
         thread_profiles: own.thread_profiles.or(default.thread_profiles),
         coordinator_profiles: own.coordinator_profiles.or(default.coordinator_profiles),
     })
