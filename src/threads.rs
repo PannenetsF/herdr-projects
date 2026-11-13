@@ -125,7 +125,7 @@ pub fn placement(kind: Option<Kind>, has_repo: bool, remote: bool) -> Result<Kin
         // Unreachable from the CLI (`Kind::parse` no longer accepts it), kept
         // explicit so a legacy record can never drive a new placement.
         (Some(Kind::Checkout), _) => bail!("`--kind checkout` was removed; a repository task runs in a worktree"),
-        (Some(Kind::Tab), _) if remote => bail!("a tab runs in the project's own workspace, which is local; a remote repo needs a worktree thread"),
+        (Some(Kind::Tab), _) if remote => bail!("a tab runs on this machine, in the project's own threads Space; a remote repo needs a worktree thread"),
         (Some(kind), _) => Ok(kind),
     }
 }
@@ -170,7 +170,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     let listed = args.repo.as_ref().and_then(|repo| settings.repos.iter().find(|r| &r.path == repo));
     let machine = args.machine.clone().or_else(|| listed.and_then(|r| r.machine.clone())).unwrap_or_default();
     let repo = match (&args.repo, machine.is_empty()) {
-        (None, false) => bail!("a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"),
+        (None, false) => bail!("a remote thread needs --repo: a task with no repository runs as a tab in the project's own threads Space, which is local"),
         (None, true) => String::new(),
         // A remote path is stored as it is on its own machine.
         (Some(repo), false) => repo.clone(),
@@ -318,8 +318,10 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> 
     Ok(())
 }
 
-/// A tab in the project workspace: in `threads/<id>/` for a tab thread, in the
-/// repo's main checkout for a checkout thread.
+/// A tab outside the project's own workspace: in the project's threads Space
+/// for a tab thread (so the human's pane/tab cycling in the project workspace
+/// never crosses a thread), in the project workspace for a legacy checkout
+/// record.
 fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<Thread> {
     let coordinator = project.coordinator().context("the project has never been opened")?;
     let workspace = coordinator::project_workspace(&coordinator, &view.panes);
@@ -337,16 +339,29 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         folder
     };
     let folder = std::fs::canonicalize(&folder)?;
-    let created = match workspace {
-        Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
-        // The coordinator runs in a pane of another workspace: the thread
-        // opens the project's own.
-        None => {
-            let (settings, _) = project.read_project_md()?;
-            let created = view.herdr.workspace_create(&folder, &crate::project::home_label(&settings.name, &project.slug), false)?;
-            let _ = view.herdr.call(&["tab", "rename", &created.tab_id, &record.title], crate::herdr::CALL_TIMEOUT);
+    let created = match record.kind {
+        Kind::Tab => {
+            // The root tab of a Space made just now is closed once the
+            // thread's tab exists, so herdr closes the Space by itself when
+            // its last thread tab goes.
+            let (threads_workspace, root_tab) = threads_space(project, view)?;
+            let created = view.herdr.tab_create(&threads_workspace, &folder, &record.title, false)?;
+            if let Some(tab) = root_tab {
+                let _ = view.herdr.call(&["tab", "close", &tab], crate::herdr::CALL_TIMEOUT);
+            }
             created
         }
+        _ => match workspace {
+            Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
+            // The coordinator runs in a pane of another workspace: the thread
+            // opens the project's own.
+            None => {
+                let (settings, _) = project.read_project_md()?;
+                let created = view.herdr.workspace_create(&folder, &crate::project::home_label(&settings.name, &project.slug), false)?;
+                let _ = view.herdr.call(&["tab", "rename", &created.tab_id, &record.title], crate::herdr::CALL_TIMEOUT);
+                created
+            }
+        },
     };
     let cwd = view.herdr.pane_cwd(&created.pane_id).unwrap_or_default();
     let cwd = if cwd.is_empty() { folder.to_string_lossy().into_owned() } else { cwd };
@@ -356,6 +371,35 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         t.tab_id = created.tab_id;
         t.pane_id = created.pane_id;
     })
+}
+
+/// The Space repo-less thread tabs live in, made on first use and reused
+/// after. Ids repeat after a server restart, so a recorded id is trusted only
+/// while a listed pane of it works inside the project's `threads/` folder —
+/// the project's own workspace, whose id a restart may hand to this one, has
+/// its panes at the project home instead. A Space made here also returns its
+/// root tab, which `place_tab` closes once the thread's own tab exists: a
+/// Space holding one shell would otherwise never be closed by herdr when its
+/// last thread tab goes.
+fn threads_space(project: &Project, view: &SessionView) -> Result<(String, Option<String>)> {
+    let home = project.canonical_dir();
+    let threads = home.join("threads");
+    let in_threads = |pane: &Pane| {
+        [pane.cwd.as_str(), pane.foreground_cwd.as_str()]
+            .into_iter()
+            .any(|dir| !dir.is_empty() && Path::new(dir).starts_with(&threads))
+    };
+    let label = {
+        let (settings, _) = project.read_project_md()?;
+        format!("{} · threads", project::display_name(&settings.name, &project.slug))
+    };
+    let recorded = project.threads_workspace();
+    if !recorded.is_empty() && view.panes.iter().any(|p| p.workspace_id == recorded && in_threads(p)) {
+        return Ok((recorded, None));
+    }
+    let created = view.herdr.workspace_create(&home, &label, false)?;
+    project.set_threads_workspace(&created.workspace_id)?;
+    Ok((created.workspace_id, Some(created.tab_id)))
 }
 
 /// Creates the thread directory, keeps it out of git, writes `brief.md`.

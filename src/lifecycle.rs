@@ -60,6 +60,21 @@ fn close_workspaces(project: &Project, view: &SessionView) -> Vec<String> {
         crate::sidebar::clear_workspace(&view.herdr, &record.workspace_id);
         close(&record.workspace_id, "the project workspace");
     }
+    // The Space repo-less thread tabs live in. Only closed when one of its
+    // panes really works in this project's `threads/` folder: ids repeat
+    // after a server restart, and a stale one may name another Space.
+    let threads_workspace = project.threads_workspace();
+    let threads_dir = project.canonical_dir().join("threads");
+    let ours = |p: &crate::herdr::Pane| {
+        p.workspace_id == threads_workspace
+            && [p.cwd.as_str(), p.foreground_cwd.as_str()]
+                .into_iter()
+                .any(|dir| !dir.is_empty() && std::path::Path::new(dir).starts_with(&threads_dir))
+    };
+    if !threads_workspace.is_empty() && view.panes.iter().any(ours) {
+        close(&threads_workspace, "the threads workspace");
+        let _ = project.set_threads_workspace("");
+    }
     notes
 }
 

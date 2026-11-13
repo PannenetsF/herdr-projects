@@ -394,6 +394,18 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
             out.left.push(format!("the home Space {} keeps its old label ({error}); `open {to}` renames it", record.workspace_id));
         }
     }
+    // The threads Space, renamed to match (a closed one is simply forgotten).
+    let threads_workspace = project.threads_workspace();
+    if old_label != new_label && !threads_workspace.is_empty() {
+        let herdr = crate::herdr::Herdr::new(&ctx.env.herdr_bin(), &record.socket, ctx.runner);
+        let label = format!("{} · threads", new_label.trim_end_matches(crate::grouping::HOME_MARK));
+        if Path::new(&record.socket).exists()
+            && let Err(error) = herdr.workspace_rename(&threads_workspace, &label)
+            && error.code == "workspace_not_found"
+        {
+            let _ = project.set_threads_workspace("");
+        }
+    }
     Ok(out)
 }
 

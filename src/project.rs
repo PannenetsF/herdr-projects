@@ -209,6 +209,13 @@ struct ProjectState {
     /// branches (`hp/<slug>/...`) keep the name they were made with.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     former_slugs: Vec<String>,
+    /// The Space a repo-less thread's tab is opened in, so thread panes never
+    /// sit in the project's own workspace (whose pane/tab cycling is the
+    /// human's). Made on the first tab thread and reused after; empty until
+    /// then. Ids repeat after a server restart, so it is only trusted while
+    /// a listed pane of it works inside the project folder.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    threads_workspace: String,
 }
 
 /// The session and workspace the project belongs to, and the coordinator pane
@@ -408,6 +415,25 @@ impl Project {
     /// slug and for each former one.
     pub fn branch_prefixes(&self) -> Vec<String> {
         std::iter::once(self.slug.clone()).chain(self.former_slugs()).map(|s| format!("hp/{s}/")).collect()
+    }
+
+    /// The Space repo-less thread tabs are opened in (empty: not made yet).
+    pub fn threads_workspace(&self) -> String {
+        read_json::<ProjectState>(&self.state_dir().join("project.json"))
+            .unwrap_or_default()
+            .threads_workspace
+    }
+
+    /// Records the Space repo-less thread tabs belong in (empty to forget it,
+    /// e.g. when herdr no longer lists it).
+    pub fn set_threads_workspace(&self, workspace_id: &str) -> Result<()> {
+        let _lock = self.lock()?;
+        let path = self.state_dir().join("project.json");
+        let state = read_json::<ProjectState>(&path).unwrap_or_default();
+        if state.threads_workspace == workspace_id {
+            return Ok(());
+        }
+        write_json(&path, &ProjectState { threads_workspace: workspace_id.to_string(), ..state })
     }
 
     pub fn coordinator(&self) -> Option<Coordinator> {

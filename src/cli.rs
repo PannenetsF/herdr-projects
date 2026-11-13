@@ -330,7 +330,7 @@ enum CoordinatorCommand {
 
 #[derive(Subcommand)]
 enum ThreadCommand {
-    /// Start a thread: a worktree workspace for --repo, else a tab in the project workspace
+    /// Start a thread: a worktree workspace for --repo, else a tab in the project's threads Space
     Start {
         slug: String,
         #[arg(long)]
@@ -342,7 +342,7 @@ enum ThreadCommand {
         /// The agent's profile (harness, model, effort, flags), one the project allows (default: thread_profile in PROJECT.md); `context` lists them
         #[arg(long, alias = "agent", value_name = "NAME")]
         profile: Option<String>,
-        /// Placement, not the agent: worktree (the only placement with --repo) or tab (a task with no repository)
+        /// Placement, not the agent: worktree (the only placement with --repo) or tab (a task with no repository; runs in the project's threads Space)
         #[arg(long, value_name = "worktree|tab")]
         kind: Option<String>,
         #[arg(long, value_name = "REF")]
