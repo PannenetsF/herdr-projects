@@ -571,7 +571,7 @@ pub fn agents_md(name: &str, slug: &str, prefix: &str) -> String {
          This folder is the home of the Herdr project \"{name}\" (`{slug}`). Written by herdr-projects; `doctor --fix` refreshes it.\n\n\
          Coordinator identity is REGISTERED, not inferred from this folder: a coordinator of {name} carries the Herdr agent name `{coordinator_name}` (or `{next_name}` for later ones). `open` sets that name; `{prefix} coordinator adopt {slug} --pane <id>` registers an already-running pane (`herdr agent list` shows names and pane ids). A session merely started in this folder is not a coordinator.\n\n\
          If your working directory is exactly this folder AND you carry a registered coordinator name (`{coordinator_name}` or `{next_name}`), you are the coordinator of {name}: run `{prefix} skill` now and follow what it prints, and run `{prefix} context {slug}` now and whenever you need project state.\n\n\
-         If your working directory is exactly this folder but you have NO registered coordinator name, you are NOT the coordinator: do not run `{prefix} context`, do not mark inbox items handled, and do not act as one. Tell the user you are unregistered and give them `{prefix} coordinator adopt {slug} --pane <your pane id>` to run in this pane.\n\n\
+         If your working directory is exactly this folder but you have NO registered coordinator name, run `{prefix} context {slug}` once before anything else. With the user's `auto_adopt` safety setting on, that command registers this pane itself and you are the coordinator from then on. If it instead refuses with \"... NOT a registered coordinator ...\", you are NOT the coordinator: do not act as one and do not mark inbox items handled; give the user the `{prefix} coordinator adopt {slug} --pane <this pane id>` line it prints, then wait.\n\n\
          If your working directory is under `threads/`, you are a thread: your brief is in your own folder (`.herdr-project/{slug}-<id>/brief.md`); ignore the rest of this file.\n"
     )
 }
@@ -590,6 +590,11 @@ pub fn prefix_in_agents_md(text: &str) -> Option<String> {
 /// Marker that the AGENTS.md predates registered coordinator names; doctor
 /// uses it to roll the new prose out even when the prefix is unchanged.
 pub const REGISTERED_COORDINATOR_MARKER: &str = "Coordinator identity is REGISTERED";
+
+/// Marker that the AGENTS.md predates the `auto_adopt`-aware paragraph, which
+/// tells an unregistered pane to try `context` once instead of refusing up
+/// front. Doctor uses it to refresh projects whose text is otherwise current.
+pub const AUTO_ADOPT_MARKER: &str = "With the user's `auto_adopt` safety setting on";
 
 pub const PR_FOLLOWUP: &str = "routines/pr-followup.md";
 
@@ -654,6 +659,9 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
         Ok(text) => {
             if !text.contains(REGISTERED_COORDINATOR_MARKER) {
                 problems.push("AGENTS.md predates registered coordinator names".into());
+            }
+            if !text.contains(AUTO_ADOPT_MARKER) {
+                problems.push("AGENTS.md predates auto_adopt-aware registration".into());
             }
             match prefix_in_agents_md(&text) {
                 None => problems.push("AGENTS.md does not name the binary".into()),
@@ -844,6 +852,7 @@ mod tests {
         assert!(text.contains("you are the coordinator of Demo Project"));
         assert!(text.contains(&format!("`{prefix} skill`")));
         assert!(text.contains(&format!("`{prefix} context demo-project`")));
+        assert!(text.contains(AUTO_ADOPT_MARKER));
         assert!(text.contains("under `threads/`, you are a thread"));
         assert_eq!(prefix_in_agents_md(&text).as_deref(), Some(prefix.as_str()));
         assert_eq!(std::fs::read_link(project.dir().join("CLAUDE.md")).unwrap(), Path::new("AGENTS.md"));
@@ -857,6 +866,17 @@ mod tests {
         let problems = priming_problems(&project, &prefix);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("does not exist"));
+        write_priming(&project, &prefix).unwrap();
+        assert!(priming_problems(&project, &prefix).is_empty());
+
+        // AGENTS.md from before the auto_adopt-aware paragraph is reported even
+        // though the prefix and the registered-coordinator marker are current.
+        let old_prose = std::fs::read_to_string(project.dir().join("AGENTS.md"))
+            .unwrap()
+            .replace(AUTO_ADOPT_MARKER, "a sentence the old template never had");
+        std::fs::write(project.dir().join("AGENTS.md"), old_prose).unwrap();
+        let problems = priming_problems(&project, &prefix);
+        assert!(problems.iter().any(|p| p.contains("auto_adopt-aware")), "{problems:?}");
         write_priming(&project, &prefix).unwrap();
         assert!(priming_problems(&project, &prefix).is_empty());
 

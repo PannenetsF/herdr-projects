@@ -309,16 +309,21 @@ fn report(
                 // Agents merely sitting in the project folder are strangers:
                 // list them with the exact registration command, but never
                 // act on them (--fix does not rename anything here).
+                let auto_adopt = project.safety(config_dir).is_ok_and(|s| s.auto_adopt);
                 let strangers: Vec<String> = agents
                     .iter()
                     .filter(|a| a.works_in(&dir) && !crate::names::is_coordinator_name(slug, &a.name))
                     .map(|a| {
+                        let tail = if auto_adopt {
+                            "with auto_adopt on, its first owner-gated command (e.g. `context`) registers it itself".to_string()
+                        } else {
+                            format!("register with `{prefix} coordinator adopt {slug} --pane {}`", a.pane_id)
+                        };
                         format!(
-                            "pane {} ({}, {}) is in the project folder but NOT a registered coordinator; register with `{prefix} coordinator adopt {slug} --pane {}`",
+                            "pane {} ({}, {}) is in the project folder but NOT a registered coordinator; {tail}",
                             a.pane_id,
                             if a.name.is_empty() { "unnamed".to_string() } else { format!("name {}", a.name) },
                             a.agent_status,
-                            a.pane_id
                         )
                     })
                     .collect();
@@ -702,5 +707,27 @@ mod tests {
             assert!(text.contains("coordinator adopt demo --pane w1:p2"), "{text}");
             assert_eq!(runner.count("agent rename"), 0, "--fix must never register a stranger");
         }
+    }
+
+    #[test]
+    fn an_unregistered_root_pane_with_auto_adopt_on_is_told_the_first_command_registers_it() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.5\n");
+        let root = home.path().join("root");
+        let cfg = home.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("config.toml"), "[safety.default]\nauto_adopt = true\n").unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        runner.on("pane list", ok(&format!(r#"{{"result":{{"panes":[{{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"{dir}"}}]}}}}"#)));
+        runner.on(
+            "agent list",
+            ok(&format!(r#"{{"result":{{"agents":[{{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"codex","agent_status":"working","cwd":"{dir}"}}]}}}}"#)),
+        );
+        let (text, _) = report(&env, &root, &cfg, &SessionFlags::default(), &runner, false, None);
+        assert!(text.contains("pane w1:p2 (unnamed, working) is in the project folder but NOT a registered coordinator"), "{text}");
+        assert!(text.contains("with auto_adopt on, its first owner-gated command"), "{text}");
+        assert!(!text.contains("coordinator adopt demo --pane"), "{text}");
     }
 }
