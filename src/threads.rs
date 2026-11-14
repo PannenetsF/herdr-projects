@@ -189,14 +189,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         eprintln!("warning: {repo} on {machine} is not listed in `repos` in PROJECT.md");
     }
 
-    let open_count = thread::list(&project).iter().filter(|t| t.status == Status::Open || t.status == Status::Starting).count();
-    if open_count as u32 >= settings.max_parallel_threads {
-        eprintln!(
-            "warning: {open_count} threads are already open; max_parallel_threads is {}",
-            settings.max_parallel_threads
-        );
-    }
-
     let profile = thread_profile(ctx, &project, &machine, args.profile.as_deref())?;
     let kind = placement(args.kind, !repo.is_empty(), !machine.is_empty())?;
     let record = thread::allocate(&project, |t| {

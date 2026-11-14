@@ -2776,7 +2776,6 @@ fn a_tab_thread_gets_a_brief_with_the_project_header_and_prompts_are_recorded() 
     let brief = std::fs::read_to_string(Path::new(&t.thread_dir).join("brief.md")).unwrap();
     assert!(brief.contains("Look into it.\n\n## Notes from the task list\n\nStart with the 2025 papers."), "{brief}");
     assert!(brief.starts_with("# Project\n\n- Project: Demo (`demo`)\n- Goal: Ship it\n- Repos: (none)\n- Uploads"), "{brief}");
-    assert!(!brief.contains("max_parallel_threads"));
 
     // A follow-up lands in the task file once it was accepted.
     thread::update(&project, &t.id, |t| t.prompt_pending = false).unwrap();

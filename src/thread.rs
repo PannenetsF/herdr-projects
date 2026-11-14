@@ -1407,7 +1407,7 @@ mod tests {
         assert!(brief.contains("Not inlined because project memory is over 32000 characters: memory/b.md."));
         assert!(!brief.contains(&"x".repeat(100)));
         // No operational settings reach a thread.
-        for word in ["max_parallel_threads", "auto_resolve_days", "nudge", "coordinator_agent", "thread_agent"] {
+        for word in ["auto_resolve_days", "nudge", "coordinator_agent", "thread_agent"] {
             assert!(!brief.contains(word), "{word}");
         }
 

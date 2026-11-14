@@ -446,7 +446,6 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
                         ("thread_profile", s.thread_profile.clone()),
                         ("coordinator_profiles", allowed_text(ctx, Some(&project), Role::Coordinator)),
                         ("thread_profiles", allowed_text(ctx, Some(&project), Role::Thread)),
-                        ("max_parallel_threads", s.max_parallel_threads.to_string()),
                         ("auto_resolve_days", s.auto_resolve_days.to_string()),
                         ("nudge", s.nudge.to_string()),
                         ("mute", s.mute.to_string()),
@@ -1694,7 +1693,7 @@ mod tests {
         let all = build(&world.ctx(), Section::Threads, None);
         assert!(all[0].text.starts_with("demo · 1 need you · 1 working"), "{:?}", all[0].text);
         let settings = build(&world.ctx(), Section::Settings, Some("demo"));
-        assert!(settings.iter().any(|r| r.text.contains("max_parallel_threads")));
+        assert!(settings.iter().any(|r| r.text.contains("auto_resolve_days")));
         assert!(!build(&world.ctx(), Section::Tasks, Some("demo")).is_empty());
         std::fs::write(project.dir().join("TASKS.md"), "# Tasks\n\n## Backlog\n- [ ] Fix login (claude) · t-0003\n  Safari drops the cookie.\n  See issue 42.\n- [ ] Docs (me)\n").unwrap();
         let tasks = build(&world.ctx(), Section::Tasks, Some("demo"));

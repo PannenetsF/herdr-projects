@@ -974,8 +974,8 @@ pub(crate) fn digest_for(ctx: &Ctx, project: &Project, prefix: &str, reader: Opt
             let _ = writeln!(out, "Goal: {}", if settings.goal.is_empty() { "(none set)" } else { &settings.goal });
             let _ = writeln!(
                 out,
-                "Settings: coordinator_profile={} thread_profile={} max_parallel_threads={} auto_resolve_days={} nudge={} mute={}",
-                settings.coordinator_profile, settings.thread_profile, settings.max_parallel_threads, settings.auto_resolve_days, settings.nudge, settings.mute
+                "Settings: coordinator_profile={} thread_profile={} auto_resolve_days={} nudge={} mute={}",
+                settings.coordinator_profile, settings.thread_profile, settings.auto_resolve_days, settings.nudge, settings.mute
             );
             out.push_str(&crate::profiles::context_text(ctx, project, &settings));
             out.push_str(&crate::assign::context_line(ctx, project));

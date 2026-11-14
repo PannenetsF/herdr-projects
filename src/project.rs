@@ -139,7 +139,6 @@ pub struct Settings {
     /// The profile a thread starts with when none is chosen.
     #[serde(alias = "thread_agent")]
     pub thread_profile: String,
-    pub max_parallel_threads: u32,
     pub auto_resolve_days: u32,
     pub nudge: bool,
     /// Silences every notification for the project except errors.
@@ -154,7 +153,6 @@ impl Default for Settings {
             goal: String::new(),
             coordinator_profile: "claude".into(),
             thread_profile: "claude".into(),
-            max_parallel_threads: 10,
             auto_resolve_days: 7,
             // On by default (W15): the ticker prompts only a coordinator that
             // has been idle for a minute and whose input box is empty, because on herdr 0.9.1 a prompt
@@ -851,7 +849,6 @@ mod tests {
         assert_eq!(settings.name, "Demo");
         assert_eq!(settings.goal, "Ship \"it\"");
         assert_eq!(settings.coordinator_profile, "claude");
-        assert_eq!(settings.max_parallel_threads, 10);
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
         assert!(project.dir().join(PR_FOLLOWUP).is_file());
