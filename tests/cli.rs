@@ -1,5 +1,6 @@
 //! End-to-end checks of the built binary with a scrubbed environment.
 
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -63,6 +64,21 @@ fn shell_escape(s: &str) -> String {
     }
 }
 
+fn hold_current_ticker(home: &Path, root: &Path) -> std::fs::File {
+    let output = hp(home, &["--version"]);
+    assert!(output.status.success());
+    let version = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .strip_prefix("herdr-projects ")
+        .unwrap()
+        .to_owned();
+    let mut file = std::fs::File::create(root.join(".ticker.lock")).unwrap();
+    file.write_all(serde_json::to_string(&serde_json::json!({ "version": version })).unwrap().as_bytes()).unwrap();
+    file.lock().unwrap();
+    file
+}
+
 #[test]
 fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
     let home = tempfile::tempdir().unwrap();
@@ -124,6 +140,9 @@ fn schedule_add_list_show_and_cancel_persist_without_calling_herdr() {
     let root = home.path().join("root");
     let root_arg = root.to_str().unwrap();
     assert!(hp(home.path(), &["--root", root_arg, "new", "demo"]).status.success());
+    // A same-version held lock makes the automatic ticker start a no-op, so
+    // this CLI test never leaves a detached process behind.
+    let _ticker = hold_current_ticker(home.path(), &root);
     std::fs::write(
         root.join("demo/threads/t-0001.toml"),
         "id = \"t-0001\"\nstatus = \"open\"\nowner = \"hpc-demo\"\n",

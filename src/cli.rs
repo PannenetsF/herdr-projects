@@ -1,7 +1,7 @@
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::coordinator::{self, OpenOptions};
@@ -839,6 +839,14 @@ pub fn run() -> Result<()> {
                     _ => bail!("exactly one of --at or --in is required"),
                 };
                 let record = crate::schedule::add(&ctx, &slug, &id, &prompt, when, now)?;
+                if let Err(error) = ticker::start(&ctx) {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "{} was saved for {} at {}, but the ticker could not be started; it remains pending and will run after `ticker start`",
+                            record.id, record.thread_id, record.due_at
+                        )
+                    });
+                }
                 println!("scheduled {} to prompt {} at {} ({})", record.id, record.thread_id, record.due_at, record.time_zone);
                 Ok(())
             }

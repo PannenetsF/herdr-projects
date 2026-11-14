@@ -305,6 +305,17 @@ pub fn run(ctx: &Ctx) -> Result<()> {
 /// project's session was reachable. A failure in one project never stops the
 /// others.
 pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
+    let lease = match crate::schedule::ClaimLease::new(&ctx.root) {
+        Ok(lease) => lease,
+        Err(error) => {
+            log.line(&format!("schedule claim lease: {error:#}"));
+            return false;
+        }
+    };
+    tick_with_lease(ctx, log, memory, lease.owner())
+}
+
+fn tick_with_lease(ctx: &Ctx, log: &Log, memory: &mut Memory, claim_owner: &str) -> bool {
     memory.tick += 1;
     // Renames first: a project that moves is ticked under its new slug.
     for line in crate::rename::pending_pass(ctx) {
@@ -341,7 +352,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         }
     }
     for (project, seen) in &reachable {
-        for error in tick_slow(ctx, project, seen, memory) {
+        for error in tick_slow(ctx, project, seen, memory, claim_owner) {
             log.line(&format!("{}: {error:#}", project.slug));
         }
     }
@@ -559,8 +570,9 @@ pub fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
 
 #[cfg(test)]
 pub fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
+    let lease = crate::schedule::ClaimLease::new(&ctx.root)?;
     match tick_cheap(ctx, project, &mut Sessions::new(ctx))? {
-        Some(seen) => match tick_slow(ctx, project, &seen, memory).into_iter().next() {
+        Some(seen) => match tick_slow(ctx, project, &seen, memory, lease.owner()).into_iter().next() {
             Some(error) => Err(error),
             None => Ok(true),
         },
@@ -954,7 +966,7 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
 
 /// Copies and launches, remote machines, then inbox items, pull requests,
 /// routines, auto-resolve and housekeeping.
-fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
+fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory, claim_owner: &str) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
     let mut copy_notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
@@ -1013,8 +1025,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     errors.extend(steps::resolve_merged(ctx, project, &mut state, now));
     errors.extend(routine_pass(ctx, project, &mut state, seen.coordinator));
-    let claim_owner = format!("{}:{}", std::process::id(), memory.started);
-    errors.extend(crate::schedule::fire_due_at(ctx, project, &claim_owner, now));
+    errors.extend(crate::schedule::fire_due_at(ctx, project, claim_owner, now));
     if let Ok((settings, _)) = project.read_project_md() {
         errors.extend(steps::auto_resolve(ctx, project, &settings, memory, now));
     }

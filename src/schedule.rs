@@ -444,7 +444,17 @@ fn cancel_at(project: &Project, id: &str, now: Timestamp) -> Result<Schedule> {
     Ok(record)
 }
 
+#[cfg(test)]
 fn claim_next(project: &Project, claim_owner: &str, now: Timestamp) -> Result<Option<Schedule>> {
+    claim_next_at(project, claim_owner, now, || now)
+}
+
+fn claim_next_at(
+    project: &Project,
+    claim_owner: &str,
+    now: Timestamp,
+    claimed_now: impl FnOnce() -> Timestamp,
+) -> Result<Option<Schedule>> {
     let _lock = project.lock()?;
     let mut store = load_store(project)?;
     for record in store.schedules.values_mut() {
@@ -457,7 +467,7 @@ fn claim_next(project: &Project, claim_owner: &str, now: Timestamp) -> Result<Op
                 record.id
             );
         }
-        let claimed_at = stamp(now);
+        let claimed_at = stamp(claimed_now());
         let attempt = Attempt {
             id: format!("{}-a1", record.id),
             claim_owner: claim_owner.to_owned(),
@@ -524,15 +534,26 @@ fn failure_item(project: &Project, record: &Schedule) -> Result<()> {
 
 /// Runs each due record once. The claim is durable before any target lookup or
 /// prompt side effect, and there is deliberately no automatic retry.
+#[cfg(test)]
 fn fire_due_with(
     project: &Project,
     claim_owner: &str,
     now: Timestamp,
+    deliver: impl FnMut(&Schedule) -> Result<()>,
+) -> Vec<anyhow::Error> {
+    fire_due_with_clock(project, claim_owner, now, || now, deliver)
+}
+
+fn fire_due_with_clock(
+    project: &Project,
+    claim_owner: &str,
+    now: Timestamp,
+    mut clock: impl FnMut() -> Timestamp,
     mut deliver: impl FnMut(&Schedule) -> Result<()>,
 ) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
     loop {
-        let record = match claim_next(project, claim_owner, now) {
+        let record = match claim_next_at(project, claim_owner, now, &mut clock) {
             Ok(Some(record)) => record,
             Ok(None) => break,
             Err(error) => {
@@ -547,7 +568,8 @@ fn fire_due_with(
             .unwrap_or_default();
         let outcome = deliver(&record);
         let failed = outcome.is_err();
-        match finish_attempt(project, &record.id, &attempt_id, now, outcome) {
+        let finished_now = clock();
+        match finish_attempt(project, &record.id, &attempt_id, finished_now, outcome) {
             Ok(finished) if failed => {
                 if let Err(error) = failure_item(project, &finished) {
                     errors.push(error);
@@ -574,7 +596,7 @@ pub(crate) fn fire_due_at(
     claim_owner: &str,
     now: Timestamp,
 ) -> Vec<anyhow::Error> {
-    fire_due_with(project, claim_owner, now, |record| {
+    fire_due_with_clock(project, claim_owner, now, Timestamp::now, |record| {
         crate::threads::scheduled_prompt(
             ctx,
             &project.slug,
@@ -586,6 +608,54 @@ pub(crate) fn fire_due_at(
     })
 }
 
+fn claim_lease_path(root: &std::path::Path) -> std::path::PathBuf {
+    root.join(".schedule-claim.lock")
+}
+
+/// Held for one whole tick. The OS releases this lease on every exit path,
+/// including a crash, and PID reuse cannot forge its unique owner token.
+pub(crate) struct ClaimLease {
+    owner: String,
+    _file: std::fs::File,
+}
+
+impl ClaimLease {
+    pub(crate) fn new(root: &std::path::Path) -> Result<Self> {
+        let path = claim_lease_path(root);
+        let mut file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .context("could not open the schedule claim lease")?;
+        file.lock()?;
+        let owner = format!("{}:{}", std::process::id(), Timestamp::now());
+        file.set_len(0)?;
+        std::io::Write::write_all(&mut file, owner.as_bytes())?;
+        std::io::Write::flush(&mut file)?;
+        Ok(Self { owner, _file: file })
+    }
+
+    pub(crate) fn owner(&self) -> &str {
+        &self.owner
+    }
+}
+
+/// A live claimant holds the lease and has written exactly this owner token.
+/// A free lease proves interruption; a locked lease with another token belongs
+/// to a newer claimant (including one that happens to reuse the same pid).
+fn claim_owner_is_alive(root: &std::path::Path, owner: &str) -> bool {
+    let path = claim_lease_path(root);
+    let Ok(file) = std::fs::File::options().read(true).write(true).open(&path) else {
+        return false;
+    };
+    if file.try_lock().is_ok() {
+        return false;
+    }
+    std::fs::read_to_string(path).is_ok_and(|current| current == owner)
+}
+
 /// A running claim has no safe automatic retry: the previous process may have
 /// typed the prompt before crashing. Mark it unknown/failed once at startup.
 pub(crate) fn recover_interrupted_at(project: &Project, now: Timestamp) -> Vec<anyhow::Error> {
@@ -593,11 +663,12 @@ pub(crate) fn recover_interrupted_at(project: &Project, now: Timestamp) -> Vec<a
         let _lock = project.lock()?;
         let mut store = load_store(project)?;
         let mut recovered = Vec::new();
-        for record in store
-            .schedules
-            .values_mut()
-            .filter(|record| record.status == ScheduleStatus::Running)
-        {
+        for record in store.schedules.values_mut().filter(|record| {
+            record.status == ScheduleStatus::Running
+                && !record.attempts.last().is_some_and(|attempt| {
+                    claim_owner_is_alive(&project.root, &attempt.claim_owner)
+                })
+        }) {
             let error =
                 "interrupted after claim; prompt delivery is unknown; not retried".to_owned();
             record.status = ScheduleStatus::Failed;
@@ -799,6 +870,44 @@ mod tests {
     }
 
     #[test]
+    fn claim_and_finish_use_delivery_times_not_tick_start() {
+        let (_root, project) = fixture();
+        let tick_start = now();
+        let claimed_at = tick_start
+            .checked_add(SignedDuration::from_secs(30))
+            .unwrap();
+        let finished_at = tick_start
+            .checked_add(SignedDuration::from_secs(45))
+            .unwrap();
+        put(&project, record("s-0001", tick_start));
+        let mut times = [claimed_at, finished_at].into_iter();
+        let errors = fire_due_with_clock(
+            &project,
+            "ticker-a",
+            tick_start,
+            || times.next().unwrap(),
+            |_| Ok(()),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(times.next().is_none());
+        let finished = get(&project, "s-0001").unwrap();
+        let attempt = &finished.attempts[0];
+        assert_eq!(attempt.claimed_at, claimed_at.to_string());
+        assert_eq!(
+            attempt.actual_fire.as_deref(),
+            Some(claimed_at.to_string().as_str())
+        );
+        assert_eq!(
+            attempt.finished_at.as_deref(),
+            Some(finished_at.to_string().as_str())
+        );
+        assert_eq!(
+            finished.completed_at.as_deref(),
+            Some(finished_at.to_string().as_str())
+        );
+    }
+
+    #[test]
     fn late_fire_preserves_original_due_and_actual_fire() {
         let (_root, project) = fixture();
         let now = now();
@@ -914,6 +1023,45 @@ mod tests {
         });
         assert!(errors.is_empty());
         assert_eq!(deliveries, 0);
+    }
+
+    #[test]
+    fn recovery_leaves_a_live_claim_untouched() {
+        let (_root, project) = fixture();
+        let now = now();
+        put(&project, record("s-0001", now));
+        let lease = ClaimLease::new(&project.root).unwrap();
+        let owner = lease.owner().to_owned();
+        assert!(claim_owner_is_alive(&project.root, &owner));
+        claim_next(&project, &owner, now).unwrap().unwrap();
+        let errors = recover_interrupted_at(&project, now);
+        assert!(errors.is_empty(), "{errors:?}");
+        let running = get(&project, "s-0001").unwrap();
+        assert_eq!(running.status, ScheduleStatus::Running);
+        assert!(running.error.is_none());
+        assert!(crate::inbox::unhandled(&project).is_empty());
+        let mut deliveries = 0;
+        let errors = fire_due_with(&project, "ticker-b", now, |_| {
+            deliveries += 1;
+            Ok(())
+        });
+        assert!(errors.is_empty());
+        assert_eq!(deliveries, 0);
+    }
+
+    #[test]
+    fn recovery_rejects_a_reused_pid_with_a_different_lease_token() {
+        let (_root, project) = fixture();
+        let now = now();
+        put(&project, record("s-0001", now));
+        let _lease = ClaimLease::new(&project.root).unwrap();
+        let reused = format!("{}:2000-01-01T00:00:00Z", std::process::id());
+        claim_next(&project, &reused, now).unwrap().unwrap();
+        let errors = recover_interrupted_at(&project, now);
+        assert!(errors.is_empty(), "{errors:?}");
+        let recovered = get(&project, "s-0001").unwrap();
+        assert_eq!(recovered.status, ScheduleStatus::Failed);
+        assert!(recovered.error.unwrap().contains("delivery is unknown"));
     }
 
     #[test]
