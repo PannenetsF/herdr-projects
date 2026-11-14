@@ -1,7 +1,7 @@
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::coordinator::{self, OpenOptions};
@@ -130,10 +130,15 @@ enum Command {
         #[command(subcommand)]
         command: ThreadCommand,
     },
-    /// Routines: scheduled prompts and watched commands
+    /// Routines: recurring prompts and watched commands
     Routine {
         #[command(subcommand)]
         command: RoutineCommand,
+    },
+    /// One-shot delayed prompts for existing owned threads
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
     },
     /// Pause a project: the ticker skips it and `thread start` is refused
     Pause { slug: String },
@@ -468,6 +473,39 @@ fn read_text(file: &str) -> Result<String> {
 }
 
 #[derive(Subcommand)]
+enum ScheduleCommand {
+    /// Schedule one prompt for an existing owned thread; never starts a thread
+    Add {
+        slug: String,
+        id: String,
+        /// Absolute time with Z, an explicit offset, and/or [IANA/Zone]
+        #[arg(long, value_name = "TIME", required_unless_present = "in", conflicts_with = "in")]
+        at: Option<String>,
+        /// Positive elapsed duration, such as 20m, 2h 30m, or 1d (24 hours)
+        #[arg(long = "in", value_name = "DURATION", required_unless_present = "at", conflicts_with = "at")]
+        r#in: Option<String>,
+        /// The complete prompt, captured now; `-` reads standard input
+        #[arg(long, value_name = "FILE")]
+        prompt_file: String,
+    },
+    /// List one-shot schedules; overdue pending records are marked delayed
+    List {
+        slug: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a schedule, its attempt/claim data, and its complete prompt
+    Show {
+        slug: String,
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a pending schedule; running or attempted schedules are refused
+    Cancel { slug: String, id: String },
+}
+
+#[derive(Subcommand)]
 enum RoutineCommand {
     /// Enable or disable a routine
     Toggle {
@@ -791,6 +829,35 @@ pub fn run() -> Result<()> {
             let workspace = ctx.env.var("HERDR_WORKSPACE_ID").unwrap_or("").to_string();
             crate::popup::run(&ctx, scope, workspace)
         }
+        Command::Schedule { command } => match command {
+            ScheduleCommand::Add { slug, id, at, r#in, prompt_file } => {
+                let prompt = read_text(&prompt_file)?;
+                let now = jiff::Timestamp::now();
+                let when = match (at, r#in) {
+                    (Some(at), None) => crate::schedule::parse_at(&at, now)?,
+                    (None, Some(duration)) => crate::schedule::parse_in(&duration, now)?,
+                    _ => bail!("exactly one of --at or --in is required"),
+                };
+                let record = crate::schedule::add(&ctx, &slug, &id, &prompt, when, now)?;
+                if let Err(error) = ticker::start(&ctx) {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "{} was saved for {} at {}, but the ticker could not be started; it remains pending and will run after `ticker start`",
+                            record.id, record.thread_id, record.due_at
+                        )
+                    });
+                }
+                println!("scheduled {} to prompt {} at {} ({})", record.id, record.thread_id, record.due_at, record.time_zone);
+                Ok(())
+            }
+            ScheduleCommand::List { slug, json } => crate::schedule::print_list(&ctx, &slug, json, jiff::Timestamp::now()),
+            ScheduleCommand::Show { slug, id, json } => crate::schedule::print_show(&ctx, &slug, &id, json),
+            ScheduleCommand::Cancel { slug, id } => {
+                let record = crate::schedule::cancel(&ctx, &slug, &id, jiff::Timestamp::now())?;
+                println!("{} is cancelled", record.id);
+                Ok(())
+            }
+        },
         Command::Routine { command } => match command {
             RoutineCommand::Toggle { slug, name, on, off } => crate::settings::routine_toggle(&ctx, &slug, &name, if on { Some(true) } else if off { Some(false) } else { None }),
             RoutineCommand::Approve { slug, name } => {

@@ -1,5 +1,6 @@
 //! End-to-end checks of the built binary with a scrubbed environment.
 
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -63,6 +64,21 @@ fn shell_escape(s: &str) -> String {
     }
 }
 
+fn hold_current_ticker(home: &Path, root: &Path) -> std::fs::File {
+    let output = hp(home, &["--version"]);
+    assert!(output.status.success());
+    let version = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .strip_prefix("herdr-projects ")
+        .unwrap()
+        .to_owned();
+    let mut file = std::fs::File::create(root.join(".ticker.lock")).unwrap();
+    file.write_all(serde_json::to_string(&serde_json::json!({ "version": version })).unwrap().as_bytes()).unwrap();
+    file.lock().unwrap();
+    file
+}
+
 #[test]
 fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
     let home = tempfile::tempdir().unwrap();
@@ -116,6 +132,79 @@ fn path_like_names_and_slugs_are_refused() {
     assert!(!hp(home.path(), &["--root", root_arg, "delete", "../x", "--force"]).status.success());
     assert!(!root.exists());
     assert!(!home.path().join("x").exists());
+}
+
+#[test]
+fn schedule_add_list_show_and_cancel_persist_without_calling_herdr() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", root_arg, "new", "demo"]).status.success());
+    // A same-version held lock makes the automatic ticker start a no-op, so
+    // this CLI test never leaves a detached process behind.
+    let _ticker = hold_current_ticker(home.path(), &root);
+    std::fs::write(
+        root.join("demo/threads/t-0001.toml"),
+        "id = \"t-0001\"\nstatus = \"open\"\nowner = \"hpc-demo\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("demo/threads/t-0002.toml"),
+        "id = \"t-0002\"\nstatus = \"open\"\nowner = \"\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("demo/threads/t-0003.toml"),
+        "id = \"t-0003\"\nstatus = \"resolved\"\nowner = \"hpc-demo\"\n",
+    )
+    .unwrap();
+    let prompt = home.path().join("prompt.md");
+    std::fs::write(&prompt, "Check PR #12.\nKeep `echo hello` as text.\n").unwrap();
+    let prompt_arg = prompt.to_str().unwrap();
+
+    assert_eq!(String::from_utf8_lossy(&hp(home.path(), &["--root", root_arg, "schedule", "list", "demo"]).stdout), "no one-shot schedules\n");
+    for args in [
+        vec!["schedule", "add", "demo", "t-0001", "--prompt-file", prompt_arg],
+        vec!["schedule", "add", "demo", "t-0001", "--in", "20m", "--at", "2099-01-01T00:00:00Z", "--prompt-file", prompt_arg],
+        vec!["schedule", "add", "demo", "t-0001", "--at", "2099-01-01T09:00", "--prompt-file", prompt_arg],
+        vec!["schedule", "add", "demo", "t-0001", "--at", "2000-01-01T00:00:00Z", "--prompt-file", prompt_arg],
+        vec!["schedule", "add", "demo", "t-0001", "--in", "0m", "--prompt-file", prompt_arg],
+        vec!["schedule", "add", "demo", "t-0002", "--in", "20m", "--prompt-file", prompt_arg],
+        vec!["schedule", "add", "demo", "t-0003", "--in", "20m", "--prompt-file", prompt_arg],
+        vec!["schedule", "add", "demo", "t-9999", "--in", "20m", "--prompt-file", prompt_arg],
+    ] {
+        let mut full = vec!["--root", root_arg];
+        full.extend(args.iter().copied());
+        let out = hp(home.path(), &full);
+        assert!(!out.status.success(), "accepted {args:?}: {}", String::from_utf8_lossy(&out.stdout));
+    }
+
+    let added = hp(home.path(), &["--root", root_arg, "schedule", "add", "demo", "t-0001", "--in", "20m", "--prompt-file", prompt_arg]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    assert!(String::from_utf8_lossy(&added.stdout).starts_with("scheduled s-0001 to prompt t-0001 at "));
+    let added = hp(home.path(), &["--root", root_arg, "schedule", "add", "demo", "t-0001", "--at", "2099-01-01T09:00[Asia/Shanghai]", "--prompt-file", prompt_arg]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    assert!(String::from_utf8_lossy(&added.stdout).contains("s-0002"));
+
+    let shown = hp(home.path(), &["--root", root_arg, "schedule", "show", "demo", "s-0001", "--json"]);
+    assert!(shown.status.success(), "{}", String::from_utf8_lossy(&shown.stderr));
+    let record: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(record["prompt"], "Check PR #12.\nKeep `echo hello` as text.\n");
+    assert_eq!(record["owner"], "hpc-demo");
+    assert_eq!(record["time_input"], "20m");
+    assert_eq!(record["status"], "pending");
+
+    let listed = hp(home.path(), &["--root", root_arg, "schedule", "list", "demo", "--json"]);
+    let records: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(records.as_array().unwrap().len(), 2);
+    for id in ["s-0001", "s-0002"] {
+        let out = hp(home.path(), &["--root", root_arg, "schedule", "cancel", "demo", id]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let shown = hp(home.path(), &["--root", root_arg, "schedule", "show", "demo", "s-0001", "--json"]);
+    let record: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(record["status"], "cancelled");
+    assert!(record["cancelled_at"].is_string());
 }
 
 #[test]

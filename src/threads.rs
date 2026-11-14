@@ -690,6 +690,12 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
 /// predicate: agents queue a message that arrives while they work.
 pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
+    let (project, record) = validate_prompt_target(ctx, slug, id, text)?;
+    require_owner(ctx, &project, &record, "post a prompt")?;
+    deliver_prompt(ctx, &project, &record, text, None)
+}
+
+pub(crate) fn validate_prompt_target(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<(Project, Thread)> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if text.trim().is_empty() {
@@ -701,15 +707,69 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     if record.prompt_pending {
         bail!("{id} has not received its brief yet; the ticker sends it once the agent is ready, and `thread brief` sends it now");
     }
-    require_owner(ctx, &project, &record, "post a prompt")?;
-    let view = require_session(ctx, &project)?;
-    let (agents, _) = lists_for(&view, &record)?;
-    let state = prompt_state(&record, &agents)?;
+    Ok((project, record))
+}
+
+/// Serializes scheduled delivery with reassignment without holding the project
+/// lock across Herdr. The side effect and the owner change have a definite
+/// order: either reassignment wins and delivery revalidation refuses, or the
+/// authorized prompt finishes before the new owner takes over.
+fn prompt_delivery_lock(project: &Project, id: &str) -> Result<std::fs::File> {
+    thread::validate_id(id)?;
+    let path = project.state_dir().join(format!("{id}.prompt-delivery.lock"));
+    let file = std::fs::File::options().create(true).truncate(false).write(true).open(&path)?;
+    file.lock()?;
+    if !project.project_md().is_file() {
+        bail!("project `{}` is gone", project.slug);
+    }
+    Ok(file)
+}
+
+fn lock_scheduled_delivery(project: &Project, stale: &Thread, owner: &str) -> Result<std::fs::File> {
+    let lock = prompt_delivery_lock(project, &stale.id)?;
+    let current = thread::load(project, &stale.id)?;
+    if current.status == Status::Resolved {
+        bail!("{} is resolved", stale.id);
+    }
+    if current.prompt_pending {
+        bail!("{} has not received its brief yet", stale.id);
+    }
+    if current.owner.is_empty() {
+        bail!("scheduled prompt: {} is unassigned; its original owner no longer owns it", stale.id);
+    }
+    if current.owner != owner {
+        bail!("scheduled prompt: {} is owned by coordinator `{}`, not the scheduling coordinator `{owner}`", stale.id, current.owner);
+    }
+    if current.pane_id != stale.pane_id || current.machine != stale.machine {
+        bail!("scheduled prompt: {} changed pane while delivery was being prepared; not sending to a stale pane", stale.id);
+    }
+    Ok(lock)
+}
+
+/// A delayed prompt carries the owner who authorized it. Never infer the
+/// ticker process as a human caller: that would bypass the ownership check.
+pub fn scheduled_prompt(ctx: &Ctx, slug: &str, id: &str, owner: &str, text: &str) -> Result<String> {
+    let (project, record) = validate_prompt_target(ctx, slug, id, text)?;
+    if record.owner.is_empty() {
+        bail!("scheduled prompt: {id} is unassigned; its original owner no longer owns it");
+    }
+    if record.owner != owner {
+        bail!("scheduled prompt: {id} is owned by coordinator `{}`, not the scheduling coordinator `{owner}`", record.owner);
+    }
+    deliver_prompt(ctx, &project, &record, text, Some(owner))
+}
+
+fn deliver_prompt(ctx: &Ctx, project: &Project, record: &Thread, text: &str, scheduled_owner: Option<&str>) -> Result<String> {
+    let id = &record.id;
+    let slug = &project.slug;
+    let view = require_session(ctx, project)?;
+    let (agents, _) = lists_for(&view, record)?;
+    let state = prompt_state(record, &agents)?;
     let herdr = view.herdr.on_machine(&record.machine);
     // Someone typing in the thread's pane would have the prompt merged into
     // their text and submitted. A box this binary cannot read (another kind, a
     // layout it does not know) is sent to as before.
-    let kind = agents.iter().find(|a| thread::agent_matches(&record, a)).map(|a| a.agent.as_str()).unwrap_or(&record.agent);
+    let kind = agents.iter().find(|a| thread::agent_matches(record, a)).map(|a| a.agent.as_str()).unwrap_or(&record.agent);
     let screen = herdr.agent_screen(&record.pane_id).map_err(|error| anyhow::anyhow!("{error}"))?;
     // Herdr may read a trust screen as idle; Enter there would accept it.
     if let Some(phrase) = crate::trust_screen::detect(kind, &screen) {
@@ -719,6 +779,11 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     if crate::prompt_box::check(kind, &screen) == crate::prompt_box::Draft::Typed {
         bail!("draft_in_box: {id}'s input box holds text someone typed ({}); not sending, so it is not merged into their prompt. Try again once it is empty; `thread read` shows it", record.pane_id);
     }
+    // Reassignment uses this same per-thread lock. Re-read after acquiring it
+    // so the earlier Herdr calls cannot leave a stale owner authorizing text.
+    let _delivery = scheduled_owner
+        .map(|owner| lock_scheduled_delivery(project, record, owner))
+        .transpose()?;
     // Confirmed only once herdr sees the agent start on it. A try that was
     // typed but not confirmed is never typed again: it may sit in the box.
     let sent = herdr.agent_prompt_confirmed(&record.pane_id, text.trim());
@@ -729,7 +794,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     }
     // Written after the send, so the task file never claims a prompt that was
     // refused; a restarted thread re-reads it with its task.
-    thread::append_follow_up(&project, id, text)?;
+    thread::append_follow_up(project, id, text)?;
     if let Err(error) = sent {
         bail!(
             "prompt_unconfirmed: the text was typed into {id}'s pane ({}) but the agent was not seen starting on it ({error}). Do not send it again: `thread read` shows whether it sits in the input box, and `thread keys {slug} {id} enter` submits it",
@@ -743,16 +808,41 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
 /// terminal (no live pane) is always allowed; an owner-less thread is refused
 /// to every coordinator until `thread assign` names an owner.
 pub fn require_owner(ctx: &Ctx, project: &Project, record: &Thread, action: &str) -> Result<()> {
-    match coordinator::caller(ctx, project) {
-        coordinator::Caller::Human => Ok(()),
+    authorize_owner(coordinator::caller(ctx, project), project, record, action).map(|_| ())
+}
+
+/// Scheduling always needs a durable owner, including when a person registers
+/// the request from a terminal. The human exception must not create an
+/// owner-less delayed prompt that the ticker could deliver without a guard.
+pub(crate) fn scheduling_owner(ctx: &Ctx, project: &Project, record: &Thread) -> Result<String> {
+    let caller = coordinator::caller(ctx, project);
+    match authorize_owner(caller, project, record, "schedule a prompt")? {
+        Some(owner) => Ok(owner),
+        None if record.owner.is_empty() => bail!("schedule a prompt: {} is unassigned; claim it first with `thread assign`", record.id),
+        None => Ok(record.owner.clone()),
+    }
+}
+
+pub(crate) fn require_schedule_owner(ctx: &Ctx, project: &Project, schedule_id: &str, owner: &str) -> Result<()> {
+    let record = Thread {
+        id: schedule_id.to_owned(),
+        owner: owner.to_owned(),
+        ..Thread::default()
+    };
+    require_owner(ctx, project, &record, "cancel a scheduled prompt")
+}
+
+fn authorize_owner(caller: coordinator::Caller, project: &Project, record: &Thread, action: &str) -> Result<Option<String>> {
+    match caller {
+        coordinator::Caller::Human => Ok(None),
         coordinator::Caller::Stranger { pane } => {
-            let prefix = coordinator::current_prefix(&ctx.root)?;
+            let prefix = coordinator::current_prefix(&project.root)?;
             Err(coordinator::stranger_refusal(&prefix, &project.slug, &pane))
         }
         coordinator::Caller::Unverified { pane } => Err(coordinator::unverified_refusal(&project.slug, &pane)),
         coordinator::Caller::Coordinator { name, .. } => {
             if record.owner == name {
-                Ok(())
+                Ok(Some(name))
             } else if record.owner.is_empty() {
                 bail!(
                     "{action}: {} is unassigned; claim it first with `hp thread assign {} {} --coordinator {name}`",
@@ -803,7 +893,13 @@ pub fn assign(ctx: &Ctx, slug: &str, id: &str, coordinator_name: &str) -> Result
     if !view.agents.iter().any(|a| a.name == coordinator_name && coordinator::is_coordinator(slug, &dir, a)) {
         bail!("no registered coordinator `{coordinator_name}` is live in `{slug}`; open or adopt one first (`herdr agent list` shows names)");
     }
-    let previous = if record.owner.is_empty() { "unassigned".to_string() } else { format!("`{}`", record.owner) };
+    let _delivery = prompt_delivery_lock(&project, id)?;
+    let current = thread::load(&project, id)?;
+    if current.owner == coordinator_name {
+        println!("{id} is already owned by `{coordinator_name}`");
+        return Ok(());
+    }
+    let previous = if current.owner.is_empty() { "unassigned".to_string() } else { format!("`{}`", current.owner) };
     thread::update(&project, id, |t| t.owner = coordinator_name.to_string())?;
     println!("{id} reassigned from {previous} to `{coordinator_name}`; its open inbox items route with it");
     Ok(())
@@ -1506,6 +1602,25 @@ mod tests {
         assert!(prompt_state(&t, &[agent("blocked")]).unwrap_err().to_string().contains("agent_blocked"));
         assert_eq!(prompt_state(&t, &[agent("working")]).unwrap(), "working");
         assert_eq!(prompt_state(&t, &[agent("idle")]).unwrap(), "idle");
+    }
+
+    #[test]
+    fn scheduled_delivery_revalidates_owner_under_its_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let thread = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+            t.owner = "hpc-demo".into();
+            t.pane_id = "w2:p1".into();
+        })
+        .unwrap();
+        let stale = thread::load(&project, &thread.id).unwrap();
+        thread::update(&project, &thread.id, |t| t.owner = "hpc-demo-1".into()).unwrap();
+        let error = lock_scheduled_delivery(&project, &stale, "hpc-demo").unwrap_err().to_string();
+        assert!(error.contains("not the scheduling coordinator"), "{error}");
+        let current = thread::load(&project, &thread.id).unwrap();
+        let lock = lock_scheduled_delivery(&project, &current, "hpc-demo-1").unwrap();
+        drop(lock);
     }
 
     #[test]
