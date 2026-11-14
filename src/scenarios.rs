@@ -1,7 +1,7 @@
 //! Multi-step behaviour checked against the scripted fake runner: what the
 //! CLI and the ticker do together, without herdr, git or an agent.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -280,12 +280,14 @@ fn thread_start_returns_without_an_agent_and_the_ticker_launches_then_prompts() 
     let repo = world.home.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     let wt = worktree.to_string_lossy().into_owned();
+    let base_sha = "0123456789abcdef0123456789abcdef01234567";
 
     *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
     world.runner.on("rev-parse --show-toplevel", ok("/repo\n"));
     world.runner.on("remote get-url origin", ok("git@github.com:Owner/App.git\n"));
     world.runner.on("fetch origin", fail(1, "offline"));
     world.runner.on("symbolic-ref", ok("origin/main\n"));
+    world.runner.on("rev-parse --verify origin/main^{commit}", ok(&format!("{base_sha}\n")));
     world.runner.on("rev-parse --git-path", fail(1, "not a repo"));
     world.runner.on(
         "worktree create",
@@ -329,6 +331,8 @@ fn thread_start_returns_without_an_agent_and_the_ticker_launches_then_prompts() 
     let calls = world.runner.calls.borrow();
     let create = calls.iter().find(|c| c.display().contains("worktree create")).unwrap();
     assert!(create.args.contains(&"Fix $(it)".to_string()));
+    let base_at = create.args.iter().position(|arg| arg == "--base").unwrap();
+    assert_eq!(create.args[base_at + 1], base_sha, "herdr receives the exact commit, while the record keeps origin/main");
     drop(calls);
 
     // Tick 1: the pane is at a shell prompt: start, do not prompt.
@@ -367,6 +371,175 @@ fn thread_start_returns_without_an_agent_and_the_ticker_launches_then_prompts() 
     assert!(ticker::tick_project(&ctx, &project).unwrap());
     assert_eq!(world.runner.count("agent prompt"), 1);
     assert!(inbox::unhandled(&project).is_empty());
+}
+
+fn config_lock_failure() -> Output {
+    fail(
+        1,
+        &serde_json::json!({"error":{"code":"worktree_create_failed","message":"error: could not lock config file .git/config: File exists\nerror: unable to write upstream branch configuration"}}).to_string(),
+    )
+}
+
+fn worktree_created(path: &str) -> Output {
+    ok(&format!(
+        r#"{{"result":{{"root_pane":{{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","cwd":"{path}"}},"worktree":{{"path":"{path}"}}}}}}"#
+    ))
+}
+
+#[test]
+fn a_local_worktree_create_retries_a_config_lock_and_cleans_its_empty_branch() {
+    let world = World::new();
+    let _project = world.project("demo", "a.sock");
+    let repo = world.home.path().join("repo");
+    let worktree = world.home.path().join("wt");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(&worktree).unwrap();
+    let base_sha = "0123456789abcdef0123456789abcdef01234567";
+    let branch = "hp/demo/t-0001-lock";
+    let reference = format!("refs/heads/{branch}");
+    world.runner.on("rev-parse --show-toplevel", ok(&format!("{}\n", repo.display())));
+    world.runner.on("remote get-url origin", fail(1, "no origin"));
+    world.runner.on("rev-parse --verify main^{commit}", ok(&format!("{base_sha}\n")));
+    world.runner.on(&format!("rev-parse --verify --quiet {reference}"), ok(&format!("{base_sha}\n")));
+    world.runner.on("worktree list --porcelain", ok(&format!("worktree {}\nHEAD {base_sha}\nbranch refs/heads/main\n", repo.display())));
+    world.runner.on(&format!("update-ref -d {reference} {base_sha}"), ok(""));
+    world.runner.on("rev-parse --git-path", fail(1, "not a repo"));
+    world.runner.on("workspace list", ok(r#"{"result":{"workspaces":[]}}"#));
+    let attempts = Rc::new(Cell::new(0));
+    let answer_attempts = attempts.clone();
+    let answer_path = worktree.to_string_lossy().into_owned();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("worktree create"),
+        move |_| {
+            answer_attempts.set(answer_attempts.get() + 1);
+            if answer_attempts.get() == 1 { Ok(config_lock_failure()) } else { Ok(worktree_created(&answer_path)) }
+        },
+    );
+
+    let started = threads::start(
+        &world.ctx(),
+        "demo",
+        StartArgs {
+            title: "Lock".into(),
+            repo: Some(repo.to_string_lossy().into_owned()),
+            machine: None,
+            profile: None,
+            kind: None,
+            base: Some("main".into()),
+            task: "Start safely.".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!((started.base.as_str(), started.status), ("main", Status::Open));
+    assert_eq!((attempts.get(), world.runner.count("update-ref -d")), (2, 1));
+    assert_eq!(world.runner.count("branch -D"), 0);
+    let calls = world.runner.calls.borrow();
+    for create in calls.iter().filter(|cmd| cmd.display().contains("worktree create")) {
+        let at = create.args.iter().position(|arg| arg == "--base").unwrap();
+        assert_eq!(create.args[at + 1], base_sha);
+    }
+}
+
+#[test]
+fn a_persistent_config_lock_fails_the_thread_after_five_creates() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let repo = world.home.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let base_sha = "0123456789abcdef0123456789abcdef01234567";
+    world.runner.on("rev-parse --show-toplevel", ok(&format!("{}\n", repo.display())));
+    world.runner.on("remote get-url origin", fail(1, "no origin"));
+    world.runner.on("rev-parse --verify main^{commit}", ok(&format!("{base_sha}\n")));
+    world.runner.on("rev-parse --verify --quiet", fail(1, "no leftover branch"));
+    let attempts = Rc::new(Cell::new(0));
+    let answer_attempts = attempts.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("worktree create"),
+        move |_| {
+            answer_attempts.set(answer_attempts.get() + 1);
+            Ok(config_lock_failure())
+        },
+    );
+
+    let error = threads::start(
+        &world.ctx(),
+        "demo",
+        StartArgs {
+            title: "Held".into(),
+            repo: Some(repo.to_string_lossy().into_owned()),
+            machine: None,
+            profile: None,
+            kind: None,
+            base: Some("main".into()),
+            task: "Start safely.".into(),
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("could not lock config file"));
+    assert_eq!(attempts.get(), 5);
+    assert_eq!(world.runner.count("rev-parse --verify --quiet"), 5);
+    let saved = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(saved.status, Status::Failed);
+    assert!(saved.error.contains("could not lock config file"));
+}
+
+#[test]
+fn an_ssh_worktree_create_uses_the_commit_and_retries_a_config_lock() {
+    let world = World::new();
+    let _project = world.project("demo", "a.sock");
+    let base_sha = "0123456789abcdef0123456789abcdef01234567";
+    world.runner.on("machine list --json", ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#));
+    world.runner.on_fn(
+        |cmd| cmd.program == "ssh" && cmd.args.last().is_some_and(|script| script.contains("profile resolve")),
+        |_| Ok(ok(r#"{"name":"claude","agent":"claude","args":[]}"#)),
+    );
+    world.runner.on_fn(
+        |cmd| cmd.program == "ssh" && cmd.args.last().is_some_and(|script| script.contains("git rev-parse --show-toplevel")),
+        move |_| Ok(ok(&format!("git@github.com:Owner/App.git\norigin/main\n{base_sha}\n"))),
+    );
+    world.runner.on("ssh", ok(""));
+    let attempts = Rc::new(Cell::new(0));
+    let answer_attempts = attempts.clone();
+    world.runner.on_fn(
+        |cmd| is_machine_call(cmd) && cmd.display().contains("worktree create"),
+        move |_| {
+            answer_attempts.set(answer_attempts.get() + 1);
+            if answer_attempts.get() == 1 { Ok(config_lock_failure()) } else { Ok(worktree_created("/home/me/wt")) }
+        },
+    );
+
+    let started = threads::start(
+        &world.ctx(),
+        "demo",
+        StartArgs {
+            title: "Lock".into(),
+            repo: Some("/home/me/repo".into()),
+            machine: Some("box".into()),
+            profile: None,
+            kind: None,
+            base: None,
+            task: "Start safely.".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!((started.base.as_str(), started.status), ("origin/main", Status::Open));
+    assert_eq!(attempts.get(), 2);
+    let calls = world.runner.calls.borrow();
+    let creates: Vec<_> = calls.iter().filter(|cmd| is_machine_call(cmd) && cmd.display().contains("worktree create")).collect();
+    assert_eq!(creates.len(), 2);
+    for create in creates {
+        let at = create.args.iter().position(|arg| arg == "--base").unwrap();
+        assert_eq!(create.args[at + 1], base_sha);
+    }
+    let cleanups: Vec<_> = calls
+        .iter()
+        .filter(|cmd| cmd.program == "ssh" && cmd.args.last().is_some_and(|script| script.contains("git update-ref -d")))
+        .collect();
+    assert_eq!(cleanups.len(), 1);
+    let script = cleanups[0].args.last().unwrap();
+    assert!(script.contains("git worktree list --porcelain"), "{script}");
+    assert!(script.contains(&format!("git update-ref -d \"$r\" {base_sha}")), "{script}");
+    assert!(!script.contains("branch -D"), "{script}");
 }
 
 #[test]

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::herdr::{Agent, Herdr, Pane};
+use crate::herdr::{Agent, Herdr, HerdrError, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
@@ -220,6 +220,64 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     }
 }
 
+/// The waits before each new worktree-create attempt while another git
+/// command holds the repository's config lock: five attempts, under four
+/// seconds of backoff in total.
+const CONFIG_LOCK_WAITS_MS: [u64; 4] = [250, 500, 1000, 2000];
+
+fn config_locked(error: &HerdrError) -> bool {
+    error.message.contains("could not lock config file")
+}
+
+fn config_lock_pause(milliseconds: u64) {
+    #[cfg(not(test))]
+    std::thread::sleep(Duration::from_millis(milliseconds));
+    #[cfg(test)]
+    let _ = milliseconds;
+}
+
+/// Retry only a genuine git config-lock refusal. After every failed create,
+/// clean up a provably empty leftover branch so the next attempt can reuse the
+/// same name; cleanup is best-effort and never masks the create error.
+fn worktree_create_with_retry<T>(
+    mut make: impl FnMut() -> std::result::Result<T, HerdrError>,
+    mut cleanup: impl FnMut(),
+) -> std::result::Result<T, HerdrError> {
+    let mut retries = 0;
+    loop {
+        let error = match make() {
+            Ok(created) => return Ok(created),
+            Err(error) => error,
+        };
+        cleanup();
+        if !config_locked(&error) || retries == CONFIG_LOCK_WAITS_MS.len() {
+            return Err(error);
+        }
+        config_lock_pause(CONFIG_LOCK_WAITS_MS[retries]);
+        retries += 1;
+    }
+}
+
+/// Local counterpart of `remote::drop_empty_branch`: compare the exact tip,
+/// require a successful worktree listing, refuse a checked-out branch, and use
+/// a compare-and-delete update that cannot remove later commits.
+fn drop_empty_local_branch(runner: &dyn Runner, repo: &str, branch: &str, base: &str) {
+    let reference = format!("refs/heads/{branch}");
+    let Ok(tip) = git(runner, repo, &["rev-parse", "--verify", "--quiet", &reference], GIT_TIMEOUT) else {
+        return;
+    };
+    if tip != base {
+        return;
+    }
+    let Ok(trees) = git(runner, repo, &["worktree", "list", "--porcelain"], GIT_TIMEOUT) else {
+        return;
+    };
+    if trees.lines().any(|line| line == format!("branch {reference}")) {
+        return;
+    }
+    let _ = git(runner, repo, &["update-ref", "-d", &reference, base], GIT_TIMEOUT);
+}
+
 /// Steps 2 to 5 of starting a thread, also used by `thread restart` case (a).
 fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, restart: bool) -> Result<Thread> {
     let slug = &project.slug;
@@ -231,9 +289,13 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
             // The same steps on the thread's own machine: git over ssh, herdr
             // through `--machine`.
             let target = remote::ssh_target(runner, &ctx.env.herdr_bin(), &ctx.config_dir, &record.machine)?;
-            let (origin, base) = remote::repo_info(runner, &target, &record.repo, &record.base)?;
+            let (origin, base, base_sha) = remote::repo_info(runner, &target, &record.repo, &record.base)?;
             let branch = thread::branch_name(slug, id, &record.title);
-            let (created, path, cwd) = view.herdr.on_machine(&record.machine).worktree_create(&record.repo, &branch, &base, &record.title)?;
+            let remote_herdr = view.herdr.on_machine(&record.machine);
+            let (created, path, cwd) = worktree_create_with_retry(
+                || remote_herdr.worktree_create(&record.repo, &branch, &base_sha, &record.title),
+                || remote::drop_empty_branch(runner, &target, &record.repo, &branch, &base_sha),
+            )?;
             thread::update(project, id, |t| {
                 t.origin = origin;
                 t.base = base;
@@ -264,8 +326,16 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
             } else {
                 record.base.clone()
             };
+            // Creating from a remote-tracking ref writes the new branch's
+            // upstream into the shared .git/config. Resolve first so parallel
+            // starts do not write config; the later `push -u` sets upstream.
+            let revision = format!("{base}^{{commit}}");
+            let base_sha = git(runner, &record.repo, &["rev-parse", "--verify", &revision], GIT_TIMEOUT)?;
             let branch = thread::branch_name(slug, id, &record.title);
-            let (created, path, cwd) = view.herdr.worktree_create(&record.repo, &branch, &base, &record.title)?;
+            let (created, path, cwd) = worktree_create_with_retry(
+                || view.herdr.worktree_create(&record.repo, &branch, &base_sha, &record.title),
+                || drop_empty_local_branch(runner, &record.repo, &branch, &base_sha),
+            )?;
             let repo_workspace = repo_space(&view.herdr, &record.repo);
             // Recorded immediately, so a command killed midway still leaves a
             // record `thread restart` can act on.
@@ -1471,6 +1541,90 @@ repo = "/repo"
         assert_eq!(restart_plan(&checkout, &gone(), false, now()).unwrap(), RestartPlan::Reopen);
         let no_pane = Thread { kind: Kind::Checkout, pane_id: String::new(), worktree_path: String::new(), ..worktree_thread() };
         assert_eq!(restart_plan(&no_pane, &gone(), false, now()).unwrap(), RestartPlan::Create);
+    }
+
+    #[test]
+    fn worktree_retries_are_bounded_and_specific_to_config_locks() {
+        let mut attempts = 0;
+        let mut cleanups = 0;
+        let error = worktree_create_with_retry::<()>(
+            || {
+                attempts += 1;
+                Err(HerdrError { code: "worktree_create_failed".into(), message: "could not lock config file .git/config: File exists".into() })
+            },
+            || cleanups += 1,
+        )
+        .unwrap_err();
+        assert_eq!((attempts, cleanups), (5, 5));
+        assert!(error.message.contains("could not lock config file"));
+
+        let mut attempts = 0;
+        let mut cleanups = 0;
+        let error = worktree_create_with_retry::<()>(
+            || {
+                attempts += 1;
+                Err(HerdrError { code: "worktree_create_failed".into(), message: "permission denied".into() })
+            },
+            || cleanups += 1,
+        )
+        .unwrap_err();
+        assert_eq!((attempts, cleanups), (1, 1));
+        assert_eq!(error.message, "permission denied");
+    }
+
+    #[test]
+    fn local_cleanup_deletes_only_an_empty_unused_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
+        let git = |args: &[&str]| {
+            let out = run(args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        git(&["add", "base.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        let cwd = repo.to_string_lossy().into_owned();
+        let branch = "hp/demo/t-0001-empty";
+        let reference = format!("refs/heads/{branch}");
+        git(&["branch", branch, &base]);
+
+        drop_empty_local_branch(&crate::runner::RealRunner, &cwd, branch, &base);
+        assert!(!run(&["show-ref", "--verify", "--quiet", &reference]).status.success());
+
+        // A commit made after the failed create is never sacrificed to cleanup.
+        git(&["branch", branch, &base]);
+        let tree = git(&["rev-parse", &format!("{base}^{{tree}}")]);
+        let advanced = git(&["commit-tree", &tree, "-p", &base, "-m", "advanced"]);
+        git(&["update-ref", &reference, &advanced, &base]);
+        drop_empty_local_branch(&crate::runner::RealRunner, &cwd, branch, &base);
+        assert_eq!(git(&["rev-parse", &reference]), advanced);
+
+        // Even at the base commit, a branch checked out anywhere is kept.
+        let checked = "hp/demo/t-0001-checked";
+        let checked_ref = format!("refs/heads/{checked}");
+        let checked_path = root.path().join("checked out").to_string_lossy().into_owned();
+        git(&["branch", checked, &base]);
+        git(&["worktree", "add", "-q", &checked_path, checked]);
+        drop_empty_local_branch(&crate::runner::RealRunner, &cwd, checked, &base);
+        assert_eq!(git(&["rev-parse", &checked_ref]), base);
+
+        // Missing or inconclusive repository facts fail closed.
+        let fake = crate::runner::fake::FakeRunner::new();
+        fake.on("rev-parse --verify --quiet", crate::runner::fake::ok(&format!("{base}\n")));
+        fake.on("worktree list --porcelain", crate::runner::fake::fail(1, "cannot inspect"));
+        drop_empty_local_branch(&fake, &cwd, checked, &base);
+        assert_eq!(fake.count("update-ref -d"), 0);
+        let fake = crate::runner::fake::FakeRunner::new();
+        fake.on("rev-parse --verify --quiet", crate::runner::fake::fail(1, "cannot inspect"));
+        drop_empty_local_branch(&fake, &cwd, checked, &base);
+        assert_eq!((fake.count("worktree list"), fake.count("update-ref -d")), (0, 0));
     }
 
     #[test]
