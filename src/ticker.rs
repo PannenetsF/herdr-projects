@@ -262,6 +262,14 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     log.line(&format!("ticker {} started (pid {})", info.version, info.pid));
     let mut last_reachable = Instant::now();
     let mut memory = Memory::new(ctx);
+    for slug in project::list_slugs(&ctx.root) {
+        let Ok(project) = Project::load(&ctx.root, &slug) else {
+            continue;
+        };
+        for error in crate::schedule::recover_interrupted_at(&project, jiff::Timestamp::now()) {
+            log.line(&format!("{slug}: schedule recovery: {error:#}"));
+        }
+    }
     loop {
         if stop_path(root).exists() {
             log.line("stop file found; exiting");
@@ -1005,6 +1013,8 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     errors.extend(steps::resolve_merged(ctx, project, &mut state, now));
     errors.extend(routine_pass(ctx, project, &mut state, seen.coordinator));
+    let claim_owner = format!("{}:{}", std::process::id(), memory.started);
+    errors.extend(crate::schedule::fire_due_at(ctx, project, &claim_owner, now));
     if let Ok((settings, _)) = project.read_project_md() {
         errors.extend(steps::auto_resolve(ctx, project, &settings, memory, now));
     }

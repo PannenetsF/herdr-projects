@@ -690,6 +690,12 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
 /// predicate: agents queue a message that arrives while they work.
 pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
+    let (project, record) = validate_prompt_target(ctx, slug, id, text)?;
+    require_owner(ctx, &project, &record, "post a prompt")?;
+    deliver_prompt(ctx, &project, &record, text)
+}
+
+pub(crate) fn validate_prompt_target(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<(Project, Thread)> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if text.trim().is_empty() {
@@ -701,15 +707,33 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     if record.prompt_pending {
         bail!("{id} has not received its brief yet; the ticker sends it once the agent is ready, and `thread brief` sends it now");
     }
-    require_owner(ctx, &project, &record, "post a prompt")?;
-    let view = require_session(ctx, &project)?;
-    let (agents, _) = lists_for(&view, &record)?;
-    let state = prompt_state(&record, &agents)?;
+    Ok((project, record))
+}
+
+/// A delayed prompt carries the owner who authorized it. Never infer the
+/// ticker process as a human caller: that would bypass the ownership check.
+pub fn scheduled_prompt(ctx: &Ctx, slug: &str, id: &str, owner: &str, text: &str) -> Result<String> {
+    let (project, record) = validate_prompt_target(ctx, slug, id, text)?;
+    if record.owner.is_empty() {
+        bail!("scheduled prompt: {id} is unassigned; its original owner no longer owns it");
+    }
+    if record.owner != owner {
+        bail!("scheduled prompt: {id} is owned by coordinator `{}`, not the scheduling coordinator `{owner}`", record.owner);
+    }
+    deliver_prompt(ctx, &project, &record, text)
+}
+
+fn deliver_prompt(ctx: &Ctx, project: &Project, record: &Thread, text: &str) -> Result<String> {
+    let id = &record.id;
+    let slug = &project.slug;
+    let view = require_session(ctx, project)?;
+    let (agents, _) = lists_for(&view, record)?;
+    let state = prompt_state(record, &agents)?;
     let herdr = view.herdr.on_machine(&record.machine);
     // Someone typing in the thread's pane would have the prompt merged into
     // their text and submitted. A box this binary cannot read (another kind, a
     // layout it does not know) is sent to as before.
-    let kind = agents.iter().find(|a| thread::agent_matches(&record, a)).map(|a| a.agent.as_str()).unwrap_or(&record.agent);
+    let kind = agents.iter().find(|a| thread::agent_matches(record, a)).map(|a| a.agent.as_str()).unwrap_or(&record.agent);
     let screen = herdr.agent_screen(&record.pane_id).map_err(|error| anyhow::anyhow!("{error}"))?;
     // Herdr may read a trust screen as idle; Enter there would accept it.
     if let Some(phrase) = crate::trust_screen::detect(kind, &screen) {
@@ -729,7 +753,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     }
     // Written after the send, so the task file never claims a prompt that was
     // refused; a restarted thread re-reads it with its task.
-    thread::append_follow_up(&project, id, text)?;
+    thread::append_follow_up(project, id, text)?;
     if let Err(error) = sent {
         bail!(
             "prompt_unconfirmed: the text was typed into {id}'s pane ({}) but the agent was not seen starting on it ({error}). Do not send it again: `thread read` shows whether it sits in the input box, and `thread keys {slug} {id} enter` submits it",
@@ -743,16 +767,41 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
 /// terminal (no live pane) is always allowed; an owner-less thread is refused
 /// to every coordinator until `thread assign` names an owner.
 pub fn require_owner(ctx: &Ctx, project: &Project, record: &Thread, action: &str) -> Result<()> {
-    match coordinator::caller(ctx, project) {
-        coordinator::Caller::Human => Ok(()),
+    authorize_owner(coordinator::caller(ctx, project), project, record, action).map(|_| ())
+}
+
+/// Scheduling always needs a durable owner, including when a person registers
+/// the request from a terminal. The human exception must not create an
+/// owner-less delayed prompt that the ticker could deliver without a guard.
+pub(crate) fn scheduling_owner(ctx: &Ctx, project: &Project, record: &Thread) -> Result<String> {
+    let caller = coordinator::caller(ctx, project);
+    match authorize_owner(caller, project, record, "schedule a prompt")? {
+        Some(owner) => Ok(owner),
+        None if record.owner.is_empty() => bail!("schedule a prompt: {} is unassigned; claim it first with `thread assign`", record.id),
+        None => Ok(record.owner.clone()),
+    }
+}
+
+pub(crate) fn require_schedule_owner(ctx: &Ctx, project: &Project, schedule_id: &str, owner: &str) -> Result<()> {
+    let record = Thread {
+        id: schedule_id.to_owned(),
+        owner: owner.to_owned(),
+        ..Thread::default()
+    };
+    require_owner(ctx, project, &record, "cancel a scheduled prompt")
+}
+
+fn authorize_owner(caller: coordinator::Caller, project: &Project, record: &Thread, action: &str) -> Result<Option<String>> {
+    match caller {
+        coordinator::Caller::Human => Ok(None),
         coordinator::Caller::Stranger { pane } => {
-            let prefix = coordinator::current_prefix(&ctx.root)?;
+            let prefix = coordinator::current_prefix(&project.root)?;
             Err(coordinator::stranger_refusal(&prefix, &project.slug, &pane))
         }
         coordinator::Caller::Unverified { pane } => Err(coordinator::unverified_refusal(&project.slug, &pane)),
         coordinator::Caller::Coordinator { name, .. } => {
             if record.owner == name {
-                Ok(())
+                Ok(Some(name))
             } else if record.owner.is_empty() {
                 bail!(
                     "{action}: {} is unassigned; claim it first with `hp thread assign {} {} --coordinator {name}`",

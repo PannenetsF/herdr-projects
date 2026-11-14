@@ -4092,6 +4092,83 @@ fn a_non_owner_coordinator_cannot_prompt_forward_next_or_clear_the_threads_inbox
 }
 
 #[test]
+fn scheduled_prompts_deliver_once_and_fail_visibly_when_the_target_changes() {
+    let (world, project, t) = finished_world("working");
+    let ctx = world.ctx();
+    let now = "2026-11-14T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let due = now.checked_add(jiff::SignedDuration::from_secs(1200)).unwrap();
+    let prompt = "Check this PR.\nKeep `echo hello` as text.";
+    let scheduled = crate::schedule::add(&ctx, "demo", &t.id, prompt, crate::schedule::parse_in("20m", now).unwrap(), now).unwrap();
+    assert_eq!(world.runner.count("agent prompt"), 0);
+
+    let errors = crate::schedule::fire_due_at(&ctx, &project, "test-ticker", due);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    let calls = world.runner.calls.borrow();
+    let sent = calls.iter().find(|cmd| cmd.display().contains("agent prompt")).unwrap();
+    assert_eq!(prompt_text(sent), prompt);
+    drop(calls);
+    assert!(std::fs::read_to_string(thread::task_path(&project, &t.id)).unwrap().contains("Keep `echo hello` as text."));
+    let errors = crate::schedule::fire_due_at(&ctx, &project, "test-ticker", due);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    assert_eq!(crate::schedule::records(&project).unwrap().iter().find(|record| record.id == scheduled.id).unwrap().status, crate::schedule::ScheduleStatus::Completed);
+
+    let reassigned = crate::schedule::add(&ctx, "demo", &t.id, "do not transfer authorization", crate::schedule::parse_in("20m", now).unwrap(), now).unwrap();
+    thread::update(&project, &t.id, |thread| thread.owner = "hpc-demo-1".into()).unwrap();
+    let errors = crate::schedule::fire_due_at(&ctx, &project, "test-ticker", due);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    let failed = crate::schedule::records(&project).unwrap().into_iter().find(|record| record.id == reassigned.id).unwrap();
+    assert_eq!(failed.status, crate::schedule::ScheduleStatus::Failed);
+    assert!(failed.error.unwrap().contains("not the scheduling coordinator"));
+
+    thread::update(&project, &t.id, |thread| thread.owner = "hpc-demo".into()).unwrap();
+    let resolved = crate::schedule::add(&ctx, "demo", &t.id, "do not prompt a resolved thread", crate::schedule::parse_in("20m", now).unwrap(), now).unwrap();
+    thread::update(&project, &t.id, |thread| thread.status = Status::Resolved).unwrap();
+    let errors = crate::schedule::fire_due_at(&ctx, &project, "test-ticker", due);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    assert!(crate::schedule::records(&project).unwrap().into_iter().find(|record| record.id == resolved.id).unwrap().error.unwrap().contains("is resolved"));
+
+    thread::update(&project, &t.id, |thread| thread.status = Status::Open).unwrap();
+    let missing = crate::schedule::add(&ctx, "demo", &t.id, "do not prompt a missing thread", crate::schedule::parse_in("20m", now).unwrap(), now).unwrap();
+    std::fs::remove_file(project.dir().join("threads/t-0001.toml")).unwrap();
+    let errors = crate::schedule::fire_due_at(&ctx, &project, "test-ticker", due);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    assert!(crate::schedule::records(&project).unwrap().into_iter().find(|record| record.id == missing.id).unwrap().error.unwrap().contains("no thread"));
+}
+
+#[test]
+fn schedule_add_and_cancel_keep_the_coordinator_owner_gate() {
+    let (world, project, env_a, env_b) = two_coordinator_world();
+    let t = thread::allocate(&project, |t| {
+        t.title = "Task".into();
+        t.status = Status::Open;
+        t.owner = "hpc-demo".into();
+    })
+    .unwrap();
+    let now = "2026-11-14T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
+    let when = crate::schedule::parse_in("20m", now).unwrap();
+    let ctx_b = Ctx { env: &env_b, ..world.ctx() };
+    let error = crate::schedule::add(&ctx_b, "demo", &t.id, "not mine", when.clone(), now).unwrap_err().to_string();
+    assert!(error.contains("is owned by coordinator `hpc-demo`"), "{error}");
+    assert!(crate::schedule::records(&project).unwrap().is_empty());
+
+    let ctx_a = Ctx { env: &env_a, ..world.ctx() };
+    let scheduled = crate::schedule::add(&ctx_a, "demo", &t.id, "mine", when.clone(), now).unwrap();
+    let error = crate::schedule::cancel(&ctx_b, "demo", &scheduled.id, now).unwrap_err().to_string();
+    assert!(error.contains("is owned by coordinator `hpc-demo`"), "{error}");
+    assert_eq!(crate::schedule::records(&project).unwrap()[0].status, crate::schedule::ScheduleStatus::Pending);
+    assert_eq!(crate::schedule::cancel(&ctx_a, "demo", &scheduled.id, now).unwrap().status, crate::schedule::ScheduleStatus::Cancelled);
+
+    thread::update(&project, &t.id, |thread| thread.owner.clear()).unwrap();
+    let error = crate::schedule::add(&ctx_a, "demo", &t.id, "unowned", when, now).unwrap_err().to_string();
+    assert!(error.contains("is unassigned"), "{error}");
+}
+
+#[test]
 fn an_unassigned_thread_is_refused_to_every_coordinator_until_it_is_assigned() {
     let (world, project, _env_a, env_b) = two_coordinator_world();
     let t = thread::allocate(&project, |t| {

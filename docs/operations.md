@@ -31,6 +31,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   inbox/, inbox/done/     events for the coordinator
   library/<id>/           home copy of files a thread produced
   .state/                 status, coordinator record, live coordinators, ticker state, lock
+  .state/schedules.json   one-shot delayed prompts, durable claims and outcomes
 ~/.herdr-projects/.ticker.lock  .ticker.log  .progress/  .trash/
 ~/.config/herdr-projects/config.toml             yours: root, profiles, safety tables, machines
 ~/.config/herdr-projects/owned.json              what `configure` changed, for `unconfigure`
@@ -59,6 +60,7 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `thread resolve [--keep-worktree] [--discard-uncopied] [--skip-copy] [--reopen]` | Final copy home, then clean up. |
 | `sweep <project> [--dry-run] [--yes]` | Remove what nothing uses any more. |
 | `set <project> <key> <value>`, `routine list/toggle/approve`, `safety show/yolo/set` | Settings, routines and safety (see below). |
+| `schedule add <project> <thread> (--at TIME \| --in DURATION) --prompt-file F`, `schedule list/show [--json]`, `schedule cancel` | One-shot delayed prompts for existing owned threads (see below). |
 | `profile list [--project P \| --names]`, `profile resolve [NAME]`, `profile add/edit/remove`, `profile allow threads\|coordinator NAMES... [--project P] [--all]`, `profile default threads\|coordinator NAME` | [Agent profiles](#agent-profiles). Everything but `list` and `resolve` needs a person at a terminal. |
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--force]` | Project lifecycle. |
 | `rename <project> <new-slug> [--name NAME] [--dry-run]` | A new slug (folder name), and with `--name` a new display name. Refused while a thread is not resolved. While agents run in the project folder (its coordinator, which may run it itself) the ticker takes over: once they are idle (at most 5 minutes) it closes their panes, renames, reopens the coordinator in the new folder resuming its conversation, and prompts it with a note; `thread start` is refused meanwhile. The folder moves in one step; the thread records, the coordinator record, `AGENTS.md`, the project's `[safety]` table (yolo, profile lists), routine approvals and the home Space's label follow it. Branches and worktrees keep `hp/<old>/` and `sweep` still finds them; the coordinator's conversation follows (Claude Code's transcript is copied to the new folder; other harnesses resume by id, one that cannot starts anew). It lists what it could not update (other machines), then runs `doctor`. Run it again to finish one that stopped halfway. |
@@ -208,6 +210,10 @@ The coordinator runs the binary every turn, so allow-list it in your agent by su
   "Bash(<binary> --root <root> inbox done:*)",
   "Bash(<binary> --root <root> list:*)",
   "Bash(<binary> --root <root> routine list:*)",
+  "Bash(<binary> --root <root> schedule list:*)",
+  "Bash(<binary> --root <root> schedule show:*)",
+  "Bash(<binary> --root <root> schedule add:*)",
+  "Bash(<binary> --root <root> schedule cancel:*)",
   "Bash(<binary> --root <root> thread list:*)",
   "Bash(<binary> --root <root> thread show:*)",
   "Bash(<binary> --root <root> thread prompt:*)",
@@ -246,6 +252,26 @@ A file `routines/<name>.md` with TOML front matter; the body is the prompt.
 - `schedule = "every <N>m|h|d"` or `"daily HH:MM"` (local time): the coordinator gets the body as an inbox item when it is due; while that item is unhandled, later runs add none. With no registered coordinator running, a due run does nothing, runs no command and is not made up later; `routine list`, the popup and `doctor` show it as `skipped: no coordinator`. `routine list` shows each routine's last and next run. An optional `command` runs (`sh -c`, in the project folder, 60 second timeout) only when `routine_commands = true` and you have run `herdr-projects routine approve <project> <name>` in a terminal; its output reaches the coordinator capped at 4,000 characters inside a fence labelled as untrusted.
 - `on = "pr"`, optionally `events = ["opened", "checks-failed", "review", "merged"]`: fired by the ticker's pull request poll. The body goes to the thread whose pull request changed, as a prompt, with facts the binary generates (how many checks fail, how many comments, the `gh` commands to read them). It needs no coordinator, only the open thread.
 - Every project has `routines/pr-followup.md` (`checks-failed`, `review`): it tells the thread to fix failing checks and address review comments. Turn it off in the popup's routines section; `doctor --fix` puts it back if the file is missing.
+
+## One-shot schedules
+
+A one-shot schedule sends one captured prompt to an existing thread once. It is not a recurring routine, a dependency graph, a new-thread action or a shell command:
+
+```sh
+herdr-projects schedule add billing t-0007 --in 20m --prompt-file /tmp/check-pr.md
+herdr-projects schedule add billing t-0007 --at '2026-11-15T09:00[Asia/Shanghai]' --prompt-file -
+herdr-projects schedule list billing
+herdr-projects schedule show billing s-0001 --json
+herdr-projects schedule cancel billing s-0001
+```
+
+- **Target and authorization.** The thread must exist, be unresolved, have received its initial brief and have an owner. The caller must pass the same owner gate as `thread prompt`; a person at a terminal may schedule for an owned thread, but not an unassigned one. The record keeps that owner. Firing reloads the thread and fails visibly if it is missing, resolved, unassigned or has changed owner. Live-agent, trust-screen, draft-box and unconfirmed-prompt safeguards are the same as for an immediate prompt. Only the scheduling owner (or a person) may cancel the record.
+- **Absolute time.** `--at` requires `Z`, a numeric offset such as `+08:00`, an IANA zone in brackets, or an offset and zone together. Naive local times are refused rather than interpreted in a later machine timezone. A zone-local time in a DST gap or fold is refused; an explicit valid offset disambiguates it. Offset/zone conflicts, invalid times and times not strictly in the future are errors.
+- **Relative time.** `--in` accepts positive elapsed durations such as `20m`, `2h 30m`, `1d` or `PT20M`. Days are fixed 24-hour durations, not calendar days; calendar months and years are refused. Zero, negative, malformed and overflowing durations are errors. Exactly one of `--at` and `--in` is required.
+- **Durable record.** The prompt file is read completely at registration (`-` means stdin), not when the schedule fires. `<project>/.state/schedules.json` stores a project-unique `s-NNNN` id, project, thread, owner, full prompt, creation time, absolute UTC due instant, original time input and timezone, status, attempt/event id, claim owner, original due/actual fire, completion or cancellation time and error. The file is independent of routine/ticker state; an old project with no file reads as an empty queue, and an older binary leaves it untouched.
+- **One automatic attempt.** Under the project lock, a due record moves from `pending` to `running` and its attempt is saved before any target lookup or Herdr call. The lock is not held during delivery. Repeated ticks and competing claimers see the claim; cancellation uses the same lock. `cancel` is idempotent for an already-cancelled record, but running, completed and failed records return their status and cannot be cancelled. A cancelled record never fires.
+- **Offline and late runs.** While the ticker or machine is down, the project is paused, or its Herdr session is unreachable, the record stays pending and `schedule list` marks an overdue one `delayed`. Once the project is active and reachable again, it makes one late attempt, preserving `due_at` and recording `actual_fire`; missed occurrences are never replayed as a batch.
+- **Crash semantics.** Automatic submission is **at most once**, not exactly once. A ticker restart turns an interrupted `running` claim into `failed` with `interrupted after claim; prompt delivery is unknown; not retried`. A `prompt_unconfirmed` error is likewise terminal. `failed` therefore does not prove that no text was typed; inspect the thread before any manual follow-up. Failures also leave a `schedule` inbox item.
 
 ## Cleanup
 
