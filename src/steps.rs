@@ -40,24 +40,79 @@ pub struct State {
     pub routines: routine::States,
     /// Hashes of files a `config-error` item was already written for.
     pub config_errors: BTreeSet<String>,
-    /// Hash of the set of unseen item ids that was last nudged.
-    pub nudged: String,
-    /// The coordinator pane whose input box was seen empty since
-    /// `box_empty_since`, while a nudge waits for it.
-    pub box_pane: String,
-    pub box_empty_since: String,
-    /// The native agent session the last nudge went to: nudges stick to it
-    /// while it remains a live coordinator, so a second coordinator that
-    /// briefly looks more active never receives the other one's inbox.
+    /// Routing key -> hash of the unseen item set last nudged on it. A key is
+    /// an owning coordinator name, or [`GLOBAL_NUDGE`] for project-wide items.
+    /// Pre-pf.5 this field was a single `String` (the global queue); that
+    /// value migrates onto the [`GLOBAL_NUDGE`] key. A type mismatch without
+    /// a custom deserializer would fail the WHOLE ticker.json and, through
+    /// load_state's default fallback, wipe every other field (PR memory …).
+    #[serde(default, deserialize_with = "deserialize_nudged")]
+    pub nudged: BTreeMap<String, String>,
+    /// Routing key -> the input box pane currently observed going quiet, and
+    /// since when.
     #[serde(default)]
-    pub nudge_session: String,
+    pub boxes: BTreeMap<String, BoxWait>,
+    /// Routing key -> the native agent session the last nudge went to. Owner
+    /// nudges stick to that coordinator; project-wide nudges stick by the old
+    /// project rule while that session is a live coordinator.
+    #[serde(default)]
+    pub nudge_sessions: BTreeMap<String, String>,
     pub session_item_written: bool,
     /// thread id -> when the ticker first saw its pull request merged.
     pub merged_seen: BTreeMap<String, String>,
+    /// Legacy checkout threads the one-time pf.5 note was already written for.
+    #[serde(default)]
+    pub checkout_noted: BTreeSet<String>,
+}
+
+/// Routing key for items with no thread owner (routines, outages, session
+/// notes): any ready coordinator may receive them, once project-wide.
+pub const GLOBAL_NUDGE: &str = "_";
+
+/// Accept both the pf.5 `{key: hash}` map and the pre-pf.5 single string,
+/// which was the hash for the one project-wide queue and moves onto
+/// [`GLOBAL_NUDGE`]. An empty legacy string means "nothing nudged yet".
+fn deserialize_nudged<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Legacy {
+        Map(BTreeMap<String, String>),
+        Single(String),
+    }
+    Ok(match Legacy::deserialize(deserializer)? {
+        Legacy::Map(map) => map,
+        Legacy::Single(s) if s.is_empty() => BTreeMap::new(),
+        Legacy::Single(s) => [(GLOBAL_NUDGE.to_string(), s)].into_iter().collect(),
+    })
+}
+
+/// The input-box wait recorded for one routing key.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct BoxWait {
+    pub pane: String,
+    pub since: String,
 }
 
 pub fn load_state(project: &Project) -> State {
-    project::read_json(&project.state_dir().join("ticker.json")).unwrap_or_default()
+    let path = project.state_dir().join("ticker.json");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<State>(&text) {
+            Ok(state) => state,
+            Err(error) => {
+                // A parse failure starts empty, but it must never do so
+                // silently: falling back wiped PR/seen memory once when a
+                // field type changed (pf.4 String -> pf.5 map).
+                eprintln!("{}: parsing {}, starting empty: {error}", project.slug, path.display());
+                State::default()
+            }
+        },
+        // No file yet is the normal first run.
+        Err(_) => State::default(),
+    }
 }
 
 /// Only the ticker writes this file, so its own read-modify-write is safe; the
@@ -139,11 +194,13 @@ impl Memory {
     }
 
     /// Remote machines are polled every fourth tick (about a minute), and not
-    /// at all for eight ticks after a failure.
+    /// at all for eight ticks after a failure. Every project is due in the
+    /// tick a machine is polled: the first one asked must not use up the
+    /// machine's turn for the others.
     pub fn machine_is_due(&mut self, machine: &str) -> bool {
         let tick = self.tick;
         let entry = self.machines.entry(machine.to_string()).or_default();
-        let due = tick >= entry.skip_until_tick && (entry.last_poll_tick == 0 || tick >= entry.last_poll_tick + REMOTE_EVERY_TICKS);
+        let due = tick >= entry.skip_until_tick && (entry.last_poll_tick == 0 || tick == entry.last_poll_tick || tick >= entry.last_poll_tick + REMOTE_EVERY_TICKS);
         if due {
             entry.last_poll_tick = tick;
         }
@@ -222,8 +279,16 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
                 summary.push_str(&format!(" on machine `{}` (reach it with `herdr --remote <ssh target>`, or select the machine in herdr's sidebar)", t.machine));
             }
         }
-        inbox::write_origin(project, "thread-state", &t.id, transition_event(change), &summary, "", &t.origin_pane())?;
+        inbox::write_thread(project, &t, "thread-state", transition_event(change), &summary, "")?;
         if change.to == Group::WaitingOnYou {
+            // An internal confirmation point (fresh harness permission prompt,
+            // self-reported question) keeps its inbox item for the coordinator,
+            // but it does not ring the human. A later internal -> stalled
+            // upgrade is not a group transition, so it raises no bell either;
+            // the badge and popup pick it up from the persisted audience.
+            if t.audience == crate::thread::Audience::Internal.token() {
+                continue;
+            }
             let reason = if !t.state_line.is_empty() && t.state_line != "needs you" { t.state_line.clone() } else { format!("needs you · {}", change.note) };
             let reason = if !t.activity.is_empty() && t.activity == crate::progress::WAITING { format!("needs you · {}", t.activity) } else { reason };
             notifier.send(&t.id, &reason, crate::notify::Sound::Request, false);
@@ -243,12 +308,67 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
         if let Some(notes) = copy_notes.get(&t.id) {
             summary.push_str(&format!("; not everything was copied: {}", notes.join("; ")));
         }
-        inbox::write_origin(project, "thread-state", &t.id, "new report", &summary, "", &t.origin_pane())?;
+        inbox::write_thread(project, &t, "thread-state", "new report", &summary, "")?;
         notifier.send(&t.id, &format!("review · new report: {}", t.title), crate::notify::Sound::Done, false);
         let hash = t.report_hash.clone();
         thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
     }
     Ok(())
+}
+
+/// The event used for the one-time pf.5 migration note. It is the one kind of
+/// owner-less thread item that still nudges project-wide, so the notice
+/// actually reaches someone instead of hiding in `context`'s Unassigned area.
+pub const LEGACY_CHECKOUT_EVENT: &str = "checkout thread (legacy)";
+
+/// One-time note per still-live thread made with the removed `--kind
+/// checkout` placement: it keeps running in the repo's main checkout, and
+/// the note tells the coordinator how to replace it with a worktree thread.
+/// Deduped through `state.checkout_noted`, so it appears exactly once. The
+/// id enters the dedup set only AFTER the item is written: a failed write
+/// must not suppress the one-time notice forever.
+pub fn note_legacy_checkouts(project: &Project, state: &mut State) -> Result<()> {
+    // The in-memory set can lag the disk across the slow tick and a
+    // concurrent `thread restart`; an existing note for the same
+    // (thread, event) makes the dedup race-proof regardless of whose state
+    // copy saves last.
+    let existing: std::collections::BTreeSet<String> = inbox::unhandled(project)
+        .into_iter()
+        .filter(|i| i.event == LEGACY_CHECKOUT_EVENT)
+        .map(|i| i.subject)
+        .collect();
+    for t in thread::list(project) {
+        if t.kind != thread::Kind::Checkout || !matches!(t.status, Status::Open | Status::Starting | Status::Failed) {
+            continue;
+        }
+        if state.checkout_noted.contains(&t.id) || existing.contains(&t.id) {
+            // Learn an externally-written note so we never reconsider it.
+            state.checkout_noted.insert(t.id.clone());
+            continue;
+        }
+        let summary = format!(
+            "{}: this is a checkout thread made before pf.5: it runs in the repository's main checkout, a placement that was removed. Resolve it with `thread resolve {} {}` and start a new thread for the remaining work; repository tasks now always run in their own worktree",
+            thread_label(&t), project.slug, t.id
+        );
+        let result = inbox::write_thread(project, &t, "thread-state", LEGACY_CHECKOUT_EVENT, &summary, "");
+        if let Err(error) = result {
+            // Keep the id OUT of the set so a later tick/restart retries.
+            return Err(error);
+        }
+        state.checkout_noted.insert(t.id.clone());
+    }
+    Ok(())
+}
+
+/// Like [`note_legacy_checkouts`] for an on-demand path (`thread restart`):
+/// loads and saves the ticker state itself. No-op apart from the one note.
+pub fn note_one_legacy_checkout(project: &Project, record: &thread::Thread) -> Result<()> {
+    if record.kind != thread::Kind::Checkout {
+        return Ok(());
+    }
+    let mut state = load_state(project);
+    note_legacy_checkouts(project, &mut state)?;
+    save_state(project, &state)
 }
 
 /// A thread-state item's event, from the group it moved to.
@@ -314,32 +434,85 @@ fn hash_ids(ids: &BTreeSet<String>) -> String {
     thread::sha256_hex(ids.iter().cloned().collect::<Vec<_>>().join("\n").as_bytes())
 }
 
-/// Step 6. A given set of unseen items is announced once; there is no timed
-/// re-nudge. With `nudge = false` the user gets a herdr notification instead
-/// of a prompt in the coordinator; with no live coordinator the same.
-/// `coordinator_ready` is a coordinator idle long enough to be prompted (see
-/// `coordinator::nudge_target`). A prompt is typed only into an input box
-/// that has looked empty for `NUDGE_QUIET_SECS`, so it never merges with text
-/// someone is typing; until then the nudge waits for a later tick.
-pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&crate::coordinator::LivePane>, now: jiff::Timestamp) -> Result<()> {
-    let seen = inbox::seen(project);
-    let unseen: Vec<inbox::Item> = inbox::unhandled(project).into_iter().filter(|i| !seen.contains(&i.id)).collect();
-    let hash = hash_ids(&unseen.iter().map(|i| i.id.clone()).collect());
-    if unseen.is_empty() || hash == state.nudged {
-        forget_box(state);
-        return Ok(());
+/// Step 6. Items are routed per owner: a coordinator is nudged only about
+/// items of threads it owns; project-wide items (routines, outages, session
+/// notes) go to any ready coordinator once project-wide; owner-less thread
+/// items are never nudged (they sit in Unassigned until `thread assign`). A
+/// given set is announced once per routing key; there is no timed re-nudge.
+/// With `nudge = false`, or with no live coordinator, items wait for the
+/// next `context` turn instead. A prompt is typed only into an input box
+/// that has looked empty for `NUDGE_QUIET_SECS`, so it never merges with
+/// text someone is typing.
+pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinators: &[crate::coordinator::LivePane], primary_pane: &str, now: jiff::Timestamp) -> Result<()> {
+    let threads = thread::list(project);
+    let items = inbox::unhandled(project);
+    // Routing key -> the items waiting on it. Owner keys get that owner's
+    // thread items; the global key gets items about no thread.
+    let mut queues: BTreeMap<String, Vec<inbox::Item>> = BTreeMap::new();
+    for item in items {
+        if crate::thread::validate_id(&item.subject).is_ok() {
+            // An owner-less thread item is claimed manually, never nudged —
+            // except the one-time legacy-checkout migration note, which is
+            // project-wide by design (every real pre-pf.5 checkout thread is
+            // owner-less, so the notice would otherwise never leave
+            // `context`'s Unassigned area).
+            match inbox::effective_owner(&item, &threads) {
+                Some(owner) => queues.entry(owner).or_default().push(item),
+                None if item.event == LEGACY_CHECKOUT_EVENT => {
+                    queues.entry(GLOBAL_NUDGE.to_string()).or_default().push(item)
+                }
+                None => {}
+            }
+        } else {
+            queues.entry(GLOBAL_NUDGE.to_string()).or_default().push(item);
+        }
     }
-    // The user already got a specific notification per event; this step only
-    // wakes a coordinator. Without one (or with `nudge = false`) the items
-    // wait for its next turn.
-    let no_coordinator = crate::coordinator::live(project).is_empty();
-    if settings.nudge && !no_coordinator {
-        let Some(pane) = coordinator_ready else {
-            forget_box(state);
-            return Ok(()); // not idle long enough: try again on a later tick
+
+    if coordinators.is_empty() {
+        // Every pin dies with its coordinators; hashes still move forward
+        // below so nothing is replayed once one returns.
+        state.nudge_sessions.clear();
+    }
+    let global_seen = inbox::seen_union(project);
+
+    for (key, queued) in queues {
+        let seen: BTreeSet<String> = if key == GLOBAL_NUDGE {
+            global_seen.clone()
+        } else {
+            inbox::seen(project, Some(&key))
         };
-        if !box_quiet(state, herdr, pane, now)? {
-            return Ok(());
+        let unseen: Vec<inbox::Item> = queued.into_iter().filter(|i| !seen.contains(&i.id)).collect();
+        let hash = hash_ids(&unseen.iter().map(|i| i.id.clone()).collect());
+        if unseen.is_empty() {
+            state.boxes.remove(&key);
+            state.nudged.remove(&key);
+            continue;
+        }
+        if state.nudged.get(&key).is_some_and(|h| h == &hash) {
+            continue;
+        }
+        if !settings.nudge || coordinators.is_empty() {
+            // Notifications per event already happened; record the set so it
+            // is not dumped into a coordinator when nudging is re-enabled.
+            state.boxes.remove(&key);
+            state.nudged.insert(key, hash);
+            continue;
+        }
+        // Owner keys target exactly their name's pane; the global key keeps
+        // the old primary-preferred, sticky choice across all coordinators.
+        let candidates: Vec<crate::coordinator::LivePane> = if key == GLOBAL_NUDGE {
+            coordinators.to_vec()
+        } else {
+            coordinators.iter().filter(|p| p.name == key).cloned().collect()
+        };
+        let sticky = state.nudge_sessions.get(&key).cloned().unwrap_or_default();
+        let preferred = if key == GLOBAL_NUDGE { primary_pane } else { "" };
+        let Some(pane) = crate::coordinator::nudge_target(&candidates, now, preferred, &sticky) else {
+            state.boxes.remove(&key);
+            continue; // nobody idle long enough: try again on a later tick
+        };
+        if !box_quiet(state, herdr, &key, pane, now)? {
+            continue;
         }
         // `agent_blocked` and other errors are returned, logged by the caller,
         // and the nudge is retried on a later tick.
@@ -347,39 +520,31 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
         // Pin follow-up nudges to this agent session (an empty id — old herdr,
         // missing data — never overwrites a real pin).
         if !pane.agent_session.is_empty() {
-            state.nudge_session = pane.agent_session.clone();
+            state.nudge_sessions.insert(key.clone(), pane.agent_session.clone());
         }
+        state.boxes.remove(&key);
+        state.nudged.insert(key, hash);
     }
-    if no_coordinator {
-        // The pin dies with its coordinator.
-        state.nudge_session.clear();
-    }
-    state.nudged = hash;
-    forget_box(state);
     Ok(())
 }
 
-fn forget_box(state: &mut State) {
-    state.box_pane.clear();
-    state.box_empty_since.clear();
-}
-
-/// True once the pane's input box has been seen empty on this tick and on an
-/// earlier one at least `NUDGE_QUIET_SECS` before, with nothing typed seen in
-/// between. A box that holds text, or that the screen does not show, starts
-/// the wait over.
-fn box_quiet(state: &mut State, herdr: &Herdr, pane: &crate::coordinator::LivePane, now: jiff::Timestamp) -> Result<bool> {
+/// True once the pane's input box for this routing key has been seen empty on
+/// this tick and on an earlier one at least `NUDGE_QUIET_SECS` before, with
+/// nothing typed seen in between. A box that holds text, or that the screen
+/// does not show, starts the wait over.
+fn box_quiet(state: &mut State, herdr: &Herdr, key: &str, pane: &crate::coordinator::LivePane, now: jiff::Timestamp) -> Result<bool> {
     let screen = herdr.agent_screen(&pane.pane_id).map_err(|error| anyhow::anyhow!("{error}"))?;
     if crate::prompt_box::check(&pane.agent, &screen) != crate::prompt_box::Draft::Empty {
-        forget_box(state);
+        state.boxes.remove(key);
         return Ok(false);
     }
-    if state.box_pane != pane.pane_id || state.box_empty_since.is_empty() {
-        state.box_pane = pane.pane_id.clone();
-        state.box_empty_since = now.to_string();
+    let started_elsewhere = state.boxes.get(key).is_none_or(|w| w.pane != pane.pane_id || w.since.is_empty());
+    if started_elsewhere {
+        state.boxes.insert(key.to_string(), BoxWait { pane: pane.pane_id.clone(), since: now.to_string() });
         return Ok(false);
     }
-    Ok(thread::seconds_since(&state.box_empty_since, now) >= NUDGE_QUIET_SECS)
+    let since = state.boxes.get(key).map(|w| w.since.clone()).unwrap_or_default();
+    Ok(thread::seconds_since(&since, now) >= NUDGE_QUIET_SECS)
 }
 
 /// Step 2, every two minutes.
@@ -445,7 +610,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             Err(note) => {
                 if state.pr_line_noted.get(&t.id) != Some(&t.report_hash) {
                     state.pr_line_noted.insert(t.id.clone(), t.report_hash.clone());
-                    errors.extend(inbox::write(project, "pr", &t.id, "bad PR: line", &format!("{}: {note}", thread_label(&t)), "").err());
+                    errors.extend(inbox::write_thread(project, &t, "pr", "bad PR: line", &format!("{}: {note}", thread_label(&t)), "").err());
                 }
                 String::new()
             }
@@ -492,7 +657,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             Ok(pr::Checked::Ignored(reason)) => {
                 if state.pr_ignored.get(&t.id) != Some(&url) {
                     state.pr_ignored.insert(t.id.clone(), url.clone());
-                    errors.extend(inbox::write(project, "pr", &t.id, "PR ignored", &format!("{}: the pull request in its report is ignored: {reason}", thread_label(&t)), "").err());
+                    errors.extend(inbox::write_thread(project, &t, "pr", "PR ignored", &format!("{}: the pull request in its report is ignored: {reason}", thread_label(&t)), "").err());
                 }
             }
             Ok(pr::Checked::Summary(summary)) => {
@@ -511,7 +676,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
                     memory.gh_login = pr::own_login(ctx.runner, &t.origin);
                 }
                 let events = pr_events(old.as_ref(), &summary, memory.gh_login.as_deref());
-                errors.extend(inbox::write(project, "pr", &t.id, pr_event(&events, &summary), &format!("{}: pull request {change}", thread_label(&t)), "").err());
+                errors.extend(inbox::write_thread(project, &t, "pr", pr_event(&events, &summary), &format!("{}: pull request {change}", thread_label(&t)), "").err());
                 let number = url.rsplit('/').next().unwrap_or("");
                 if merged {
                     notifier.send(&t.id, &format!("PR #{number} merged"), crate::notify::Sound::Done, false);
@@ -643,7 +808,7 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str, me
     let complete = copied.outcome == CopyOutcome::Complete;
     let notes = threads::clean(ctx, project, &resolved, &threads::Clean { keep_worktree: false, copy_complete: complete, merged_head });
     let why = if reason == "auto" { "it was idle for `auto_resolve_days` and was resolved automatically; `thread resolve --reopen` undoes it".to_string() } else { format!("resolved ({reason})") };
-    inbox::write_origin(project, "thread-state", &t.id, "resolved", &format!("{}: {why}: {}", thread_label(t), notes.join("; ")), "", &t.origin_pane())?;
+    inbox::write_thread(project, &resolved, "thread-state", "resolved", &format!("{}: {why}: {}", thread_label(t), notes.join("; ")), "")?;
     Ok(true)
 }
 
@@ -764,6 +929,119 @@ mod tests {
 
     fn at(text: &str) -> jiff::Timestamp {
         text.parse().unwrap()
+    }
+
+    fn memory() -> Memory {
+        Memory { started: jiff::Timestamp::now(), gh: Outage::default(), gh_login: None, outage_secs: DEFAULT_OUTAGE_SECS, tick: 0, machines: BTreeMap::new(), grouping: Default::default() }
+    }
+
+    #[test]
+    fn every_project_is_due_in_the_tick_a_machine_is_polled() {
+        let mut memory = memory();
+        memory.tick = 1;
+        // Two projects with threads on the same machine, asked in turn in one tick.
+        assert!(memory.machine_is_due("mac"));
+        assert!(memory.machine_is_due("mac"), "the second project is polled too");
+        for tick in 2..=4 {
+            memory.tick = tick;
+            assert!(!memory.machine_is_due("mac"), "not again before the fourth tick after");
+        }
+        memory.tick = 5;
+        assert!(memory.machine_is_due("mac") && memory.machine_is_due("mac"));
+        // A failure in one project spares the others of the same tick, and the ticks after.
+        memory.record_machine("mac", Some("unreachable"), jiff::Timestamp::now());
+        assert!(!memory.machine_is_due("mac"));
+        memory.tick = 5 + SKIP_TICKS_AFTER_FAILURE;
+        assert!(!memory.machine_is_due("mac"));
+        memory.tick = 5 + SKIP_TICKS_AFTER_FAILURE + 1;
+        assert!(memory.machine_is_due("mac"));
+    }
+
+    #[test]
+    fn a_failed_legacy_note_write_does_not_poison_the_one_time_dedup() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let old = root.path().join("old-checkout");
+        std::fs::create_dir(&old).unwrap();
+        thread::allocate(&project, |t| {
+            t.kind = thread::Kind::Checkout;
+            t.status = thread::Status::Open;
+            t.title = "Legacy".into();
+            t.cwd = old.to_string_lossy().into_owned();
+        })
+        .unwrap();
+
+        let inbox = project.dir().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let mut perms = std::fs::metadata(&inbox).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o500); // readable, not writable
+        std::fs::set_permissions(&inbox, perms).unwrap();
+
+        let mut state = State::default();
+        let result = note_legacy_checkouts(&project, &mut state);
+        assert!(result.is_err(), "the write failure surfaces");
+        assert!(state.checkout_noted.is_empty(), "nothing is deduped before a successful write");
+
+        // Writable again: the note is delivered and only now deduped.
+        let mut perms = std::fs::metadata(&inbox).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&inbox, perms).unwrap();
+        note_legacy_checkouts(&project, &mut state).unwrap();
+        assert!(state.checkout_noted.contains("t-0001"));
+        assert_eq!(
+            inbox::unhandled(&project).iter().filter(|i| i.event == LEGACY_CHECKOUT_EVENT).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_pre_pf5_ticker_json_migrates_its_string_nudged_without_losing_other_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        // Exact pf.4 shape: `nudged` a single string (the global queue).
+        project::write_json(
+            &project.state_dir().join("ticker.json"),
+            &serde_json::json!({
+                "last_pr_check": "2026-10-25T08:00:00Z",
+                "prs": { "t-0001": {} },
+                "pr_ignored": { "t-0002": "https://x/y/3" },
+                "pr_line_noted": { "t-0003": "deadbeef" },
+                "routines": {},
+                "config_errors": ["cfg-hash-1"],
+                "nudged": "globalhash",
+                "box_pane": "w1:p1",
+                "box_empty_since": "2026-10-25T07:00:00Z",
+                "session_item_written": true,
+                "merged_seen": { "t-0004": "2026-10-25T06:00:00Z" }
+            }),
+        )
+        .unwrap();
+
+        let state = load_state(&project);
+        assert_eq!(state.nudged.get(GLOBAL_NUDGE).map(String::as_str), Some("globalhash"));
+        assert_eq!(state.nudged.len(), 1);
+        // The fields that silently resetting would re-fire PR notices and
+        // routines over must all survive the upgrade.
+        assert_eq!(state.last_pr_check, "2026-10-25T08:00:00Z");
+        assert!(state.prs.contains_key("t-0001"));
+        assert_eq!(state.pr_ignored.get("t-0002").map(String::as_str), Some("https://x/y/3"));
+        assert_eq!(state.pr_line_noted.get("t-0003").map(String::as_str), Some("deadbeef"));
+        assert!(state.config_errors.contains("cfg-hash-1"));
+        assert!(state.session_item_written);
+        assert_eq!(state.merged_seen.get("t-0004").map(String::as_str), Some("2026-10-25T06:00:00Z"));
+    }
+
+    #[test]
+    fn an_empty_legacy_nudged_string_and_corrupt_state_both_start_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let path = project.state_dir().join("ticker.json");
+        project::write_json(&path, &serde_json::json!({ "nudged": "" })).unwrap();
+        assert!(load_state(&project).nudged.is_empty());
+
+        std::fs::write(&path, "{ not json").unwrap();
+        assert_eq!(load_state(&project), State::default());
     }
 
     #[test]

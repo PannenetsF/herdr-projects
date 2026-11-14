@@ -161,7 +161,17 @@ pub fn render(project: &Project, rows: &[Row]) -> String {
                 "-".to_string()
             };
             let _ = writeln!(out, "  {}  {}  [{}]  {}", t.id, t.title, row.note, place);
-            if group == Group::WaitingOnYou && !t.pane_id.is_empty() && row.note != "pane closed" {
+            // An internal confirmation point still groups under Waiting on
+            // you, but it is not a pane the human must go to; a stalled one is.
+            let for_human = matches!(
+                row.audience,
+                Some(thread::Audience::Human | thread::Audience::Stalled)
+            );
+            if group == Group::WaitingOnYou
+                && for_human
+                && !t.pane_id.is_empty()
+                && row.note != "pane closed"
+            {
                 if t.machine.is_empty() {
                     let _ = writeln!(out, "          needs you in pane {}", t.pane_id);
                 } else {
@@ -222,12 +232,13 @@ pub fn unfocus(ctx: &Ctx, session: &crate::paths::SessionFlags) -> Result<()> {
 mod tests {
     use super::*;
     use crate::scenarios::World;
-    use crate::thread::{Kind, Thread};
+    use crate::thread::{Audience, Kind, Thread};
 
-    fn row(id: &str, group: Group, note: &str) -> Row {
+    fn row(id: &str, group: Group, audience: Option<Audience>, note: &str) -> Row {
         Row {
             thread: Thread { id: id.into(), title: format!("Title {id}"), pane_id: "w2:p1".into(), kind: Kind::Tab, ..Thread::default() },
             group,
+            audience,
             note: note.into(),
         }
     }
@@ -237,12 +248,28 @@ mod tests {
         let world = World::new();
         let project = world.project("demo", "a.sock");
         let rows = vec![
-            row("t-0001", Group::Resolved, "manual"),
-            row("t-0002", Group::Idle, "idle"),
-            row("t-0003", Group::Working, "working"),
-            row("t-0004", Group::WaitingOnYou, "blocked"),
-            row("t-0005", Group::ReadyForReview, "done"),
-            row("t-0006", Group::Landing, "idle"),
+            row("t-0001", Group::Resolved, None, "manual"),
+            row("t-0002", Group::Idle, None, "idle"),
+            row("t-0003", Group::Working, None, "working"),
+            row(
+                "t-0004",
+                Group::WaitingOnYou,
+                Some(Audience::Human),
+                "blocked",
+            ),
+            row(
+                "t-0005",
+                Group::ReadyForReview,
+                Some(Audience::Human),
+                "done",
+            ),
+            row("t-0006", Group::Landing, None, "idle"),
+            row(
+                "t-0007",
+                Group::WaitingOnYou,
+                Some(Audience::Internal),
+                "blocked",
+            ),
         ];
         let text = render(&project, &rows);
         let order: Vec<usize> = ["Waiting on you", "Ready for review", "Landing", "Working", "Idle", "Resolved"]
@@ -251,6 +278,23 @@ mod tests {
             .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{text}");
         assert!(text.contains("needs you in pane w2:p1"));
+        // The internal prompt stays in the Waiting-on-you section but gets no
+        // "needs you in pane" cue of its own (only one line in the text).
+        assert_eq!(text.matches("needs you in pane").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn stalled_waits_get_the_pane_cue_like_human_ones() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let rows = vec![row(
+            "t-0001",
+            Group::WaitingOnYou,
+            Some(Audience::Stalled),
+            "blocked",
+        )];
+        let text = render(&project, &rows);
+        assert!(text.contains("needs you in pane w2:p1"), "{text}");
     }
 
     #[test]

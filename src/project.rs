@@ -139,7 +139,6 @@ pub struct Settings {
     /// The profile a thread starts with when none is chosen.
     #[serde(alias = "thread_agent")]
     pub thread_profile: String,
-    pub max_parallel_threads: u32,
     pub auto_resolve_days: u32,
     pub nudge: bool,
     /// Silences every notification for the project except errors.
@@ -154,7 +153,6 @@ impl Default for Settings {
             goal: String::new(),
             coordinator_profile: "claude".into(),
             thread_profile: "claude".into(),
-            max_parallel_threads: 10,
             auto_resolve_days: 7,
             // On by default (W15): the ticker prompts only a coordinator that
             // has been idle for a minute and whose input box is empty, because on herdr 0.9.1 a prompt
@@ -209,6 +207,13 @@ struct ProjectState {
     /// branches (`hp/<slug>/...`) keep the name they were made with.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     former_slugs: Vec<String>,
+    /// The Space a repo-less thread's tab is opened in, so thread panes never
+    /// sit in the project's own workspace (whose pane/tab cycling is the
+    /// human's). Made on the first tab thread and reused after; empty until
+    /// then. Ids repeat after a server restart, so it is only trusted while
+    /// a listed pane of it works inside the project folder.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    threads_workspace: String,
 }
 
 /// The session and workspace the project belongs to, and the coordinator pane
@@ -249,6 +254,10 @@ pub struct Safety {
     /// Who answers trust screens in thread panes: `coordinator` or `user`.
     /// Unset, it follows yolo (on: the coordinator; off: the user).
     pub trust_screens: String,
+    /// On: an unnamed, proven agent pane in the project home registers itself
+    /// as a coordinator on its first owner-gated command, instead of being
+    /// refused. Thread panes, named agents and other projects stay refused.
+    pub auto_adopt: bool,
     /// The profiles threads may use; `None`: every profile.
     pub thread_profiles: Option<Vec<String>>,
     pub coordinator_profiles: Option<Vec<String>>,
@@ -263,6 +272,7 @@ impl Default for Safety {
             routine_commands: false,
             yolo: false,
             trust_screens: crate::trust_screen::USER.into(),
+            auto_adopt: false,
             thread_profiles: None,
             coordinator_profiles: None,
         }
@@ -295,6 +305,7 @@ pub struct SafetyLayer {
     pub routine_commands: Option<bool>,
     pub yolo: Option<bool>,
     pub trust_screens: Option<String>,
+    pub auto_adopt: Option<bool>,
     pub thread_profiles: Option<Vec<String>>,
     pub coordinator_profiles: Option<Vec<String>>,
 }
@@ -404,6 +415,25 @@ impl Project {
         std::iter::once(self.slug.clone()).chain(self.former_slugs()).map(|s| format!("hp/{s}/")).collect()
     }
 
+    /// The Space repo-less thread tabs are opened in (empty: not made yet).
+    pub fn threads_workspace(&self) -> String {
+        read_json::<ProjectState>(&self.state_dir().join("project.json"))
+            .unwrap_or_default()
+            .threads_workspace
+    }
+
+    /// Records the Space repo-less thread tabs belong in (empty to forget it,
+    /// e.g. when herdr no longer lists it).
+    pub fn set_threads_workspace(&self, workspace_id: &str) -> Result<()> {
+        let _lock = self.lock()?;
+        let path = self.state_dir().join("project.json");
+        let state = read_json::<ProjectState>(&path).unwrap_or_default();
+        if state.threads_workspace == workspace_id {
+            return Ok(());
+        }
+        write_json(&path, &ProjectState { threads_workspace: workspace_id.to_string(), ..state })
+    }
+
     pub fn coordinator(&self) -> Option<Coordinator> {
         read_json(&self.state_dir().join("coordinator.json"))
     }
@@ -449,6 +479,7 @@ pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Sa
         routine_commands: own.routine_commands.or(default.routine_commands).unwrap_or(base.routine_commands),
         trust_screens: own.trust_screens.or(default.trust_screens).unwrap_or_else(|| default_trust_screens(yolo).into()),
         yolo,
+        auto_adopt: own.auto_adopt.or(default.auto_adopt).unwrap_or(base.auto_adopt),
         thread_profiles: own.thread_profiles.or(default.thread_profiles),
         coordinator_profiles: own.coordinator_profiles.or(default.coordinator_profiles),
     })
@@ -564,7 +595,7 @@ pub fn agents_md(name: &str, slug: &str, prefix: &str) -> String {
          This folder is the home of the Herdr project \"{name}\" (`{slug}`). Written by herdr-projects; `doctor --fix` refreshes it.\n\n\
          Coordinator identity is REGISTERED, not inferred from this folder: a coordinator of {name} carries the Herdr agent name `{coordinator_name}` (or `{next_name}` for later ones). `open` sets that name; `{prefix} coordinator adopt {slug} --pane <id>` registers an already-running pane (`herdr agent list` shows names and pane ids). A session merely started in this folder is not a coordinator.\n\n\
          If your working directory is exactly this folder AND you carry a registered coordinator name (`{coordinator_name}` or `{next_name}`), you are the coordinator of {name}: run `{prefix} skill` now and follow what it prints, and run `{prefix} context {slug}` now and whenever you need project state.\n\n\
-         If your working directory is exactly this folder but you have NO registered coordinator name, you are NOT the coordinator: do not run `{prefix} context`, do not mark inbox items handled, and do not act as one. Tell the user you are unregistered and give them `{prefix} coordinator adopt {slug} --pane <your pane id>` to run in this pane.\n\n\
+         If your working directory is exactly this folder but you have NO registered coordinator name, run `{prefix} context {slug}` once before anything else. With the user's `auto_adopt` safety setting on, that command registers this pane itself and you are the coordinator from then on. If it instead refuses with \"... NOT a registered coordinator ...\", you are NOT the coordinator: do not act as one and do not mark inbox items handled; give the user the `{prefix} coordinator adopt {slug} --pane <this pane id>` line it prints, then wait.\n\n\
          If your working directory is under `threads/`, you are a thread: your brief is in your own folder (`.herdr-project/{slug}-<id>/brief.md`); ignore the rest of this file.\n"
     )
 }
@@ -583,6 +614,11 @@ pub fn prefix_in_agents_md(text: &str) -> Option<String> {
 /// Marker that the AGENTS.md predates registered coordinator names; doctor
 /// uses it to roll the new prose out even when the prefix is unchanged.
 pub const REGISTERED_COORDINATOR_MARKER: &str = "Coordinator identity is REGISTERED";
+
+/// Marker that the AGENTS.md predates the `auto_adopt`-aware paragraph, which
+/// tells an unregistered pane to try `context` once instead of refusing up
+/// front. Doctor uses it to refresh projects whose text is otherwise current.
+pub const AUTO_ADOPT_MARKER: &str = "With the user's `auto_adopt` safety setting on";
 
 pub const PR_FOLLOWUP: &str = "routines/pr-followup.md";
 
@@ -647,6 +683,9 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
         Ok(text) => {
             if !text.contains(REGISTERED_COORDINATOR_MARKER) {
                 problems.push("AGENTS.md predates registered coordinator names".into());
+            }
+            if !text.contains(AUTO_ADOPT_MARKER) {
+                problems.push("AGENTS.md predates auto_adopt-aware registration".into());
             }
             match prefix_in_agents_md(&text) {
                 None => problems.push("AGENTS.md does not name the binary".into()),
@@ -810,7 +849,6 @@ mod tests {
         assert_eq!(settings.name, "Demo");
         assert_eq!(settings.goal, "Ship \"it\"");
         assert_eq!(settings.coordinator_profile, "claude");
-        assert_eq!(settings.max_parallel_threads, 10);
         assert_eq!(settings.auto_resolve_days, 7);
         assert!(settings.nudge);
         assert!(project.dir().join(PR_FOLLOWUP).is_file());
@@ -837,6 +875,7 @@ mod tests {
         assert!(text.contains("you are the coordinator of Demo Project"));
         assert!(text.contains(&format!("`{prefix} skill`")));
         assert!(text.contains(&format!("`{prefix} context demo-project`")));
+        assert!(text.contains(AUTO_ADOPT_MARKER));
         assert!(text.contains("under `threads/`, you are a thread"));
         assert_eq!(prefix_in_agents_md(&text).as_deref(), Some(prefix.as_str()));
         assert_eq!(std::fs::read_link(project.dir().join("CLAUDE.md")).unwrap(), Path::new("AGENTS.md"));
@@ -850,6 +889,17 @@ mod tests {
         let problems = priming_problems(&project, &prefix);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("does not exist"));
+        write_priming(&project, &prefix).unwrap();
+        assert!(priming_problems(&project, &prefix).is_empty());
+
+        // AGENTS.md from before the auto_adopt-aware paragraph is reported even
+        // though the prefix and the registered-coordinator marker are current.
+        let old_prose = std::fs::read_to_string(project.dir().join("AGENTS.md"))
+            .unwrap()
+            .replace(AUTO_ADOPT_MARKER, "a sentence the old template never had");
+        std::fs::write(project.dir().join("AGENTS.md"), old_prose).unwrap();
+        let problems = priming_problems(&project, &prefix);
+        assert!(problems.iter().any(|p| p.contains("auto_adopt-aware")), "{problems:?}");
         write_priming(&project, &prefix).unwrap();
         assert!(priming_problems(&project, &prefix).is_empty());
 

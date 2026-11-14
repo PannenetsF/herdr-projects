@@ -11,12 +11,11 @@ use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
 
 /// The keys `set` accepts, with what they hold.
-pub const KEYS: [(&str, &str); 10] = [
+pub const KEYS: [(&str, &str); 9] = [
     ("name", "text"),
     ("goal", "text"),
     ("coordinator_profile", "profile name"),
     ("thread_profile", "profile name"),
-    ("max_parallel_threads", "number"),
     ("auto_resolve_days", "number (0 = never)"),
     ("nudge", "true/false"),
     ("mute", "true/false"),
@@ -89,11 +88,8 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
             doc.remove(&format!("{role}_agent"));
             doc[&format!("{role}_profile")] = toml_edit::value(value);
         }
-        "max_parallel_threads" | "auto_resolve_days" => {
+        "auto_resolve_days" => {
             let n: i64 = value.parse().ok().filter(|n: &i64| *n >= 0 && *n <= 1000).with_context(|| format!("`{value}` is not a number from 0 to 1000"))?;
-            if key == "max_parallel_threads" && n == 0 {
-                bail!("max_parallel_threads must be at least 1");
-            }
             doc[key] = toml_edit::value(n);
         }
         "nudge" | "mute" => doc[key] = toml_edit::value(parse_bool(value)?),
@@ -231,32 +227,21 @@ pub fn system_open(ctx: &Ctx, target: &str) -> Result<()> {
     Ok(())
 }
 
-/// `set`'s array form for tests and the popup: the current repos as text.
-pub fn repos_text(settings: &Settings) -> String {
-    if settings.repos.is_empty() {
-        return "(none)".into();
-    }
-    settings.repos.iter().map(|r| match &r.machine { Some(m) => format!("{}@{m}", r.path), None => r.path.clone() }).collect::<Vec<_>>().join(", ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const MD: &str = "+++\nname = \"Demo\" # the label\ngoal = \"\"\nmax_parallel_threads = 3\nnudge = false\n\n[[repos]]\npath = \"/srv/app\"\nmachine = \"box\"\n+++\n\n# Instructions\nBody with +++ inside\n";
+    const MD: &str = "+++\nname = \"Demo\" # the label\ngoal = \"\"\nnudge = false\n\n[[repos]]\npath = \"/srv/app\"\nmachine = \"box\"\n+++\n\n# Instructions\nBody with +++ inside\n";
 
     #[test]
     fn settings_are_edited_in_place_and_validated() {
-        let edited = set_in(MD, "max_parallel_threads", "5").unwrap();
-        assert!(edited.contains("max_parallel_threads = 5"));
+        let edited = set_in(MD, "goal", "Ship it").unwrap();
+        assert!(edited.contains("goal = \"Ship it\""));
         assert!(edited.contains("# the label"), "comments survive");
         assert!(edited.ends_with("\n# Instructions\nBody with +++ inside\n"));
-        let (settings, body) = project::parse_project_md(&edited).unwrap();
-        assert_eq!(settings.max_parallel_threads, 5);
+        let (_, body) = project::parse_project_md(&edited).unwrap();
         assert!(body.starts_with("# Instructions"));
 
-        assert!(set_in(MD, "max_parallel_threads", "0").is_err());
-        assert!(set_in(MD, "max_parallel_threads", "many").is_err());
         assert!(set_in(MD, "thread_profile", "not a name").is_err());
         // The old key is replaced by the new one, never duplicated.
         let old = set_in("+++\nthread_agent = \"claude\"\n+++\n", "thread_agent", "luna").unwrap();

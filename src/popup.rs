@@ -64,6 +64,10 @@ pub struct ThreadRow {
     pub socket: String,
     pub thread: Thread,
     pub group: Group,
+    /// Whether the group's current wait is for the human: a needs-you group
+    /// with audience human or stalled. An internal prompt is listed but never
+    /// reddened or counted.
+    pub human: bool,
     pub next: Vec<String>,
     pub pr_facts: String,
 }
@@ -157,7 +161,7 @@ pub fn picker_rows(root: &Path) -> Vec<PickerRow> {
     let mut rows = vec![PickerRow { slug: None, name: "All projects".into(), status: summary(root) }];
     for project in projects_in_scope(root, None, false) {
         let name = project.read_project_md().map(|(s, _)| project::display_name(&s.name, &project.slug)).unwrap_or_else(|_| project.slug.clone());
-        let status = crate::sidebar::project_line(&crate::sidebar::recorded_groups(&project), project.status() == Status::Paused);
+        let status = crate::sidebar::project_line(&crate::sidebar::recorded_state(&project), project.status() == Status::Paused);
         rows.push(PickerRow { slug: Some(project.slug.clone()), name, status });
     }
     rows
@@ -251,12 +255,16 @@ pub fn thread_rows(root: &Path, scope: Option<&str>) -> Vec<ThreadRow> {
         let state = crate::steps::load_state(&project);
         for t in thread::list(&project) {
             let group = if t.status == thread::Status::Resolved { Group::Resolved } else { Group::from_token(&t.last_group).unwrap_or(Group::Working) };
+            // An empty audience (older record) counts as human, like the badge.
+            let human = crate::sidebar::needs_you(group)
+                && t.audience != crate::thread::Audience::Internal.token();
             rows.push(ThreadRow {
                 slug: project.slug.clone(),
                 socket: socket.clone(),
                 next: thread::all_next(&project, &t.id),
                 pr_facts: pr_facts(&t, state.prs.get(&t.id)),
                 group,
+                human,
                 thread: t,
             });
         }
@@ -264,9 +272,11 @@ pub fn thread_rows(root: &Path, scope: Option<&str>) -> Vec<ThreadRow> {
     rows
 }
 
-fn group_color(group: Group) -> Option<Color> {
+fn group_color(group: Group, human: bool) -> Option<Color> {
     match group {
-        Group::WaitingOnYou => Some(Color::Red),
+        // An internal permission prompt waits but is not the human's cue:
+        // it stays in the list uncolored; a stalled wait is red again.
+        Group::WaitingOnYou if human => Some(Color::Red),
         Group::ReadyForReview => Some(Color::Yellow),
         Group::Landing => Some(Color::Green),
         Group::Resolved => Some(Color::DarkGrey),
@@ -330,10 +340,10 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
                     if mine.is_empty() {
                         continue;
                     }
-                    let groups: Vec<Group> = mine.iter().map(|r| r.group).collect();
+                    let groups: Vec<(Group, bool)> = mine.iter().map(|r| (r.group, r.human)).collect();
                     rows.push(header(format!("{slug} · {}", crate::sidebar::project_line(&groups, false))));
                     for r in mine {
-                        rows.push(Row { header: false, text: format!("  {}", thread_line(r, false)), color: group_color(r.group), kind: RowKind::Thread(Box::new(r.clone())) });
+                        rows.push(Row { header: false, text: format!("  {}", thread_line(r, false)), color: group_color(r.group, r.human), kind: RowKind::Thread(Box::new(r.clone())) });
                     }
                 }
             } else {
@@ -344,7 +354,7 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
                     }
                     rows.push(header(format!("{} ({})", group.label(), mine.len())));
                     for r in mine {
-                        rows.push(Row { header: false, text: format!("  {}", thread_line(r, false)), color: group_color(r.group), kind: RowKind::Thread(Box::new(r.clone())) });
+                        rows.push(Row { header: false, text: format!("  {}", thread_line(r, false)), color: group_color(r.group, r.human), kind: RowKind::Thread(Box::new(r.clone())) });
                     }
                 }
             }
@@ -436,20 +446,31 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
                         ("thread_profile", s.thread_profile.clone()),
                         ("coordinator_profiles", allowed_text(ctx, Some(&project), Role::Coordinator)),
                         ("thread_profiles", allowed_text(ctx, Some(&project), Role::Thread)),
-                        ("max_parallel_threads", s.max_parallel_threads.to_string()),
                         ("auto_resolve_days", s.auto_resolve_days.to_string()),
                         ("nudge", s.nudge.to_string()),
                         ("mute", s.mute.to_string()),
-                        ("repos.add", crate::settings::repos_text(&s)),
-                        ("repos.remove", crate::settings::repos_text(&s)),
                     ];
                     for (key, value) in values {
-                        let label = match key {
-                            "repos.add" => "repos (↵ add)".to_string(),
-                            "repos.remove" => "repos (↵ remove)".to_string(),
-                            k => k.to_string(),
-                        };
+                        let label = key;
                         rows.push(Row { header: false, text: format!("  {label:<22} {value}"), color: None, kind: RowKind::Setting { slug: slug.to_string(), key: key.to_string(), value } });
+                    }
+                    rows.push(header(format!("repositories ({}) · one repository per row", s.repos.len())));
+                    rows.push(Row {
+                        header: false, text: "  + Add repository (Enter)".into(), color: None,
+                        kind: RowKind::Setting { slug: slug.to_string(), key: "repos.add".into(), value: String::new() },
+                    });
+                    if s.repos.is_empty() {
+                        rows.push(header("  No repositories yet"));
+                    }
+                    for repo in &s.repos {
+                        let value = match &repo.machine {
+                            Some(machine) => format!("{}@{machine}", repo.path),
+                            None => repo.path.clone(),
+                        };
+                        rows.push(Row {
+                            header: false, text: format!("  - {value}  (Enter to remove)"), color: None,
+                            kind: RowKind::Setting { slug: slug.to_string(), key: "repos.remove".into(), value },
+                        });
                     }
                 }
             }
@@ -564,7 +585,7 @@ impl OrDefault for Result<(project::Settings, String)> {
 /// The header summary: `3 projects · 2 need you`.
 pub fn summary(root: &Path) -> String {
     let projects = projects_in_scope(root, None, false);
-    let need: usize = projects.iter().map(|p| crate::sidebar::recorded_groups(p).into_iter().filter(|g| crate::sidebar::needs_you(*g)).count()).sum();
+    let need: usize = projects.iter().map(|p| crate::sidebar::recorded_state(p).into_iter().filter(|(g, human)| crate::sidebar::needs_you(*g) && *human).count()).sum();
     format!("{} project{} · {need} need you", projects.len(), if projects.len() == 1 { "" } else { "s" })
 }
 
@@ -1171,8 +1192,8 @@ impl<'a> Popup<'a> {
                         Mode::Pick { label: format!("{name} (default: use the all-projects value)"), options, selected: 0, action }
                     };
                     self.mode = match name.as_str() {
-                        "yolo" | "routine_commands" if value == "on" => pick(&["off", "on"]),
-                        "yolo" | "routine_commands" => pick(&["on", "off"]),
+                        "yolo" | "routine_commands" | "auto_adopt" if value == "on" => pick(&["off", "on"]),
+                        "yolo" | "routine_commands" | "auto_adopt" => pick(&["on", "off"]),
                         "start_threads" if value == "auto" => pick(&["propose", "auto"]),
                         "start_threads" => pick(&["auto", "propose"]),
                         "trust_screens" if value == "coordinator" => pick(&["user", "coordinator"]),
@@ -1208,14 +1229,11 @@ impl<'a> Popup<'a> {
                             Mode::Pick { label: name.clone(), options: vec![(value != "true").to_string(), value.clone()], selected: 0, action }
                         }
                         "repos.remove" => {
-                            let options: Vec<String> = value.split(", ").filter(|s| *s != "(none)").map(str::to_string).collect();
-                            if options.is_empty() {
-                                self.message = "no repos to remove".into();
-                                Mode::List
-                            } else {
-                                let mut action = action;
-                                action.push("{}".into());
-                                Mode::Pick { label: "remove repo".into(), options, selected: 0, action }
+                            let mut action = action;
+                            action.push(value.clone());
+                            Mode::Confirm {
+                                question: "Remove this repository from the project? Files are kept. y/N".into(),
+                                action, lines: vec![value],
                             }
                         }
                         "repos.add" => Mode::Edit { label: "add repo (PATH or PATH@MACHINE)".into(), buffer: String::new(), action },
@@ -1586,6 +1604,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repository_rows_are_individual_exact_values_and_removal_requires_confirmation() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let path = "/srv/repo, with spaces";
+        let text = std::fs::read_to_string(project.project_md()).unwrap();
+        let text = crate::settings::set_in(&text, "repos.add", path).unwrap();
+        let text = crate::settings::set_in(&text, "repos.add", "/srv/remote@boe-fyq").unwrap();
+        std::fs::write(project.project_md(), &text).unwrap();
+        let ctx = world.ctx();
+        let mut popup = Popup::new(&ctx, Some("demo".into()), String::new());
+        popup.section = SECTIONS.iter().position(|s| *s == Section::Settings).unwrap();
+        popup.reload();
+        let repos: Vec<_> = popup.rows.iter().filter_map(|r| match &r.kind {
+            RowKind::Setting { key, value, .. } if key == "repos.remove" => Some(value.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(repos, vec![path, "/srv/remote@boe-fyq"]);
+        assert!(popup.rows.iter().any(|r| r.text.contains("repositories (2)")));
+        popup.selected = popup.rows.iter().position(|r| matches!(&r.kind, RowKind::Setting { key, value, .. } if key == "repos.remove" && value == path)).unwrap();
+        popup.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(&popup.mode, Mode::Confirm { action, lines, .. }
+            if action == &["set", "demo", "repos.remove", path] && lines == &[path]));
+        assert_eq!(std::fs::read_to_string(project.project_md()).unwrap(), text, "Enter alone cannot remove a repo");
+        popup.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(std::fs::read_to_string(project.project_md()).unwrap(), text);
+        popup.selected = popup.rows.iter().position(|r| matches!(&r.kind, RowKind::Setting { key, .. } if key == "repos.add")).unwrap();
+        popup.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(&popup.mode, Mode::Edit { buffer, action, .. } if buffer.is_empty() && action == &["set", "demo", "repos.add"]));
+        let remaining = crate::settings::set_in(&text, "repos.remove", "/srv/remote@boe-fyq").unwrap();
+        let (settings, _) = project::parse_project_md(&remaining).unwrap();
+        assert_eq!(settings.repos.len(), 1);
+        assert_eq!(settings.repos[0].path, path);
+    }
+
+    #[test]
+    fn empty_repository_list_still_has_one_add_action() {
+        let world = crate::scenarios::World::new();
+        world.project("demo", "a.sock");
+        let rows = build(&world.ctx(), Section::Settings, Some("demo"));
+        assert!(rows.iter().any(|r| r.text == "  No repositories yet"));
+        assert_eq!(rows.iter().filter(|r| matches!(&r.kind, RowKind::Setting { key, .. } if key == "repos.add")).count(), 1);
+        assert!(!rows.iter().any(|r| matches!(&r.kind, RowKind::Setting { key, .. } if key == "repos.remove")));
+    }
+
+    #[test]
     fn tasks_parse_with_lists_owners_and_threads() {
         let text = "# Tasks\n\n## Backlog\n- [ ] Write the docs (me)\n- [ ] Fix login (codex-fast@m1) · t-0007\n- [ ] Plain line\n\n## Later\n- [x] Old (agent)\n";
         let tasks = parse_tasks("demo", text);
@@ -1630,7 +1693,7 @@ mod tests {
         let all = build(&world.ctx(), Section::Threads, None);
         assert!(all[0].text.starts_with("demo · 1 need you · 1 working"), "{:?}", all[0].text);
         let settings = build(&world.ctx(), Section::Settings, Some("demo"));
-        assert!(settings.iter().any(|r| r.text.contains("max_parallel_threads")));
+        assert!(settings.iter().any(|r| r.text.contains("auto_resolve_days")));
         assert!(!build(&world.ctx(), Section::Tasks, Some("demo")).is_empty());
         std::fs::write(project.dir().join("TASKS.md"), "# Tasks\n\n## Backlog\n- [ ] Fix login (claude) · t-0003\n  Safari drops the cookie.\n  See issue 42.\n- [ ] Docs (me)\n").unwrap();
         let tasks = build(&world.ctx(), Section::Tasks, Some("demo"));

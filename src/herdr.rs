@@ -8,7 +8,8 @@ use serde::Deserialize;
 
 use crate::runner::{Cmd, Runner};
 
-pub const MIN_VERSION: Version = Version(0, 9, 1);
+/// 0.9.5 is required for `pane process-info`, the process-fact identity probe.
+pub const MIN_VERSION: Version = Version(0, 9, 5);
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -76,7 +77,44 @@ pub struct Herdr<'a> {
     /// A saved SSH machine: every call is forwarded as `herdr --machine M ...`.
     machine: Option<String>,
     runner: &'a dyn Runner,
+    /// Identity checks only: the binary is already an absolute, vetted path
+    /// and the child environment is scrubbed of interposition/override vars.
+    identity: bool,
 }
+
+/// Variables an agent could use to interpose on, or redirect, the herdr
+/// client that proves its identity. `DYLD_*` is refused by Apple-platform
+/// binaries but applies to the Homebrew herdr; `LD_*` matters on remote
+/// Linux; `BASH_ENV`/`ENV` can hijack the `/bin/sh` home probe.
+pub(crate) const IDENTITY_ENV_SCRUB: &[&str] = &[
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    // "_debug" variant library selection: DYLD_IMAGE_SUFFIX=_interposing
+    // loads attacker-controlled sibling dylibs.
+    "DYLD_IMAGE_SUFFIX",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_ORIGIN_PATH",
+    "LD_PROFILE",
+    // glibc 2.33+ tunables can redirect IFUNC resolution and (per distro)
+    // load modules; env-independent /etc/ld.so.preload remains uncloseable.
+    "__GLIBC_TUNABLES",
+    "BASH_ENV",
+    "ENV",
+    "HERDR_BIN_PATH",
+    // Older/alternate herdr client var that also redirects the socket.
+    "HERDR_CLIENT_SOCKET_PATH",
+    // Config redirect: can point the client at another server's settings.
+    "HERDR_CONFIG_PATH",
+    // The XDG location herdr resolves its socket/config from when no socket
+    // is pinned; identity pins the socket but must not inherit a foreign
+    // config tree either.
+    "XDG_CONFIG_HOME",
+];
 
 impl<'a> Herdr<'a> {
     pub fn new(bin: impl Into<String>, socket: impl Into<PathBuf>, runner: &'a dyn Runner) -> Self {
@@ -85,7 +123,15 @@ impl<'a> Herdr<'a> {
             socket: socket.into(),
             machine: None,
             runner,
+            identity: false,
         }
+    }
+
+    /// The hardened constructor for caller-identity queries: `bin` must be an
+    /// absolute, registry-trusted path; the child never inherits an
+    /// interposable loader, a shell-init hook or `HERDR_BIN_PATH`.
+    pub fn for_identity(bin: impl Into<String>, socket: impl Into<PathBuf>, runner: &'a dyn Runner) -> Self {
+        Herdr { identity: true, ..Herdr::new(bin, socket, runner) }
     }
 
     /// The same session, with calls forwarded to a saved machine.
@@ -95,15 +141,26 @@ impl<'a> Herdr<'a> {
             socket: self.socket.clone(),
             machine: (!machine.is_empty()).then(|| machine.to_string()),
             runner: self.runner,
+            identity: self.identity,
         }
     }
 
-    /// `HERDR_SESSION` is removed so an inherited value can never compete with
-    /// the socket this project recorded.
+    /// Every call is pinned to the session this object was built for. We set
+    /// the socket explicitly rather than trusting an inherited
+    /// `HERDR_SOCKET_PATH` — identity checks must talk to a trusted session,
+    /// not one an agent redirected via its environment — and `HERDR_SESSION`
+    /// is removed for the same reason.
     pub fn cmd(&self, timeout: Duration) -> Cmd {
-        let cmd = Cmd::new(&self.bin, timeout)
-            .env("HERDR_SOCKET_PATH", self.socket.to_string_lossy())
-            .env_remove("HERDR_SESSION");
+        let mut cmd = Cmd::new(&self.bin, timeout);
+        if !self.socket.as_os_str().is_empty() {
+            cmd = cmd.env("HERDR_SOCKET_PATH", self.socket.to_string_lossy());
+        }
+        let mut cmd = cmd.env_remove("HERDR_SESSION");
+        if self.identity {
+            for var in IDENTITY_ENV_SCRUB {
+                cmd = cmd.env_remove(*var);
+            }
+        }
         match &self.machine {
             Some(machine) => cmd.args(["--machine", machine]),
             None => cmd,
@@ -140,12 +197,33 @@ impl std::fmt::Display for HerdrError {
 impl std::error::Error for HerdrError {}
 
 pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
+/// A new pane's shell can refuse a start until its prompt is ready. Three
+/// retries with roughly fourteen seconds of backoff match the upstream bound.
+pub const AGENT_START_RETRIES: usize = 3;
+const AGENT_START_BACKOFF: [Duration; AGENT_START_RETRIES] = [
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
 /// How long `agent_prompt_confirmed` lets herdr wait for the agent to start.
 pub const PROMPT_WAIT: Duration = Duration::from_secs(8);
 
 /// herdr refused the prompt before typing anything.
 pub fn refused_before_typing(error: &HerdrError) -> bool {
     matches!(error.code.as_str(), "agent_blocked" | "pane_not_found" | "unreachable")
+}
+
+/// The explicit ways herdr 0.9.5 says a new pane's shell is not ready for an
+/// agent start. Other argument, integration, timeout and startup failures are
+/// permanent for this call and must not be retried.
+fn shell_start_retryable(error: &HerdrError) -> bool {
+    error.message.contains("canonical mode") || no_shell_yet(error)
+}
+
+/// Herdr cannot see a shell in the pane yet. This can also mean an agent is
+/// already there, so the first refusal is checked against `agent list`.
+fn no_shell_yet(error: &HerdrError) -> bool {
+    error.code == "agent_pane_busy" || error.message.contains("not an available shell")
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -221,6 +299,12 @@ pub struct Agent {
     pub state_change_seq: u64,
     #[serde(default)]
     pub agent_session: Option<AgentSession>,
+    /// Herdr saw the agent's composer open for input. Codex can rest at
+    /// `agent_status: "unknown"` with this set. It does not show that the box
+    /// is on screen or empty: the trust-screen and empty-box checks still
+    /// gate typing.
+    #[serde(default)]
+    pub interactive_ready: bool,
 }
 
 impl Agent {
@@ -229,15 +313,33 @@ impl Agent {
         ready_state(&self.agent_status)
     }
 
-    /// True when the agent works in `dir`: its shell's directory, or its own
-    /// when it runs as a child of `open` in a shell elsewhere.
+    /// Ready for a first brief: `ready`, or `unknown` while Herdr reports the
+    /// composer open, but only for a `kind` whose input box this binary can
+    /// read: the brief checks that box is empty before typing, and an
+    /// unreadable box would be typed into unchecked.
+    pub fn ready_for_brief(&self, kind: &str) -> bool {
+        self.ready() || (self.agent_status == "unknown" && self.interactive_ready && crate::prompt_box::knows(kind))
+    }
+
+    /// True when the agent works in `dir`, judged by [`own_dir`].
     pub fn works_in(&self, dir: &str) -> bool {
-        !dir.is_empty() && (self.cwd == dir || self.foreground_cwd == dir)
+        !dir.is_empty() && own_dir(&self.cwd, &self.foreground_cwd) == dir
     }
 
     pub fn session_id(&self) -> &str {
         self.agent_session.as_ref().map(|s| s.value.as_str()).unwrap_or("")
     }
+}
+
+/// The directory a pane's agent works in: its foreground process's when Herdr
+/// reports one, else the shell's. `open` runs a coordinator as a child in a
+/// shell pane elsewhere, so the shell's directory may be another project's
+/// home: deciding by either would make the pane a coordinator of both (#97).
+/// The foreground directory is the group leader's and stays put while the
+/// agent runs a tool in another folder (checked with Claude Code 2.1.300 and
+/// Codex 0.162.1 on Herdr 0.9.3).
+pub fn own_dir<'a>(cwd: &'a str, foreground_cwd: &'a str) -> &'a str {
+    if foreground_cwd.is_empty() { cwd } else { foreground_cwd }
 }
 
 pub fn ready_state(state: &str) -> bool {
@@ -308,6 +410,17 @@ impl<'a> Herdr<'a> {
 
     pub fn agent_list(&self) -> Result<Vec<Agent>, HerdrError> {
         self.call_as(&["agent", "list"], "agents")
+    }
+
+    /// Like `agent_list` but bounded by the identity loop's deadline: a
+    /// session that answers process-info yet stalls on agent list must not
+    /// pin a caller-identity command for the full `CALL_TIMEOUT`.
+    pub fn agent_list_within(&self, timeout: Duration) -> Result<Vec<Agent>, HerdrError> {
+        let result = self.call(&["agent", "list"], timeout)?;
+        serde_json::from_value(result["agents"].clone()).map_err(|e| HerdrError {
+            code: "failed".into(),
+            message: format!("`herdr agent list` reply changed: {e}"),
+        })
     }
 
     pub fn workspace_list(&self) -> Result<Vec<Workspace>, HerdrError> {
@@ -424,21 +537,60 @@ impl<'a> Herdr<'a> {
         Ok(result["pane"]["cwd"].as_str().unwrap_or_default().to_string())
     }
 
-    /// Starts an agent in a pane that is at a shell prompt. Success means herdr
-    /// detected the agent and it is ready for input.
+    /// Starts an agent in a pane whose shell may still be reaching its first
+    /// prompt. Only Herdr's explicit shell-startup refusals are retried. Before
+    /// every retry, list the pane again: an agent that appeared despite the
+    /// error is returned, never started a second time.
     pub fn agent_start(&self, name: &str, kind: &str, pane: &str, agent_args: &[String]) -> Result<Agent, HerdrError> {
-        let timeout_ms = AGENT_START_TIMEOUT.as_millis().to_string();
-        let mut args = vec!["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", &timeout_ms];
-        if !agent_args.is_empty() {
-            args.push("--");
-            args.extend(agent_args.iter().map(String::as_str));
+        self.agent_start_with_wait(name, kind, pane, agent_args, std::thread::sleep)
+    }
+
+    fn agent_start_with_wait(&self, name: &str, kind: &str, pane: &str, agent_args: &[String], mut wait: impl FnMut(Duration)) -> Result<Agent, HerdrError> {
+        let start = || {
+            let timeout_ms = AGENT_START_TIMEOUT.as_millis().to_string();
+            let mut args = vec!["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", &timeout_ms];
+            if !agent_args.is_empty() {
+                args.push("--");
+                args.extend(agent_args.iter().map(String::as_str));
+            }
+            // herdr enforces the timeout itself; the outer deadline only guards a hang.
+            let result = self.call(&args, AGENT_START_TIMEOUT + Duration::from_secs(5))?;
+            serde_json::from_value(result["agent"].clone()).map_err(|e| HerdrError {
+                code: "failed".into(),
+                message: format!("`herdr agent start` reply changed: {e}"),
+            })
+        };
+        let mut retries = 0;
+        loop {
+            let error = match start() {
+                Ok(agent) => return Ok(agent),
+                Err(error) => error,
+            };
+            if !shell_start_retryable(&error) {
+                return Err(error);
+            }
+            if retries == AGENT_START_RETRIES {
+                return Err(HerdrError {
+                    code: error.code,
+                    message: format!("{} (tried {} times)", error.message.trim_end_matches('.'), retries + 1),
+                });
+            }
+            // `agent_pane_busy` also describes a pane that already has an
+            // agent. That is not a startup race: preserve the refusal rather
+            // than adopting somebody else's agent or retrying for 14 seconds.
+            if retries == 0 && no_shell_yet(&error) && self.agent_in_pane(pane)?.is_some() {
+                return Err(error);
+            }
+            wait(AGENT_START_BACKOFF[retries]);
+            retries += 1;
+            if let Some(agent) = self.agent_in_pane(pane)? {
+                return Ok(agent);
+            }
         }
-        // herdr enforces the timeout itself; the outer deadline only guards a hang.
-        let result = self.call(&args, AGENT_START_TIMEOUT + Duration::from_secs(5))?;
-        serde_json::from_value(result["agent"].clone()).map_err(|e| HerdrError {
-            code: "failed".into(),
-            message: format!("`herdr agent start` reply changed: {e}"),
-        })
+    }
+
+    fn agent_in_pane(&self, pane: &str) -> Result<Option<Agent>, HerdrError> {
+        Ok(self.agent_list()?.into_iter().find(|agent| agent.pane_id == pane))
     }
 
     /// Submits a prompt. herdr's parser takes positionals first and options
@@ -570,6 +722,10 @@ impl<'a> Herdr<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::Output;
+    use crate::runner::fake::{FakeRunner, fail, ok};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     #[test]
     fn parses_versions() {
@@ -579,5 +735,104 @@ mod tests {
         assert_eq!(parse_version("herdr"), None);
         assert!(Version(0, 9, 0) < MIN_VERSION);
         assert!(Version(0, 10, 0) > MIN_VERSION);
+    }
+
+    fn start_failure(code: &str, message: &str) -> Output {
+        fail(1, &serde_json::json!({"error": {"code": code, "message": message}}).to_string())
+    }
+
+    fn agent_object(pane: &str, name: &str) -> String {
+        format!(r#"{{"pane_id":"{pane}","tab_id":"w1:t1","workspace_id":"w1","name":"{name}","agent":"claude","agent_status":"idle"}}"#)
+    }
+
+    fn start_success(pane: &str, name: &str) -> Output {
+        ok(&format!(r#"{{"result":{{"agent":{}}}}}"#, agent_object(pane, name)))
+    }
+
+    #[test]
+    fn a_shell_startup_refusal_is_retried_once_then_succeeds() {
+        let cases = [
+            ("invalid_input", "input contains a 1200-byte line but the terminal is in canonical mode with a 1024-byte limit; wait for the shell prompt and retry"),
+            ("agent_pane_busy", "agent target pane w1:p1 is not an available shell"),
+        ];
+        for (code, message) in cases {
+            let runner = FakeRunner::new();
+            let attempts = Rc::new(Cell::new(0));
+            let answer_attempts = attempts.clone();
+            runner.on_fn(
+                |cmd| cmd.display().contains("agent start"),
+                move |_| {
+                    answer_attempts.set(answer_attempts.get() + 1);
+                    if answer_attempts.get() == 1 { Ok(start_failure(code, message)) } else { Ok(start_success("w1:p1", "hp-demo-t-0001")) }
+                },
+            );
+            runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+            let waits = Cell::new(0);
+            let agent = Herdr::new("herdr", "", &runner)
+                .agent_start_with_wait("hp-demo-t-0001", "claude", "w1:p1", &[], |_| waits.set(waits.get() + 1))
+                .unwrap();
+            assert_eq!(agent.name, "hp-demo-t-0001", "{code}");
+            assert_eq!((attempts.get(), waits.get()), (2, 1), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_shell_that_never_becomes_ready_has_a_bounded_number_of_starts() {
+        let runner = FakeRunner::new();
+        runner.on("agent start", start_failure("agent_pane_busy", "agent target pane w1:p1 is not an available shell"));
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        let waits = Cell::new(0);
+        let error = Herdr::new("herdr", "", &runner)
+            .agent_start_with_wait("hp-demo-t-0001", "claude", "w1:p1", &[], |_| waits.set(waits.get() + 1))
+            .unwrap_err();
+        assert_eq!(runner.count("agent start"), AGENT_START_RETRIES + 1);
+        assert_eq!(waits.get(), AGENT_START_RETRIES);
+        assert_eq!(error.code, "agent_pane_busy");
+        assert!(error.message.contains("tried 4 times"), "{}", error.message);
+    }
+
+    #[test]
+    fn an_agent_already_in_the_pane_is_not_started_again() {
+        let runner = FakeRunner::new();
+        runner.on("agent start", start_failure("agent_pane_busy", "agent target pane w1:p1 is not an available shell"));
+        runner.on("agent list", ok(&format!(r#"{{"result":{{"agents":[{}]}}}}"#, agent_object("w1:p1", "existing"))));
+        let waits = Cell::new(0);
+        let error = Herdr::new("herdr", "", &runner)
+            .agent_start_with_wait("hp-demo-t-0001", "claude", "w1:p1", &[], |_| waits.set(waits.get() + 1))
+            .unwrap_err();
+        assert_eq!(error.code, "agent_pane_busy");
+        assert_eq!((runner.count("agent start"), waits.get()), (1, 0));
+    }
+
+    #[test]
+    fn an_agent_appearing_before_a_retry_is_returned_not_duplicated() {
+        let runner = FakeRunner::new();
+        runner.on("agent start", start_failure("invalid_input", "the terminal is in canonical mode with a 1024-byte limit"));
+        let listed = Rc::new(RefCell::new(String::from("[]")));
+        let answer = listed.clone();
+        runner.on_fn(
+            |cmd| cmd.display().contains("agent list"),
+            move |_| Ok(ok(&format!(r#"{{"result":{{"agents":{}}}}}"#, answer.borrow()))),
+        );
+        let appeared = listed.clone();
+        let agent = Herdr::new("herdr", "", &runner)
+            .agent_start_with_wait("hp-demo-t-0001", "claude", "w1:p1", &[], |_| {
+                *appeared.borrow_mut() = format!("[{}]", agent_object("w1:p1", "appeared"));
+            })
+            .unwrap();
+        assert_eq!(agent.name, "appeared");
+        assert_eq!(runner.count("agent start"), 1);
+    }
+
+    #[test]
+    fn other_start_errors_are_not_retried() {
+        let runner = FakeRunner::new();
+        runner.on("agent start", start_failure("invalid_input", "unknown flag --bogus"));
+        let waits = Cell::new(0);
+        let error = Herdr::new("herdr", "", &runner)
+            .agent_start_with_wait("hp-demo-t-0001", "claude", "w1:p1", &[], |_| waits.set(waits.get() + 1))
+            .unwrap_err();
+        assert_eq!(error.message, "unknown flag --bogus");
+        assert_eq!((runner.count("agent start"), waits.get()), (1, 0));
     }
 }

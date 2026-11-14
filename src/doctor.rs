@@ -309,16 +309,21 @@ fn report(
                 // Agents merely sitting in the project folder are strangers:
                 // list them with the exact registration command, but never
                 // act on them (--fix does not rename anything here).
+                let auto_adopt = project.safety(config_dir).is_ok_and(|s| s.auto_adopt);
                 let strangers: Vec<String> = agents
                     .iter()
                     .filter(|a| a.works_in(&dir) && !crate::names::is_coordinator_name(slug, &a.name))
                     .map(|a| {
+                        let tail = if auto_adopt {
+                            "with auto_adopt on, its first owner-gated command (e.g. `context`) registers it itself".to_string()
+                        } else {
+                            format!("register with `{prefix} coordinator adopt {slug} --pane {}`", a.pane_id)
+                        };
                         format!(
-                            "pane {} ({}, {}) is in the project folder but NOT a registered coordinator; register with `{prefix} coordinator adopt {slug} --pane {}`",
+                            "pane {} ({}, {}) is in the project folder but NOT a registered coordinator; {tail}",
                             a.pane_id,
                             if a.name.is_empty() { "unnamed".to_string() } else { format!("name {}", a.name) },
                             a.agent_status,
-                            a.pane_id
                         )
                     })
                     .collect();
@@ -525,14 +530,14 @@ mod tests {
         );
         assert!(!healthy);
         assert!(text.contains("[FAIL] herdr: 0.9.0"), "{text}");
-        assert!(text.contains("0.9.1 or later"));
+        assert!(text.contains("0.9.5 or later"));
     }
 
     #[test]
     fn new_herdr_passes_and_warnings_do_not_fail() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         let (text, healthy) = report(
             &env,
@@ -554,7 +559,7 @@ mod tests {
     fn missing_priming_files_are_reported_and_fixed() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         // A project made before AGENTS.md existed: no priming files, no uploads/.
         let project = project::create(&root, "demo", "", vec![]).unwrap();
@@ -590,7 +595,7 @@ mod tests {
                 runner.on_fn(on_host, |_| Ok(ok("eliasstravik\n")));
             }
             runner.on("gh api user", fail(1, "HTTP 401: Requires authentication"));
-            for (needle, output) in [("herdr --version", "herdr 0.9.1\n"), ("git --version", "git 2\n"), ("gh --version", "gh 2\n")] {
+            for (needle, output) in [("herdr --version", "herdr 0.9.5\n"), ("git --version", "git 2\n"), ("gh --version", "gh 2\n")] {
                 runner.on(needle, ok(output));
             }
             let (text, _) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner, false, None);
@@ -608,7 +613,7 @@ mod tests {
     fn routines_skipped_for_want_of_a_coordinator_are_named() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         std::fs::write(project.dir().join("routines/standup.md"), "+++\nschedule = \"every 5m\"\n+++\nGo.\n").unwrap();
@@ -627,7 +632,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let claude = home.path().join("claude-config");
         let env = Env::for_test(home.path(), &[("CLAUDE_CONFIG_DIR", claude.to_str().unwrap())]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         let cfg = home.path().join("cfg");
         let flags = SessionFlags::default();
@@ -671,7 +676,7 @@ mod tests {
     fn colliding_agent_names_fail_the_report() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         let long = "x".repeat(30);
         for suffix in ["a", "b"] {
@@ -687,7 +692,7 @@ mod tests {
     fn an_unregistered_root_pane_is_warned_with_the_adopt_command_and_fix_never_renames() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let runner = runner_with_herdr("herdr 0.9.5\n");
         let root = home.path().join("root");
         let project = project::create(&root, "demo", "", vec![]).unwrap();
         let dir = project.canonical_dir().to_string_lossy().into_owned();
@@ -702,5 +707,27 @@ mod tests {
             assert!(text.contains("coordinator adopt demo --pane w1:p2"), "{text}");
             assert_eq!(runner.count("agent rename"), 0, "--fix must never register a stranger");
         }
+    }
+
+    #[test]
+    fn an_unregistered_root_pane_with_auto_adopt_on_is_told_the_first_command_registers_it() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.5\n");
+        let root = home.path().join("root");
+        let cfg = home.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("config.toml"), "[safety.default]\nauto_adopt = true\n").unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        runner.on("pane list", ok(&format!(r#"{{"result":{{"panes":[{{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"{dir}"}}]}}}}"#)));
+        runner.on(
+            "agent list",
+            ok(&format!(r#"{{"result":{{"agents":[{{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"","agent":"codex","agent_status":"working","cwd":"{dir}"}}]}}}}"#)),
+        );
+        let (text, _) = report(&env, &root, &cfg, &SessionFlags::default(), &runner, false, None);
+        assert!(text.contains("pane w1:p2 (unnamed, working) is in the project folder but NOT a registered coordinator"), "{text}");
+        assert!(text.contains("with auto_adopt on, its first owner-gated command"), "{text}");
+        assert!(!text.contains("coordinator adopt demo --pane"), "{text}");
     }
 }

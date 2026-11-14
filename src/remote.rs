@@ -139,9 +139,11 @@ pub fn resolve_profile(runner: &dyn Runner, target: &str, machine: &str, name: O
     Ok(profile)
 }
 
-/// Origin URL and base ref of a repository on the machine, after a fetch whose
-/// failure is not an error. One ssh call.
-pub fn repo_info(runner: &dyn Runner, target: &str, repo: &str, base: &str) -> Result<(String, String)> {
+/// Origin URL, selected base ref and its exact commit on the machine, after a
+/// fetch whose failure is not an error. One ssh call. The ref stays in the
+/// thread record; only the immutable commit is handed to worktree creation so
+/// git does not write a new upstream into the shared config.
+pub fn repo_info(runner: &dyn Runner, target: &str, repo: &str, base: &str) -> Result<(String, String, String)> {
     let script = format!(
         "cd {repo} && git rev-parse --show-toplevel >/dev/null || exit 3\n\
          o=$(git remote get-url origin 2>/dev/null || true)\n\
@@ -149,7 +151,8 @@ pub fn repo_info(runner: &dyn Runner, target: &str, repo: &str, base: &str) -> R
          b={base}\n\
          if [ -z \"$b\" ]; then b=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || git rev-parse --abbrev-ref HEAD); fi\n\
          if [ \"$b\" = HEAD ]; then b=$(git rev-parse HEAD); fi\n\
-         printf '%s\\n%s\\n' \"$o\" \"$b\"",
+         c=$(git rev-parse --verify \"${{b}}^{{commit}}\") || exit 4\n\
+         printf '%s\\n%s\\n%s\\n' \"$o\" \"$b\" \"$c\"",
         repo = quote(repo),
         base = quote(base),
     );
@@ -160,10 +163,14 @@ pub fn repo_info(runner: &dyn Runner, target: &str, repo: &str, base: &str) -> R
     let mut lines = out.stdout.lines();
     let origin = lines.next().unwrap_or("").trim().to_string();
     let base = lines.next().unwrap_or("").trim().to_string();
+    let commit = lines.next().unwrap_or("").trim().to_string();
     if base.is_empty() {
         bail!("could not find a base ref in {repo} on {target}");
     }
-    Ok((origin, base))
+    if commit.is_empty() {
+        bail!("could not resolve {base} to a commit in {repo} on {target}");
+    }
+    Ok((origin, base, commit))
 }
 
 /// Creates the thread directory, keeps it out of git, and writes the brief
@@ -193,6 +200,31 @@ pub fn write_brief(runner: &dyn Runner, target: &str, cwd: &str, thread_dir: &st
 pub fn branch_exists(runner: &dyn Runner, target: &str, repo: &str, branch: &str) -> Result<bool> {
     let script = format!("cd {} && git rev-parse --verify --quiet {} >/dev/null", quote(repo), quote(&format!("refs/heads/{branch}")));
     Ok(ssh(runner, target, &script, None, SSH_TIMEOUT)?.success())
+}
+
+/// Best-effort cleanup after a failed worktree create. Only a leftover branch
+/// that still points at `base` and is not checked out is deleted. The old-OID
+/// argument makes the delete conditional if the branch advances meanwhile;
+/// every inspection or ssh failure keeps the branch.
+pub fn drop_empty_branch(runner: &dyn Runner, target: &str, repo: &str, branch: &str, base: &str) {
+    let reference = format!("refs/heads/{branch}");
+    let script = format!(
+        "cd {repo} || exit 0\n\
+         r={reference}\n\
+         tip=$(git rev-parse --verify --quiet \"$r\" 2>/dev/null) || exit 0\n\
+         [ \"$tip\" = {base} ] || exit 0\n\
+         trees=$(git worktree list --porcelain 2>/dev/null) || exit 0\n\
+         if printf '%s\\n' \"$trees\" | grep -qxF \"branch $r\"; then\n\
+           exit 0\n\
+         else\n\
+           [ \"$?\" -eq 1 ] || exit 0\n\
+         fi\n\
+         git update-ref -d \"$r\" {base} >/dev/null 2>&1 || true",
+        repo = quote(repo),
+        reference = quote(&reference),
+        base = quote(base),
+    );
+    let _ = ssh(runner, target, &script, None, SSH_TIMEOUT);
 }
 
 /// Report hashes for every given thread on one machine, in one ssh call. Only
@@ -386,6 +418,53 @@ mod tests {
         std::os::unix::fs::symlink("/etc/passwd", format!("{dir}/report.md")).unwrap();
         assert!(report_hashes(&runner, "box", &[("t-0001".into(), dir.clone())]).unwrap().is_empty());
         assert!(layout(&runner, "box", &dir).unwrap().report_is_other);
+    }
+
+    #[test]
+    fn remote_cleanup_deletes_only_an_empty_unused_branch_with_a_hostile_path() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("it's a $(repo)");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
+        let git = |args: &[&str]| {
+            let out = run(args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        git(&["add", "base.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        let cwd = repo.to_string_lossy().into_owned();
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            |cmd| RealRunner.run(&Cmd { program: "sh".into(), args: vec!["-c".into(), cmd.args.last().unwrap().clone()], ..cmd.clone() }),
+        );
+        let branch = "hp/demo/t-0001-empty";
+        let reference = format!("refs/heads/{branch}");
+        git(&["branch", branch, &base]);
+
+        drop_empty_branch(&runner, "box", &cwd, branch, &base);
+        assert!(!run(&["show-ref", "--verify", "--quiet", &reference]).status.success());
+
+        git(&["branch", branch, &base]);
+        let tree = git(&["rev-parse", &format!("{base}^{{tree}}")]);
+        let advanced = git(&["commit-tree", &tree, "-p", &base, "-m", "advanced"]);
+        git(&["update-ref", &reference, &advanced, &base]);
+        drop_empty_branch(&runner, "box", &cwd, branch, &base);
+        assert_eq!(git(&["rev-parse", &reference]), advanced);
+
+        let checked = "hp/demo/t-0001-checked";
+        let checked_ref = format!("refs/heads/{checked}");
+        let checked_path = root.path().join("checked out").to_string_lossy().into_owned();
+        git(&["branch", checked, &base]);
+        git(&["worktree", "add", "-q", &checked_path, checked]);
+        drop_empty_branch(&runner, "box", &cwd, checked, &base);
+        assert_eq!(git(&["rev-parse", &checked_ref]), base);
     }
 
     #[test]

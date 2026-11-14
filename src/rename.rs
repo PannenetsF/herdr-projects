@@ -394,6 +394,38 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
             out.left.push(format!("the home Space {} keeps its old label ({error}); `open {to}` renames it", record.workspace_id));
         }
     }
+    // The threads Space, renamed to match only when a pane listed before the
+    // folder move proves it works under this project's old `threads/` folder.
+    // A stale id may name an unrelated Space after a server restart.
+    let threads_workspace = project.threads_workspace();
+    let verified = view.as_ref().is_some_and(|view| {
+        view.panes.iter().any(|pane| {
+            pane.workspace_id == threads_workspace
+                && old_paths
+                    .iter()
+                    .any(|old| crate::threads::pane_in_threads(pane, &old.join("threads")))
+        })
+    });
+    if old_label != new_label && !threads_workspace.is_empty() && verified {
+        let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
+        let label = format!(
+            "{} · threads",
+            new_label.trim_end_matches(crate::grouping::HOME_MARK)
+        );
+        if Path::new(&record.socket).exists() {
+            match herdr.workspace_rename(&threads_workspace, &label) {
+                Ok(_) => {}
+                Err(error) if error.code == "workspace_not_found" => {
+                    if let Err(error) = project.set_threads_workspace("") {
+                        out.left.push(format!("the threads Space {threads_workspace} is closed, but its recorded id could not be forgotten ({error:#})"));
+                    }
+                }
+                Err(error) => out.left.push(format!(
+                    "the threads Space {threads_workspace} keeps its old label ({error})"
+                )),
+            }
+        }
+    }
     Ok(out)
 }
 

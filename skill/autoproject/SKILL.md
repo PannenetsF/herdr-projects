@@ -15,7 +15,7 @@ autoproject owns one review ratchet per project, from setup to stop, run by the 
 
 ## Inputs
 
-- The user's request and the `hp context` digest: goal, repos, `thread_profile` and the allowed thread profiles, `max_parallel_threads`, `nudge`, project status, TASKS.md, open threads, inbox.
+- The user's request and the `hp context` digest: goal, repos, `thread_profile` and the allowed thread profiles, `nudge`, project status, TASKS.md, open threads, inbox.
 - Three inputs, each one free-text description, with these defaults:
   - **Brief**: the goal, what makers build or improve. Default: the project goal. Reviewers never see it.
   - **Rubric**: how the adversarial reviewer judges a candidate. Default: beats the base on the goal, with proof. Makers never see it.
@@ -55,7 +55,7 @@ For run threads and the run's own TASKS.md line only, and nowhere else:
 - The TASKS.md owner set gains `autoproject` (not a profile; `assignable --check` does not apply to it), and only the ratchet changes that line. "Thread ends" and "Freed slot" do not fire for run threads finishing.
 - "Coordination preferences are saved unasked" and "Decisions the user makes in chat that later threads must know go to memory" do not apply to run steering.
 
-Every other coordinator rule stands, including the parallel cap: before each start, if the threads listed as `Working` (not counting this run's own maker) reach `max_parallel_threads`, wait with step `waiting for slot`.
+Every other coordinator rule stands.
 
 ## Outputs
 

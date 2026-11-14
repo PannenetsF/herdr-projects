@@ -58,7 +58,7 @@ herdr-projects open billing
 - `open billing --tab` starts it in a new tab of the project's own workspace instead. The plugin's actions and the popup always do that, and so does `open` run outside Herdr.
 - When a coordinator is already running, `open` jumps to it. `open --new` starts another beside it, with a fresh conversation.
 - `open billing --profile codex` starts another agent: every installed, signed-in harness is a profile, and your own profiles (a model, an effort, extra flags) are made in the popup's settings or with `profile add` ([operations](operations.md#agent-profiles)).
-- A coordinator is a **registered** agent: it carries a name like `hpc-billing`. An agent you start by hand in the project folder is not a coordinator until you register it with `herdr-projects coordinator adopt billing` (run it in that pane, or pass `--pane <id>`). Until then it gets no inbox and `context` refuses it. `open --new` registers another coordinator, and several can run side by side.
+- A coordinator is a **registered** agent: it carries a name like `hpc-billing`. An agent you start by hand in the project folder is not a coordinator until you register it with `herdr-projects coordinator adopt billing` (run it in that pane, or pass `--pane <id>`). Until then it gets no inbox and `context` refuses it. `open --new` registers another coordinator, and several can run side by side. With the `auto_adopt` safety setting on (`safety set --global auto_adopt on`), that manual step is skipped: an unnamed pane in the project home registers itself on its first owner-gated command; thread and named panes are still refused.
 - `open` resumes the agent's last session when Herdr recorded one for that profile.
 - The first time, your agent may ask whether you trust the folder: answer it in the coordinator's pane.
 
@@ -72,7 +72,7 @@ Everything about the project can be changed in chat: goal, instructions, repos, 
 
 ## 6. Watch the threads
 
-Each code thread runs in its own worktree workspace on a branch named `hp/<project>/<id>-<title>`; a task with no repository runs as a tab in the project's workspace.
+Each code thread runs in its own worktree workspace on a branch named `hp/<project>/<id>-<title>`; a task with no repository runs as a tab in the project's own `· threads` Space, so the project workspace's panes and tab bar stay the coordinator's alone.
 
 - **The sidebar** shows each thread as `t-0003 · <title>` with a line under it that adds what Herdr's own state word does not say: `needs you · ~55%`, `review · PR #4`, `~40%`, `12m quiet`, `landing · PR #4`. The agent's own activity follows on the same line. The tab bar says `projects: 2 need you`. Agents and Spaces are grouped by project: each project starts with its own head row, the home Space and the coordinator, which show the project's name in bold, and its threads by need and its other Spaces follow as Herdr's own rows; agents or Spaces outside any project come last. Selecting a row lights only that row. The ticker keeps the Spaces in these blocks, so a Space you drag elsewhere moves back.
 - **The popup** (`prefix+a`) lists threads, tasks, inbox, routines, settings and memory. Every thread report ends with a `## Next` list; press a number to send that line back to the thread, which then does it with its own tools. Other keys jump to a thread, stop it, restart it with another profile, resolve it, open its PR, edit settings, pause or archive the project.

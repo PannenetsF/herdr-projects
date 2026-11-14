@@ -39,10 +39,28 @@ pub(crate) fn alive_panes(project: &Project, view: &SessionView) -> Vec<(String,
 /// and Herdr's refusal (`workspace_group_close_required`) is reported.
 fn close_workspaces(project: &Project, view: &SessionView) -> Vec<String> {
     let mut notes = Vec::new();
-    let mut close = |workspace: &str, what: &str| match view.herdr.call(&["workspace", "close", workspace], crate::herdr::CALL_TIMEOUT) {
-        Ok(_) => notes.push(format!("closed {what} (workspace {workspace})")),
-        Err(error) if error.code == "workspace_group_close_required" => notes.push(format!("left {what} open: it is a repository's primary workspace")),
-        Err(error) => notes.push(format!("could not close {what}: {error}")),
+    let mut close = |workspace: &str, what: &str| match view.herdr.call(
+        &["workspace", "close", workspace],
+        crate::herdr::CALL_TIMEOUT,
+    ) {
+        Ok(_) => {
+            notes.push(format!("closed {what} (workspace {workspace})"));
+            true
+        }
+        Err(error) if error.code == "workspace_not_found" => {
+            notes.push(format!("{what} was already closed (workspace {workspace})"));
+            true
+        }
+        Err(error) if error.code == "workspace_group_close_required" => {
+            notes.push(format!(
+                "left {what} open: it is a repository's primary workspace"
+            ));
+            false
+        }
+        Err(error) => {
+            notes.push(format!("could not close {what}: {error}"));
+            false
+        }
     };
     let mut done = Vec::new();
     for t in thread::list(project).iter().filter(|t| t.status != thread::Status::Resolved && !t.is_remote() && t.kind == thread::Kind::Worktree) {
@@ -59,6 +77,38 @@ fn close_workspaces(project: &Project, view: &SessionView) -> Vec<String> {
     {
         crate::sidebar::clear_workspace(&view.herdr, &record.workspace_id);
         close(&record.workspace_id, "the project workspace");
+    }
+    // The Space repo-less thread tabs live in. A pane under `threads/` proves
+    // it is ours. A root-only Space left by a failed root-tab close instead has
+    // every pane at the project home, which is also safe to recognise here:
+    // unlike start, archive never opens a tab in the recorded id.
+    let threads_workspace = project.threads_workspace();
+    let home = project.canonical_dir();
+    let threads_dir = home.join("threads");
+    let panes: Vec<_> = view
+        .panes
+        .iter()
+        .filter(|p| p.workspace_id == threads_workspace)
+        .collect();
+    let in_threads = panes
+        .iter()
+        .any(|p| threads::pane_in_threads(p, &threads_dir));
+    let home_only = !panes.is_empty()
+        && panes.iter().all(|p| {
+            let dirs: Vec<_> = [p.cwd.as_str(), p.foreground_cwd.as_str()]
+                .into_iter()
+                .filter(|dir| !dir.is_empty())
+                .collect();
+            !dirs.is_empty() && dirs.iter().all(|dir| std::path::Path::new(dir) == home)
+        });
+    if !threads_workspace.is_empty()
+        && (in_threads || home_only)
+        && close(&threads_workspace, "the threads workspace")
+        && let Err(error) = project.set_threads_workspace("")
+    {
+        notes.push(format!(
+            "the threads workspace id {threads_workspace} could not be forgotten: {error:#}"
+        ));
     }
     notes
 }

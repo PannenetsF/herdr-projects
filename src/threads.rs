@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::herdr::{Agent, Herdr, Pane};
+use crate::herdr::{Agent, Herdr, HerdrError, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
@@ -53,7 +53,9 @@ fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Res
 }
 
 pub fn report_thread_tokens(herdr: &Herdr, thread: &Thread, slug: &str, group: Group) {
-    crate::sidebar::report_pane(&herdr.on_machine(&thread.machine), &thread.pane_id, &crate::sidebar::thread_display(thread), slug, group);
+    // Adoption and start report Working: no audience yet; the ticker stamps
+    // the real one (and clears it) on its next pass.
+    crate::sidebar::report_pane(&herdr.on_machine(&thread.machine), &thread.pane_id, &crate::sidebar::thread_display(thread), slug, group, None);
 }
 
 fn clear_thread_tokens(herdr: &Herdr, thread: &Thread) {
@@ -67,8 +69,8 @@ pub struct StartArgs {
     /// The profile (`--profile`), default `thread_profile` in PROJECT.md;
     /// it must be on the project's allow-list.
     pub profile: Option<String>,
-    /// Placement (`--kind worktree|tab|checkout`); default worktree with a
-    /// repo, tab without one.
+    /// Placement (`--kind worktree|tab`); a repository always means a
+    /// worktree, no repo means a tab.
     pub kind: Option<Kind>,
     pub base: Option<String>,
     pub task: String,
@@ -110,14 +112,20 @@ pub fn thread_profile(ctx: &Ctx, project: &Project, machine: &str, requested: Op
     Ok(ThreadProfile { name: found.name, agent: found.agent, remote_args: Some(found.args) })
 }
 
-/// The placement of a new thread from what was asked and whether it has a repo.
+/// The placement of a new thread from what was asked and whether it has a
+/// repo. A repository always means a worktree: `--kind tab` is for a task
+/// with no repository and is refused together with `--repo`.
 pub fn placement(kind: Option<Kind>, has_repo: bool, remote: bool) -> Result<Kind> {
     match (kind, has_repo) {
         (None, true) => Ok(Kind::Worktree),
         (None, false) => Ok(Kind::Tab),
-        (Some(Kind::Worktree), false) | (Some(Kind::Checkout), false) => bail!("a worktree or checkout thread needs --repo"),
+        (Some(Kind::Worktree), false) => bail!("a worktree thread needs --repo"),
+        (Some(Kind::Tab), true) => bail!("a tab is for a task with no repository; a repository task always runs in its own worktree"),
         (Some(Kind::Adopted), _) => bail!("an adopted thread is made with `thread adopt`"),
-        (Some(Kind::Tab), _) | (Some(Kind::Checkout), _) if remote => bail!("a tab or checkout thread runs in the project's own workspace, which is local; a remote repo needs a worktree thread"),
+        // Unreachable from the CLI (`Kind::parse` no longer accepts it), kept
+        // explicit so a legacy record can never drive a new placement.
+        (Some(Kind::Checkout), _) => bail!("`--kind checkout` was removed; a repository task runs in a worktree"),
+        (Some(Kind::Tab), _) if remote => bail!("a tab runs on this machine, in the project's own threads Space; a remote repo needs a worktree thread"),
         (Some(kind), _) => Ok(kind),
     }
 }
@@ -139,6 +147,21 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     if args.task.trim().is_empty() {
         bail!("the task is empty");
     }
+    // Who is starting this: a registered coordinator owns it; a person's
+    // shell leaves it owner-less (it lands in Unassigned until `thread
+    // assign`). An unnamed agent in the project folder is turned away before
+    // anything is created, as `context` turns it away.
+    let owner = match coordinator::caller(ctx, &project) {
+        coordinator::Caller::Coordinator { name, .. } => Some(name),
+        coordinator::Caller::Human => None,
+        coordinator::Caller::Stranger { pane } => {
+            let prefix = coordinator::current_prefix(&ctx.root)?;
+            return Err(coordinator::stranger_refusal(&prefix, slug, &pane));
+        }
+        coordinator::Caller::Unverified { pane } => {
+            return Err(coordinator::unverified_refusal(slug, &pane));
+        }
+    };
     let (settings, _) = project.read_project_md()?;
     // Without a running ticker nothing launches.
     ticker::start(ctx)?;
@@ -147,7 +170,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     let listed = args.repo.as_ref().and_then(|repo| settings.repos.iter().find(|r| &r.path == repo));
     let machine = args.machine.clone().or_else(|| listed.and_then(|r| r.machine.clone())).unwrap_or_default();
     let repo = match (&args.repo, machine.is_empty()) {
-        (None, false) => bail!("a remote thread needs --repo: a task with no repository runs as a tab in the project's own workspace, which is local"),
+        (None, false) => bail!("a remote thread needs --repo: a task with no repository runs as a tab in the project's own threads Space, which is local"),
         (None, true) => String::new(),
         // A remote path is stored as it is on its own machine.
         (Some(repo), false) => repo.clone(),
@@ -166,14 +189,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         eprintln!("warning: {repo} on {machine} is not listed in `repos` in PROJECT.md");
     }
 
-    let open_count = thread::list(&project).iter().filter(|t| t.status == Status::Open || t.status == Status::Starting).count();
-    if open_count as u32 >= settings.max_parallel_threads {
-        eprintln!(
-            "warning: {open_count} threads are already open; max_parallel_threads is {}",
-            settings.max_parallel_threads
-        );
-    }
-
     let profile = thread_profile(ctx, &project, &machine, args.profile.as_deref())?;
     let kind = placement(args.kind, !repo.is_empty(), !machine.is_empty())?;
     let record = thread::allocate(&project, |t| {
@@ -181,6 +196,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         t.kind = kind;
         t.repo = repo.clone();
         t.machine = machine.clone();
+        t.owner = owner.unwrap_or_default();
         profile.apply(t);
         t.base = args.base.clone().unwrap_or_default();
     })?;
@@ -204,6 +220,64 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     }
 }
 
+/// The waits before each new worktree-create attempt while another git
+/// command holds the repository's config lock: five attempts, under four
+/// seconds of backoff in total.
+const CONFIG_LOCK_WAITS_MS: [u64; 4] = [250, 500, 1000, 2000];
+
+fn config_locked(error: &HerdrError) -> bool {
+    error.message.contains("could not lock config file")
+}
+
+fn config_lock_pause(milliseconds: u64) {
+    #[cfg(not(test))]
+    std::thread::sleep(Duration::from_millis(milliseconds));
+    #[cfg(test)]
+    let _ = milliseconds;
+}
+
+/// Retry only a genuine git config-lock refusal. After every failed create,
+/// clean up a provably empty leftover branch so the next attempt can reuse the
+/// same name; cleanup is best-effort and never masks the create error.
+fn worktree_create_with_retry<T>(
+    mut make: impl FnMut() -> std::result::Result<T, HerdrError>,
+    mut cleanup: impl FnMut(),
+) -> std::result::Result<T, HerdrError> {
+    let mut retries = 0;
+    loop {
+        let error = match make() {
+            Ok(created) => return Ok(created),
+            Err(error) => error,
+        };
+        cleanup();
+        if !config_locked(&error) || retries == CONFIG_LOCK_WAITS_MS.len() {
+            return Err(error);
+        }
+        config_lock_pause(CONFIG_LOCK_WAITS_MS[retries]);
+        retries += 1;
+    }
+}
+
+/// Local counterpart of `remote::drop_empty_branch`: compare the exact tip,
+/// require a successful worktree listing, refuse a checked-out branch, and use
+/// a compare-and-delete update that cannot remove later commits.
+fn drop_empty_local_branch(runner: &dyn Runner, repo: &str, branch: &str, base: &str) {
+    let reference = format!("refs/heads/{branch}");
+    let Ok(tip) = git(runner, repo, &["rev-parse", "--verify", "--quiet", &reference], GIT_TIMEOUT) else {
+        return;
+    };
+    if tip != base {
+        return;
+    }
+    let Ok(trees) = git(runner, repo, &["worktree", "list", "--porcelain"], GIT_TIMEOUT) else {
+        return;
+    };
+    if trees.lines().any(|line| line == format!("branch {reference}")) {
+        return;
+    }
+    let _ = git(runner, repo, &["update-ref", "-d", &reference, base], GIT_TIMEOUT);
+}
+
 /// Steps 2 to 5 of starting a thread, also used by `thread restart` case (a).
 fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, restart: bool) -> Result<Thread> {
     let slug = &project.slug;
@@ -215,9 +289,13 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
             // The same steps on the thread's own machine: git over ssh, herdr
             // through `--machine`.
             let target = remote::ssh_target(runner, &ctx.env.herdr_bin(), &ctx.config_dir, &record.machine)?;
-            let (origin, base) = remote::repo_info(runner, &target, &record.repo, &record.base)?;
+            let (origin, base, base_sha) = remote::repo_info(runner, &target, &record.repo, &record.base)?;
             let branch = thread::branch_name(slug, id, &record.title);
-            let (created, path, cwd) = view.herdr.on_machine(&record.machine).worktree_create(&record.repo, &branch, &base, &record.title)?;
+            let remote_herdr = view.herdr.on_machine(&record.machine);
+            let (created, path, cwd) = worktree_create_with_retry(
+                || remote_herdr.worktree_create(&record.repo, &branch, &base_sha, &record.title),
+                || remote::drop_empty_branch(runner, &target, &record.repo, &branch, &base_sha),
+            )?;
             thread::update(project, id, |t| {
                 t.origin = origin;
                 t.base = base;
@@ -248,8 +326,16 @@ fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str, r
             } else {
                 record.base.clone()
             };
+            // Creating from a remote-tracking ref writes the new branch's
+            // upstream into the shared .git/config. Resolve first so parallel
+            // starts do not write config; the later `push -u` sets upstream.
+            let revision = format!("{base}^{{commit}}");
+            let base_sha = git(runner, &record.repo, &["rev-parse", "--verify", &revision], GIT_TIMEOUT)?;
             let branch = thread::branch_name(slug, id, &record.title);
-            let (created, path, cwd) = view.herdr.worktree_create(&record.repo, &branch, &base, &record.title)?;
+            let (created, path, cwd) = worktree_create_with_retry(
+                || view.herdr.worktree_create(&record.repo, &branch, &base_sha, &record.title),
+                || drop_empty_local_branch(runner, &record.repo, &branch, &base_sha),
+            )?;
             let repo_workspace = repo_space(&view.herdr, &record.repo);
             // Recorded immediately, so a command killed midway still leaves a
             // record `thread restart` can act on.
@@ -294,8 +380,10 @@ fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> 
     Ok(())
 }
 
-/// A tab in the project workspace: in `threads/<id>/` for a tab thread, in the
-/// repo's main checkout for a checkout thread.
+/// A tab outside the project's own workspace: in the project's threads Space
+/// for a tab thread (so the human's pane/tab cycling in the project workspace
+/// never crosses a thread), in the project workspace for a legacy checkout
+/// record.
 fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<Thread> {
     let coordinator = project.coordinator().context("the project has never been opened")?;
     let workspace = coordinator::project_workspace(&coordinator, &view.panes);
@@ -313,16 +401,67 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         folder
     };
     let folder = std::fs::canonicalize(&folder)?;
-    let created = match workspace {
-        Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
-        // The coordinator runs in a pane of another workspace: the thread
-        // opens the project's own.
-        None => {
-            let (settings, _) = project.read_project_md()?;
-            let created = view.herdr.workspace_create(&folder, &crate::project::home_label(&settings.name, &project.slug), false)?;
-            let _ = view.herdr.call(&["tab", "rename", &created.tab_id, &record.title], crate::herdr::CALL_TIMEOUT);
+    let created = match record.kind {
+        Kind::Tab => {
+            // The root tab of a Space made just now is closed once the
+            // thread's tab exists, so herdr closes the Space by itself when
+            // its last thread tab goes.
+            let (threads_workspace, root_tab) = threads_space(project, view)?;
+            let created = match view.herdr.tab_create(
+                &threads_workspace,
+                &folder,
+                &record.title,
+                false,
+            ) {
+                Ok(created) => created,
+                Err(error) => {
+                    if root_tab.is_some() {
+                        // This Space was made for the tab that just failed.
+                        // Close the whole Space, not only its root tab, in case
+                        // herdr created the thread tab but failed to reply.
+                        match view.herdr.call(
+                            &["workspace", "close", &threads_workspace],
+                            crate::herdr::CALL_TIMEOUT,
+                        ) {
+                            Ok(_) => project.set_threads_workspace("")?,
+                            Err(close_error) if close_error.code == "workspace_not_found" => {
+                                project.set_threads_workspace("")?
+                            }
+                            Err(close_error) => {
+                                return Err(anyhow::Error::new(error).context(format!(
+                                    "the new threads Space {threads_workspace} could not be closed ({close_error}); its id stays recorded so archive can retry"
+                                )));
+                            }
+                        }
+                    }
+                    return Err(error.into());
+                }
+            };
+            if let Some(tab) = root_tab {
+                match view
+                    .herdr
+                    .call(&["tab", "close", &tab], crate::herdr::CALL_TIMEOUT)
+                {
+                    Ok(_) => {}
+                    Err(error) if error.code == "tab_not_found" => {}
+                    Err(error) => eprintln!(
+                        "warning: the threads Space root tab {tab} could not be closed ({error}); archive will close the recorded Space"
+                    ),
+                }
+            }
             created
         }
+        _ => match workspace {
+            Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
+            // The coordinator runs in a pane of another workspace: the thread
+            // opens the project's own.
+            None => {
+                let (settings, _) = project.read_project_md()?;
+                let created = view.herdr.workspace_create(&folder, &crate::project::home_label(&settings.name, &project.slug), false)?;
+                let _ = view.herdr.call(&["tab", "rename", &created.tab_id, &record.title], crate::herdr::CALL_TIMEOUT);
+                created
+            }
+        },
     };
     let cwd = view.herdr.pane_cwd(&created.pane_id).unwrap_or_default();
     let cwd = if cwd.is_empty() { folder.to_string_lossy().into_owned() } else { cwd };
@@ -332,6 +471,36 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         t.tab_id = created.tab_id;
         t.pane_id = created.pane_id;
     })
+}
+
+/// The Space repo-less thread tabs live in, made on first use and reused
+/// after. Ids repeat after a server restart, so a recorded id is trusted only
+/// while a listed pane of it works inside the project's `threads/` folder —
+/// the project's own workspace, whose id a restart may hand to this one, has
+/// its panes at the project home instead. A Space made here also returns its
+/// root tab, which `place_tab` closes once the thread's own tab exists: a
+/// Space holding one shell would otherwise never be closed by herdr when its
+/// last thread tab goes.
+pub(crate) fn pane_in_threads(pane: &Pane, threads_dir: &Path) -> bool {
+    [pane.cwd.as_str(), pane.foreground_cwd.as_str()]
+        .into_iter()
+        .any(|dir| !dir.is_empty() && Path::new(dir).starts_with(threads_dir))
+}
+
+fn threads_space(project: &Project, view: &SessionView) -> Result<(String, Option<String>)> {
+    let home = project.canonical_dir();
+    let threads = home.join("threads");
+    let label = {
+        let (settings, _) = project.read_project_md()?;
+        format!("{} · threads", project::display_name(&settings.name, &project.slug))
+    };
+    let recorded = project.threads_workspace();
+    if !recorded.is_empty() && view.panes.iter().any(|p| p.workspace_id == recorded && pane_in_threads(p, &threads)) {
+        return Ok((recorded, None));
+    }
+    let created = view.herdr.workspace_create(&home, &label, false)?;
+    project.set_threads_workspace(&created.workspace_id)?;
+    Ok((created.workspace_id, Some(created.tab_id)))
 }
 
 /// Creates the thread directory, keeps it out of git, writes `brief.md`.
@@ -485,7 +654,11 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
     };
 
     match restart_plan(&record, &live, branch_exists, now)? {
-        RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
+        RestartPlan::Create => {
+            let placed = place_and_brief(ctx, &project, &view, id, true)?;
+            let _ = crate::steps::note_one_legacy_checkout(&project, &placed);
+            return Ok(placed);
+        }
         RestartPlan::ReusePane => {}
         RestartPlan::Reopen => match record.kind {
             Kind::Worktree => {
@@ -509,7 +682,9 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
     }
     let placed = thread::load(&project, id)?;
     write_brief(ctx, &project, &placed, true)?;
-    finish_placement(&project, &view, id)
+    let placed = finish_placement(&project, &view, id)?;
+    let _ = crate::steps::note_one_legacy_checkout(&project, &placed);
+    Ok(placed)
 }
 
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
@@ -526,6 +701,7 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     if record.prompt_pending {
         bail!("{id} has not received its brief yet; the ticker sends it once the agent is ready, and `thread brief` sends it now");
     }
+    require_owner(ctx, &project, &record, "post a prompt")?;
     let view = require_session(ctx, &project)?;
     let (agents, _) = lists_for(&view, &record)?;
     let state = prompt_state(&record, &agents)?;
@@ -563,12 +739,84 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     Ok(state)
 }
 
+/// Refuses when a live coordinator is not the thread's owner. A person at a
+/// terminal (no live pane) is always allowed; an owner-less thread is refused
+/// to every coordinator until `thread assign` names an owner.
+pub fn require_owner(ctx: &Ctx, project: &Project, record: &Thread, action: &str) -> Result<()> {
+    match coordinator::caller(ctx, project) {
+        coordinator::Caller::Human => Ok(()),
+        coordinator::Caller::Stranger { pane } => {
+            let prefix = coordinator::current_prefix(&ctx.root)?;
+            Err(coordinator::stranger_refusal(&prefix, &project.slug, &pane))
+        }
+        coordinator::Caller::Unverified { pane } => Err(coordinator::unverified_refusal(&project.slug, &pane)),
+        coordinator::Caller::Coordinator { name, .. } => {
+            if record.owner == name {
+                Ok(())
+            } else if record.owner.is_empty() {
+                bail!(
+                    "{action}: {} is unassigned; claim it first with `hp thread assign {} {} --coordinator {name}`",
+                    record.id,
+                    project.slug,
+                    record.id
+                )
+            } else {
+                bail!("{action}: {} is owned by coordinator `{}`; only that coordinator may drive it (claim it with `hp thread assign {} {} --coordinator <your-name>`)", record.id, record.owner, project.slug, record.id)
+            }
+        }
+    }
+}
+
+/// `thread assign <id> --coordinator <name>`: the one way an owner-less (or
+/// any) thread changes owner. A registered coordinator of this project, a
+/// person's shell, or another registered coordinator may run it; the target
+/// name must be a live registered coordinator of this project. Assigning
+/// also moves the thread's already-written inbox items, since their routing
+/// follows the live record.
+pub fn assign(ctx: &Ctx, slug: &str, id: &str, coordinator_name: &str) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    thread::validate_id(id)?;
+    let record = thread::load(&project, id)?;
+    if !crate::names::is_coordinator_name(slug, coordinator_name) {
+        bail!("`{coordinator_name}` is not a coordinator name of `{slug}` (the `hpc-{slug}` family; `open --new` or `coordinator adopt` allocates one)");
+    }
+    match coordinator::caller(ctx, &project) {
+        coordinator::Caller::Stranger { pane } => {
+            let prefix = coordinator::current_prefix(&ctx.root)?;
+            return Err(coordinator::stranger_refusal(&prefix, slug, &pane));
+        }
+        coordinator::Caller::Unverified { pane } => {
+            return Err(coordinator::unverified_refusal(slug, &pane));
+        }
+        coordinator::Caller::Human | coordinator::Caller::Coordinator { .. } => {}
+    }
+    // Idempotent before the liveness requirement: re-asserting the recorded
+    // owner must succeed even when that coordinator is momentarily gone.
+    if record.owner == coordinator_name {
+        println!("{id} is already owned by `{coordinator_name}`");
+        return Ok(());
+    }
+    // Only a registered, LIVE coordinator can receive new work: nudges route
+    // to a live pane.
+    let view = require_session(ctx, &project)?;
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    if !view.agents.iter().any(|a| a.name == coordinator_name && coordinator::is_coordinator(slug, &dir, a)) {
+        bail!("no registered coordinator `{coordinator_name}` is live in `{slug}`; open or adopt one first (`herdr agent list` shows names)");
+    }
+    let previous = if record.owner.is_empty() { "unassigned".to_string() } else { format!("`{}`", record.owner) };
+    thread::update(&project, id, |t| t.owner = coordinator_name.to_string())?;
+    println!("{id} reassigned from {previous} to `{coordinator_name}`; its open inbox items route with it");
+    Ok(())
+}
+
 /// `thread next`: forward line N of the thread's Next list as a prompt, or add
 /// a line the coordinator wants on that list.
 pub fn next(ctx: &Ctx, slug: &str, id: &str, line: Option<usize>, add: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    thread::load(&project, id)?;
+    let record = thread::load(&project, id)?;
     if let Some(text) = add {
+        // Adding to the Next list is driving the thread: owner only.
+        require_owner(ctx, &project, &record, "add a Next line")?;
         let text = text.trim();
         if text.is_empty() || text.contains('\n') {
             bail!("a Next line is one non-empty line");
@@ -667,6 +915,10 @@ pub fn keys(ctx: &Ctx, slug: &str, id: &str, keys: &[String], text: Option<&str>
     if keys.iter().any(|k| k.trim().is_empty()) {
         bail!("a key name is empty");
     }
+    // Arbitrary keystrokes steer the agent exactly like a prompt: owner only.
+    let project = Project::load(&ctx.root, slug)?;
+    let record = thread::load(&project, id)?;
+    require_owner(ctx, &project, &record, "send keys to")?;
     let pane = pane_agent(ctx, slug, id)?;
     let fail = |error: crate::herdr::HerdrError| anyhow::anyhow!("{error}");
     // With `trust_screens = user`, a trust answer is the user's alone.
@@ -701,10 +953,13 @@ pub fn brief(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     if record.status != Status::Open {
         bail!("{id} is {}; `thread restart` brings it back", format!("{:?}", record.status).to_lowercase());
     }
+    // Delivering the brief by hand is steering the thread: owner only (the
+    // ticker's own delivery goes through brief::deliver, not this command).
+    require_owner(ctx, &project, &record, "send the brief to")?;
     let pane = pane_agent(ctx, slug, id).map_err(|e| anyhow::anyhow!("{e:#}; the ticker launches the agent on its next pass"))?;
     match pane.state.as_str() {
         "blocked" => bail!("{id}'s pane shows a prompt: `thread read` shows it, `thread keys` answers it; then run `thread brief` again"),
-        state if !crate::herdr::ready_state(state) && record.brief_attempts == 0 => bail!("{id}'s agent is {state}, not ready for its brief yet; try again shortly"),
+        state if !pane.agent.ready_for_brief(if pane.agent.agent.is_empty() { &record.agent } else { &pane.agent.agent }) && record.brief_attempts == 0 => bail!("{id}'s agent is {state}, not ready for its brief yet; try again shortly"),
         _ => {}
     }
     match crate::brief::deliver(&project, &pane.herdr, &pane.record, &pane.agent, crate::brief::Sender::Manual)? {
@@ -739,6 +994,10 @@ pub fn prompt_state(record: &Thread, agents: &[Agent]) -> Result<String> {
 
 pub fn ack(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
+    let record = thread::load(&project, id)?;
+    // Acking moves the owner's Ready-for-review row; a foreign coordinator
+    // must not silently change another one's board.
+    require_owner(ctx, &project, &record, "acknowledge the report of")?;
     let record = thread::update(&project, id, |t| t.acked_report_hash = t.report_hash.clone())?;
     if record.report_hash.is_empty() {
         println!("{id} has no report yet; nothing to acknowledge");
@@ -808,7 +1067,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     for note in &notes {
         println!("  - {note}");
     }
-    crate::inbox::write_origin(&project, "thread-state", id, "resolved", &format!("{id} \"{}\" was resolved: {}", resolved.title, notes.join("; ")), "", &resolved.origin_pane())?;
+    crate::inbox::write_thread(&project, &resolved, "thread-state", "resolved", &format!("{id} \"{}\" was resolved: {}", resolved.title, notes.join("; ")), "")?;
     Ok(())
 }
 
@@ -925,7 +1184,7 @@ fn last_pr_lookup(ctx: &Ctx, project: &Project, t: &Thread) -> Option<crate::pr:
             r.pr_state = state;
             r.pr_review = review;
         });
-        let _ = crate::inbox::write_origin(project, "pr", &t.id, "PR found at resolve", &format!("{}: pull request {} (found at resolve)", crate::steps::thread_label(t), pr::describe_change(None, &summary)), "", &t.origin_pane());
+        let _ = crate::inbox::write_thread(project, t, "pr", "PR found at resolve", &format!("{}: pull request {} (found at resolve)", crate::steps::thread_label(t), pr::describe_change(None, &summary)), "");
     }
     Some(summary)
 }
@@ -1048,37 +1307,45 @@ pub fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread, view: Opti
 pub struct Row {
     pub thread: Thread,
     pub group: Group,
+    /// Who the group's current wait is for; `None` when the row wants nobody.
+    pub audience: Option<thread::Audience>,
     pub note: String,
 }
 
 pub fn rows(ctx: &Ctx, project: &Project) -> Vec<Row> {
     let view = session_view(ctx, project);
     let now = jiff::Timestamp::now();
+    let stall_secs = thread::stall_upgrade_secs(ctx.env.var(thread::STALL_UPGRADE_ENV));
     thread::list(project)
         .into_iter()
-        .map(|t| row(&t, &project.root, view.as_ref(), now))
+        .map(|t| row(&t, &project.root, view.as_ref(), now, stall_secs))
         .collect()
 }
 
-fn row(t: &Thread, root: &Path, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
+fn row(t: &Thread, root: &Path, view: Option<&SessionView>, now: jiff::Timestamp, stall_secs: i64) -> Row {
     // Before the first poll a thread that is waiting for its launch is Working.
     let recorded = Group::from_token(&t.last_group).unwrap_or(if t.prompt_pending { Group::Working } else { Group::Idle });
+    // The audience the ticker last persisted: used for remote threads and
+    // when the session is unreachable, where the CLI does no live classify.
+    let recorded_audience = || thread::Audience::from_token(&t.audience);
     if t.status == Status::Resolved {
-        return Row { thread: t.clone(), group: Group::Resolved, note: t.resolved_reason.clone() };
+        return Row { thread: t.clone(), group: Group::Resolved, audience: None, note: t.resolved_reason.clone() };
     }
     let Some(view) = view else {
         // Records are still printed; panes are not treated as gone.
-        return Row { thread: t.clone(), group: recorded, note: "session unreachable".into() };
+        return Row { thread: t.clone(), group: recorded, audience: recorded_audience(), note: "session unreachable".into() };
     };
     if t.is_remote() {
         // Remote state is what the ticker last polled; the CLI makes no ssh call.
         let state = if t.last_state.is_empty() { "not polled yet" } else { &t.last_state };
-        return Row { thread: t.clone(), group: recorded, note: format!("{state}, on {}", t.machine) };
+        return Row { thread: t.clone(), group: recorded, audience: recorded_audience(), note: format!("{state}, on {}", t.machine) };
     }
     let live = thread::live_with_report(t, &view.agents, &view.panes, now, root, &view.socket);
     // A report the ticker has not hashed yet still counts, as it does for the ticker.
     let fresh = Thread { report_hash: thread::local_report_hash(t).unwrap_or_else(|| t.report_hash.clone()), ..t.clone() };
-    let group = thread::group(&fresh, &live, now);
+    let class = thread::classify(&fresh, &live, now);
+    let audience = thread::audience_of(&class, &live, stall_secs);
+    let group = class.group;
     let note = if t.status == Status::Failed {
         format!("failed: {}", t.error)
     } else if !live.pane_exists {
@@ -1086,7 +1353,7 @@ fn row(t: &Thread, root: &Path, view: Option<&SessionView>, now: jiff::Timestamp
     } else {
         live.agent_state.unwrap_or_else(|| "no agent".into())
     };
-    Row { thread: t.clone(), group, note }
+    Row { thread: t.clone(), group, audience, note }
 }
 
 /// One thread as JSON: the record, its group and note, the Next list and the
@@ -1097,6 +1364,10 @@ pub fn row_json(project: &Project, row: &Row) -> serde_json::Value {
     let mut value = serde_json::to_value(t).unwrap_or_default();
     value["group"] = row.group.label().into();
     value["group_token"] = row.group.token().into();
+    value["audience"] = match row.audience {
+        Some(audience) => audience.token().into(),
+        None => serde_json::Value::Null,
+    };
     value["rank"] = row.group.rank().into();
     value["note"] = row.note.clone().into();
     value["next"] = thread::all_next(project, &t.id).into();
@@ -1123,7 +1394,8 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str, json: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     let view = session_view(ctx, &project);
-    let row = row(&record, &project.root, view.as_ref(), jiff::Timestamp::now());
+    let stall_secs = thread::stall_upgrade_secs(ctx.env.var(thread::STALL_UPGRADE_ENV));
+    let row = row(&record, &project.root, view.as_ref(), jiff::Timestamp::now(), stall_secs);
     if json {
         println!("{}", serde_json::to_string_pretty(&row_json(&project, &row))?);
         return Ok(());
@@ -1240,14 +1512,119 @@ mod tests {
     fn placement_follows_the_request_then_the_repo() {
         assert_eq!(placement(None, true, false).unwrap(), Kind::Worktree);
         assert_eq!(placement(None, false, false).unwrap(), Kind::Tab);
-        assert_eq!(placement(Some(Kind::Tab), true, false).unwrap(), Kind::Tab);
-        assert_eq!(placement(Some(Kind::Checkout), true, false).unwrap(), Kind::Checkout);
-        assert!(placement(Some(Kind::Checkout), false, false).is_err());
+        assert_eq!(placement(Some(Kind::Tab), false, false).unwrap(), Kind::Tab);
+        // A repository task always lands in a worktree: tab+repo is refused,
+        // and the old checkout placement cannot be requested any more.
+        assert!(placement(Some(Kind::Tab), true, false).is_err());
+        assert!(placement(Some(Kind::Checkout), true, false).is_err());
         assert!(placement(Some(Kind::Worktree), false, false).is_err());
         assert!(placement(Some(Kind::Tab), true, true).is_err());
         assert!(placement(Some(Kind::Adopted), true, false).is_err());
-        assert_eq!(Kind::parse("checkout").unwrap(), Kind::Checkout);
+        assert!(Kind::parse("checkout").is_err());
         assert!(Kind::parse("popup").is_err());
+    }
+
+    #[test]
+    fn a_legacy_checkout_record_still_parses_and_restart_plans() {
+        // The record format keeps accepting the removed kind.
+        let text = r#"
+id = "t-0007"
+title = "Old"
+status = "open"
+kind = "checkout"
+repo = "/repo"
+"#;
+        let t: Thread = toml::from_str(text).unwrap();
+        assert_eq!(t.kind, Kind::Checkout);
+        // Restart still knows what to do with the tab it was.
+        let checkout = Thread { kind: Kind::Checkout, worktree_path: String::new(), ..worktree_thread() };
+        assert_eq!(restart_plan(&checkout, &gone(), false, now()).unwrap(), RestartPlan::Reopen);
+        let no_pane = Thread { kind: Kind::Checkout, pane_id: String::new(), worktree_path: String::new(), ..worktree_thread() };
+        assert_eq!(restart_plan(&no_pane, &gone(), false, now()).unwrap(), RestartPlan::Create);
+    }
+
+    #[test]
+    fn worktree_retries_are_bounded_and_specific_to_config_locks() {
+        let mut attempts = 0;
+        let mut cleanups = 0;
+        let error = worktree_create_with_retry::<()>(
+            || {
+                attempts += 1;
+                Err(HerdrError { code: "worktree_create_failed".into(), message: "could not lock config file .git/config: File exists".into() })
+            },
+            || cleanups += 1,
+        )
+        .unwrap_err();
+        assert_eq!((attempts, cleanups), (5, 5));
+        assert!(error.message.contains("could not lock config file"));
+
+        let mut attempts = 0;
+        let mut cleanups = 0;
+        let error = worktree_create_with_retry::<()>(
+            || {
+                attempts += 1;
+                Err(HerdrError { code: "worktree_create_failed".into(), message: "permission denied".into() })
+            },
+            || cleanups += 1,
+        )
+        .unwrap_err();
+        assert_eq!((attempts, cleanups), (1, 1));
+        assert_eq!(error.message, "permission denied");
+    }
+
+    #[test]
+    fn local_cleanup_deletes_only_an_empty_unused_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
+        let git = |args: &[&str]| {
+            let out = run(args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        git(&["add", "base.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        let cwd = repo.to_string_lossy().into_owned();
+        let branch = "hp/demo/t-0001-empty";
+        let reference = format!("refs/heads/{branch}");
+        git(&["branch", branch, &base]);
+
+        drop_empty_local_branch(&crate::runner::RealRunner, &cwd, branch, &base);
+        assert!(!run(&["show-ref", "--verify", "--quiet", &reference]).status.success());
+
+        // A commit made after the failed create is never sacrificed to cleanup.
+        git(&["branch", branch, &base]);
+        let tree = git(&["rev-parse", &format!("{base}^{{tree}}")]);
+        let advanced = git(&["commit-tree", &tree, "-p", &base, "-m", "advanced"]);
+        git(&["update-ref", &reference, &advanced, &base]);
+        drop_empty_local_branch(&crate::runner::RealRunner, &cwd, branch, &base);
+        assert_eq!(git(&["rev-parse", &reference]), advanced);
+
+        // Even at the base commit, a branch checked out anywhere is kept.
+        let checked = "hp/demo/t-0001-checked";
+        let checked_ref = format!("refs/heads/{checked}");
+        let checked_path = root.path().join("checked out").to_string_lossy().into_owned();
+        git(&["branch", checked, &base]);
+        git(&["worktree", "add", "-q", &checked_path, checked]);
+        drop_empty_local_branch(&crate::runner::RealRunner, &cwd, checked, &base);
+        assert_eq!(git(&["rev-parse", &checked_ref]), base);
+
+        // Missing or inconclusive repository facts fail closed.
+        let fake = crate::runner::fake::FakeRunner::new();
+        fake.on("rev-parse --verify --quiet", crate::runner::fake::ok(&format!("{base}\n")));
+        fake.on("worktree list --porcelain", crate::runner::fake::fail(1, "cannot inspect"));
+        drop_empty_local_branch(&fake, &cwd, checked, &base);
+        assert_eq!(fake.count("update-ref -d"), 0);
+        let fake = crate::runner::fake::FakeRunner::new();
+        fake.on("rev-parse --verify --quiet", crate::runner::fake::fail(1, "cannot inspect"));
+        drop_empty_local_branch(&fake, &cwd, checked, &base);
+        assert_eq!((fake.count("worktree list"), fake.count("update-ref -d")), (0, 0));
     }
 
     #[test]

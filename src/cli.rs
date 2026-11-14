@@ -9,7 +9,7 @@ use crate::paths::{self, Ctx, Env, SessionFlags};
 use crate::project::{self, Project, Status};
 use crate::runner::RealRunner;
 use crate::threads::{self, ResolveArgs, StartArgs};
-use crate::{actions, adopt, doctor, inbox, lifecycle, overview, routine, ticker};
+use crate::{actions, adopt, doctor, lifecycle, overview, routine, ticker};
 
 #[derive(Parser)]
 #[command(name = "herdr-projects", version = crate::VERSION, about = "Projects for herdr")]
@@ -218,7 +218,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Change one setting in PROJECT.md (name, goal, coordinator_profile, thread_profile, max_parallel_threads, auto_resolve_days, nudge, mute, repos.add, repos.remove)
+    /// Change one setting in PROJECT.md (name, goal, coordinator_profile, thread_profile, auto_resolve_days, nudge, mute, repos.add, repos.remove)
     Set { slug: String, key: String, value: String },
     /// Open a file: text in a new Herdr tab running $EDITOR, anything else with the system opener
     OpenFile {
@@ -330,7 +330,7 @@ enum CoordinatorCommand {
 
 #[derive(Subcommand)]
 enum ThreadCommand {
-    /// Start a thread: a worktree workspace for --repo, else a tab in the project workspace
+    /// Start a thread: a worktree workspace for --repo, else a tab in the project's threads Space
     Start {
         slug: String,
         #[arg(long)]
@@ -342,8 +342,8 @@ enum ThreadCommand {
         /// The agent's profile (harness, model, effort, flags), one the project allows (default: thread_profile in PROJECT.md); `context` lists them
         #[arg(long, alias = "agent", value_name = "NAME")]
         profile: Option<String>,
-        /// Placement, not the agent: worktree (default with --repo), tab (default without), or checkout (a tab on the repo's main checkout)
-        #[arg(long, value_name = "worktree|tab|checkout")]
+        /// Placement, not the agent: worktree (the only placement with --repo) or tab (a task with no repository; runs in the project's threads Space)
+        #[arg(long, value_name = "worktree|tab")]
         kind: Option<String>,
         #[arg(long, value_name = "REF")]
         base: Option<String>,
@@ -429,6 +429,14 @@ enum ThreadCommand {
     },
     /// Record that the user has seen the current report
     Ack { slug: String, id: String },
+    /// Assign a thread to a registered coordinator by name (claim an unassigned one)
+    Assign {
+        slug: String,
+        id: String,
+        /// The coordinator's registered name (`hpc-<slug>` family)
+        #[arg(long, value_name = "NAME")]
+        coordinator: String,
+    },
     /// Resolve a thread: final copy home, then its worktree, merged branch and tab are cleaned up (reports and library are kept)
     Resolve {
         slug: String,
@@ -708,8 +716,7 @@ pub fn run() -> Result<()> {
         Command::Unfocus { session } => overview::unfocus(&ctx, &session.into()),
         Command::Inbox { command } => match command {
             InboxCommand::Done { slug, ids, all } => {
-                let project = Project::load(&ctx.root, &slug)?;
-                let moved = inbox::done(&project, &ids, all)?;
+                let moved = coordinator::inbox_done(&ctx, &slug, &ids, all)?;
                 println!("{moved} item(s) moved to inbox/done");
                 Ok(())
             }
@@ -759,6 +766,7 @@ pub fn run() -> Result<()> {
             ThreadCommand::List { slug, json } => threads::print_list(&ctx, &slug, json),
             ThreadCommand::Show { slug, id, json } => threads::print_show(&ctx, &slug, &id, json),
             ThreadCommand::Ack { slug, id } => threads::ack(&ctx, &slug, &id),
+            ThreadCommand::Assign { slug, id, coordinator } => threads::assign(&ctx, &slug, &id, &coordinator),
             ThreadCommand::Resolve { slug, id, reopen, keep_worktree, skip_copy, discard_uncopied } => {
                 threads::resolve(&ctx, &slug, &id, &ResolveArgs { reopen, keep_worktree, skip_copy, discard_uncopied })
             }

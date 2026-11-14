@@ -24,7 +24,7 @@ One line under `## Backlog` (create `TASKS.md` with `# Tasks`, a blank line, and
 ```
 
 - `<n>` is the current iteration (0 at setup). `<max>` and `<limit>` are numbers or `none` for an explicit "no limit".
-- `<step>` is one of: `setup`, `waiting for slot`, `maker t-NNNN`, `reviewer t-NNNN`, `landing t-NNNN`, `paused`, `blocked t-NNNN`.
+- `<step>` is one of: `setup`, `maker t-NNNN`, `reviewer t-NNNN`, `landing t-NNNN`, `paused`, `blocked t-NNNN`.
 - Only the ratchet changes this line. It is created on the go-ahead and deleted at stop.
 
 ### Scratch file
@@ -88,8 +88,6 @@ Run `hp context <project>` at the start of every turn. Find this run's threads b
 | A run thread is still `Working` | Nothing to do. Say where the run is in one line. |
 
 **Continue or stop,** after every finished iteration: stop when the reviewer said `SUCCESS: MET` and that candidate landed `MERGED`, when `<n>` reached `<max>`, when the streak reached `<limit>`, when the user said stop, or on `landing blocked`. Otherwise set the next step and launch the next maker in the same turn.
-
-**Working-thread check,** before every start: count the threads listed as `Working` under `## Open threads`, not counting this run's own maker. If the count is at least `max_parallel_threads`, set step `waiting for slot` and retry on the next turn.
 
 ## 3. Starting a run thread
 
