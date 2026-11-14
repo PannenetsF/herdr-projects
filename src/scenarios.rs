@@ -3060,6 +3060,180 @@ fn a_recorded_threads_space_is_rejected_when_its_id_was_reused_after_a_restart()
     assert!(last.display().contains("--label Demo · threads"), "{}", last.display());
 }
 
+#[test]
+fn a_failed_first_tab_creation_closes_its_new_space_before_restart() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let workspace_number = Rc::new(RefCell::new(0));
+    let n = workspace_number.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("workspace create"),
+        move |_| {
+            *n.borrow_mut() += 1;
+            let workspace = if *n.borrow() == 1 { "w7" } else { "w8" };
+            Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"{workspace}","tab_id":"{workspace}:t1","pane_id":"{workspace}:p1"}}}}}}"#)))
+        },
+    );
+    let tab_number = Rc::new(RefCell::new(0));
+    let n = tab_number.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("tab create"),
+        move |_| {
+            *n.borrow_mut() += 1;
+            if *n.borrow() == 1 {
+                Ok(fail(1, r#"{"error":{"code":"timeout","message":"tab create timed out"}}"#))
+            } else {
+                Ok(ok(r#"{"result":{"root_pane":{"workspace_id":"w8","tab_id":"w8:t2","pane_id":"w8:p2"}}}"#))
+            }
+        },
+    );
+    world.runner.on("workspace close", ok(r#"{"result":{}}"#));
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+    world
+        .runner
+        .on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    let ctx = world.ctx();
+    let args = || StartArgs {
+        title: "Research".into(),
+        repo: None,
+        machine: None,
+        profile: None,
+        kind: Some(Kind::Tab),
+        base: None,
+        task: "Look.".into(),
+    };
+
+    let error = threads::start(&ctx, "demo", args())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("failed to start"), "{error}");
+    assert_eq!(
+        world.runner.count("workspace close w7"),
+        1,
+        "the Space with no proven thread tab is closed"
+    );
+    assert_eq!(
+        project.threads_workspace(),
+        "",
+        "the closed Space is not left for restart to reject"
+    );
+    assert_eq!(
+        thread::load(&project, "t-0001").unwrap().status,
+        Status::Failed
+    );
+
+    let restarted = threads::restart(&ctx, "demo", "t-0001", None).unwrap();
+    assert_eq!(
+        (restarted.workspace_id.as_str(), restarted.pane_id.as_str()),
+        ("w8", "w8:p2")
+    );
+    assert_eq!(world.runner.count("workspace create"), 2);
+    assert_eq!(
+        world.runner.count("tab close w7:t1"),
+        0,
+        "the failed Space was closed as a whole"
+    );
+    assert_eq!(
+        world.runner.count("tab close w8:t1"),
+        1,
+        "only the successful Space's root tab is closed"
+    );
+    assert_eq!(project.threads_workspace(), "w8");
+}
+
+#[test]
+fn archive_recovers_a_root_only_threads_space_after_its_root_tab_close_failed() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    world.runner.on(
+        "workspace create",
+        ok(r#"{"result":{"root_pane":{"workspace_id":"w7","tab_id":"w7:t1","pane_id":"w7:p1"}}}"#),
+    );
+    world.runner.on(
+        "tab create",
+        ok(r#"{"result":{"root_pane":{"workspace_id":"w7","tab_id":"w7:t2","pane_id":"w7:p2"}}}"#),
+    );
+    world.runner.on(
+        "tab close",
+        fail(
+            1,
+            r#"{"error":{"code":"timeout","message":"tab close timed out"}}"#,
+        ),
+    );
+    world
+        .runner
+        .on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    world.runner.on("workspace close", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+    threads::start(
+        &ctx,
+        "demo",
+        StartArgs {
+            title: "Research".into(),
+            repo: None,
+            machine: None,
+            profile: None,
+            kind: Some(Kind::Tab),
+            base: None,
+            task: "Look.".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(project.threads_workspace(), "w7");
+
+    // The last thread tab later went away, but the failed root close left the
+    // Space alive. No pane under threads/ remains to prove ownership.
+    let home = project.canonical_dir().to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w7", "w7:t1", "w7:p1", &home));
+    crate::lifecycle::set_status(&ctx, "demo", project::Status::Archived).unwrap();
+    assert_eq!(world.runner.count("workspace close w7"), 1);
+    assert_eq!(project.threads_workspace(), "");
+}
+
+#[test]
+fn archive_keeps_a_threads_space_id_after_close_failure_and_forgets_it_once_gone() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    project.set_threads_workspace("w7").unwrap();
+    let cwd = project
+        .canonical_dir()
+        .join("threads/t-0001")
+        .to_string_lossy()
+        .into_owned();
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w7", "w7:t2", "w7:p2", &cwd));
+    let reply = Rc::new(RefCell::new(fail(
+        1,
+        r#"{"error":{"code":"timeout","message":"workspace close timed out"}}"#,
+    )));
+    let next = reply.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("workspace close w7"),
+        move |_| Ok(next.borrow().clone()),
+    );
+    let ctx = world.ctx();
+
+    crate::lifecycle::set_status(&ctx, "demo", project::Status::Archived).unwrap();
+    assert_eq!(
+        project.threads_workspace(),
+        "w7",
+        "an uncertain close must not orphan the open Space"
+    );
+
+    *reply.borrow_mut() = fail(
+        1,
+        r#"{"error":{"code":"workspace_not_found","message":"already closed"}}"#,
+    );
+    crate::lifecycle::set_status(&ctx, "demo", project::Status::Archived).unwrap();
+    assert_eq!(world.runner.count("workspace close w7"), 2);
+    assert_eq!(
+        project.threads_workspace(),
+        "",
+        "confirmed absence releases the record"
+    );
+}
+
 /// Herdr's default socket, where the ticker looks for hand-started agents.
 fn default_socket(world: &World) -> String {
     let socket = world.home.path().join(".config/herdr/herdr.sock");
@@ -4289,6 +4463,100 @@ fn a_remote_threads_profile_is_resolved_on_its_machine() {
 
 fn rename_args<'a>(from: &'a str, to: &'a str, name: Option<&'a str>, dry_run: bool) -> crate::rename::Args<'a> {
     crate::rename::Args { from, to, name, dry_run, by_ticker: false }
+}
+
+#[test]
+fn rename_verifies_a_threads_space_and_keeps_its_id_when_relabeling_fails() {
+    let world = World::new();
+    let project = world.project("scratch", "a.sock");
+    project.set_threads_workspace("w7").unwrap();
+    let old_threads = project
+        .canonical_dir()
+        .join("threads/t-0001")
+        .to_string_lossy()
+        .into_owned();
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w7", "w7:t2", "w7:p2", &old_threads));
+    let reply = Rc::new(RefCell::new(fail(
+        1,
+        r#"{"error":{"code":"timeout","message":"workspace rename timed out"}}"#,
+    )));
+    let next = reply.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("workspace rename w7"),
+        move |_| Ok(next.borrow().clone()),
+    );
+    world.runner.on("workspace rename", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+
+    let out = crate::rename::run(
+        &ctx,
+        &rename_args("scratch", "home", Some("Home Base"), false),
+    )
+    .unwrap();
+    assert!(
+        out.left
+            .iter()
+            .any(|note| note.contains("threads Space w7") && note.contains("timed out")),
+        "{:?}",
+        out.left
+    );
+    let home = Project::load(&world.root, "home").unwrap();
+    assert_eq!(
+        home.threads_workspace(),
+        "w7",
+        "a transient relabeling failure keeps the live Space recorded"
+    );
+    assert_eq!(world.runner.count("workspace rename w7"), 1);
+
+    // A confirmed-closed verified Space is forgotten.
+    let closed = World::new();
+    let project = closed.project("scratch", "a.sock");
+    project.set_threads_workspace("w8").unwrap();
+    let old_threads = project
+        .canonical_dir()
+        .join("threads/t-0001")
+        .to_string_lossy()
+        .into_owned();
+    *closed.panes.borrow_mut() = format!("[{}]", pane_json("w8", "w8:t2", "w8:p2", &old_threads));
+    closed.runner.on(
+        "workspace rename w8",
+        fail(
+            1,
+            r#"{"error":{"code":"workspace_not_found","message":"already closed"}}"#,
+        ),
+    );
+    closed.runner.on("workspace rename", ok(r#"{"result":{}}"#));
+    crate::rename::run(
+        &closed.ctx(),
+        &rename_args("scratch", "home", Some("Home Base"), false),
+    )
+    .unwrap();
+    assert_eq!(
+        Project::load(&closed.root, "home")
+            .unwrap()
+            .threads_workspace(),
+        ""
+    );
+
+    // The same id in another session incarnation may belong to somebody else:
+    // a pane outside this project's threads/ folder must not be relabeled.
+    let stale = World::new();
+    let project = stale.project("scratch", "a.sock");
+    project.set_threads_workspace("w9").unwrap();
+    *stale.panes.borrow_mut() = format!("[{}]", pane_json("w9", "w9:t1", "w9:p1", "/unrelated"));
+    stale.runner.on("workspace rename", ok(r#"{"result":{}}"#));
+    crate::rename::run(
+        &stale.ctx(),
+        &rename_args("scratch", "home", Some("Home Base"), false),
+    )
+    .unwrap();
+    assert_eq!(stale.runner.count("workspace rename w9"), 0);
+    assert_eq!(
+        Project::load(&stale.root, "home")
+            .unwrap()
+            .threads_workspace(),
+        "w9"
+    );
 }
 
 #[test]

@@ -337,9 +337,47 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
             // thread's tab exists, so herdr closes the Space by itself when
             // its last thread tab goes.
             let (threads_workspace, root_tab) = threads_space(project, view)?;
-            let created = view.herdr.tab_create(&threads_workspace, &folder, &record.title, false)?;
+            let created = match view.herdr.tab_create(
+                &threads_workspace,
+                &folder,
+                &record.title,
+                false,
+            ) {
+                Ok(created) => created,
+                Err(error) => {
+                    if root_tab.is_some() {
+                        // This Space was made for the tab that just failed.
+                        // Close the whole Space, not only its root tab, in case
+                        // herdr created the thread tab but failed to reply.
+                        match view.herdr.call(
+                            &["workspace", "close", &threads_workspace],
+                            crate::herdr::CALL_TIMEOUT,
+                        ) {
+                            Ok(_) => project.set_threads_workspace("")?,
+                            Err(close_error) if close_error.code == "workspace_not_found" => {
+                                project.set_threads_workspace("")?
+                            }
+                            Err(close_error) => {
+                                return Err(anyhow::Error::new(error).context(format!(
+                                    "the new threads Space {threads_workspace} could not be closed ({close_error}); its id stays recorded so archive can retry"
+                                )));
+                            }
+                        }
+                    }
+                    return Err(error.into());
+                }
+            };
             if let Some(tab) = root_tab {
-                let _ = view.herdr.call(&["tab", "close", &tab], crate::herdr::CALL_TIMEOUT);
+                match view
+                    .herdr
+                    .call(&["tab", "close", &tab], crate::herdr::CALL_TIMEOUT)
+                {
+                    Ok(_) => {}
+                    Err(error) if error.code == "tab_not_found" => {}
+                    Err(error) => eprintln!(
+                        "warning: the threads Space root tab {tab} could not be closed ({error}); archive will close the recorded Space"
+                    ),
+                }
             }
             created
         }
@@ -373,20 +411,21 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
 /// root tab, which `place_tab` closes once the thread's own tab exists: a
 /// Space holding one shell would otherwise never be closed by herdr when its
 /// last thread tab goes.
+pub(crate) fn pane_in_threads(pane: &Pane, threads_dir: &Path) -> bool {
+    [pane.cwd.as_str(), pane.foreground_cwd.as_str()]
+        .into_iter()
+        .any(|dir| !dir.is_empty() && Path::new(dir).starts_with(threads_dir))
+}
+
 fn threads_space(project: &Project, view: &SessionView) -> Result<(String, Option<String>)> {
     let home = project.canonical_dir();
     let threads = home.join("threads");
-    let in_threads = |pane: &Pane| {
-        [pane.cwd.as_str(), pane.foreground_cwd.as_str()]
-            .into_iter()
-            .any(|dir| !dir.is_empty() && Path::new(dir).starts_with(&threads))
-    };
     let label = {
         let (settings, _) = project.read_project_md()?;
         format!("{} · threads", project::display_name(&settings.name, &project.slug))
     };
     let recorded = project.threads_workspace();
-    if !recorded.is_empty() && view.panes.iter().any(|p| p.workspace_id == recorded && in_threads(p)) {
+    if !recorded.is_empty() && view.panes.iter().any(|p| p.workspace_id == recorded && pane_in_threads(p, &threads)) {
         return Ok((recorded, None));
     }
     let created = view.herdr.workspace_create(&home, &label, false)?;
