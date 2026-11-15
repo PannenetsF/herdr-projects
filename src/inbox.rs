@@ -218,7 +218,10 @@ pub fn ensure_buckets(project: &Project) -> Result<()> {
 }
 
 /// Ids this coordinator was already shown: its own bucket plus the shared
-/// legacy baseline. `None` is the reader-less baseline itself.
+/// legacy baseline. `None` is the reader-less baseline itself. The ticker's
+/// owner nudges use [`seen_own`] instead; this remains for tests and the
+/// legacy-inclusive view of what a `context` read counts as seen.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn seen(project: &Project, coordinator: Option<&str>) -> BTreeSet<String> {
     let _ = ensure_buckets(project);
     let mut all = read_bucket(project, LEGACY_BUCKET);
@@ -250,6 +253,22 @@ pub fn seen_union(project: &Project) -> BTreeSet<String> {
         }
     }
     all
+}
+
+/// Ids shown to THIS coordinator alone: its own named bucket, never the
+/// shared legacy baseline and never another coordinator's bucket. An owner
+/// nudge is suppressed only by what that owner itself saw: a bare human
+/// `context` (or an unregistered reader from before the identity gate) marks
+/// the shared legacy bucket, which must not silence an owner-specific nudge —
+/// the legacy bucket is pre-owner migration data, not a cross-owner seen
+/// channel. An invalid name reads as nothing seen, so it fails toward a
+/// nudge. Project-wide items keep the legacy-inclusive [`seen_union`].
+pub fn seen_own(project: &Project, coordinator: &str) -> BTreeSet<String> {
+    let _ = ensure_buckets(project);
+    if !valid_bucket(coordinator) {
+        return BTreeSet::new();
+    }
+    read_bucket(project, coordinator)
 }
 
 /// Records that `context` showed these items to this coordinator, so they
@@ -528,5 +547,34 @@ mod tests {
         assert!(seen(&project, Some("hpc-demo")).contains(&id));
         assert!(seen(&project, None).contains(&id));
         assert!(project.state_dir().join("inbox-seen/_legacy.json").is_file());
+    }
+
+    #[test]
+    fn an_owner_seen_set_ignores_the_shared_legacy_baseline_and_other_buckets() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let owned = write(&project, "thread-state", "t-0001", "idle", "one", "").unwrap();
+        let other = write(&project, "thread-state", "t-0002", "idle", "two", "").unwrap();
+        // A bare human/reader-less context read lands in the shared legacy
+        // bucket, the way the production _legacy entries got there.
+        mark_seen(&project, None, std::slice::from_ref(&owned)).unwrap();
+        mark_seen(&project, Some("hpc-demo-1"), std::slice::from_ref(&other)).unwrap();
+
+        // The owner's own nudge seen set contains neither mark: legacy data
+        // and another coordinator's bucket cannot suppress its nudge.
+        assert!(seen_own(&project, "hpc-demo").is_empty());
+        // The legacy-inclusive views still see it: project-wide semantics and
+        // the coordinator's own `context` digest are unchanged.
+        assert!(seen(&project, Some("hpc-demo")).contains(&owned));
+        assert!(seen_union(&project).contains(&owned));
+        assert!(seen_union(&project).contains(&other));
+
+        // The owner reading its own context suppresses only via its bucket.
+        mark_seen(&project, Some("hpc-demo"), std::slice::from_ref(&owned)).unwrap();
+        assert_eq!(seen_own(&project, "hpc-demo").iter().collect::<Vec<_>>(), vec![&owned]);
+        assert!(!seen_own(&project, "hpc-demo").contains(&other));
+        // An invalid bucket name fails toward a nudge: nothing is seen.
+        assert!(seen_own(&project, "../evil").is_empty());
+        assert!(seen_own(&project, "").is_empty());
     }
 }

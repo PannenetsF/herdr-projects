@@ -965,7 +965,14 @@ fn box_empty_for_a_while(project: &Project) {
 }
 
 fn nudges(world: &World) -> Vec<String> {
-    world.runner.calls.borrow().iter().filter(|c| c.display().contains("agent prompt")).filter_map(|c| c.args.last().cloned()).filter(|a| a.starts_with("[hp inbox]")).collect()
+    world
+        .runner
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.display().contains("agent prompt"))
+        .filter_map(|c| c.args.iter().find(|a| a.starts_with("[hp inbox]")).cloned())
+        .collect()
 }
 
 /// Makes the fixture thread already Idle, so a test about something else does
@@ -1017,8 +1024,10 @@ fn a_finishing_thread_gives_one_item_and_one_nudge_until_a_new_item_arrives() {
     // One nudge, to the coordinator's pane, saying what happened.
     assert_eq!(nudges(&world), ["[hp inbox] t-0001 new report"]);
     let calls = world.runner.calls.borrow();
-    let nudge = calls.iter().find(|c| c.args.last().is_some_and(|a| a.starts_with("[hp inbox]"))).unwrap();
+    let nudge = calls.iter().find(|c| c.args.iter().any(|a| a.starts_with("[hp inbox]"))).unwrap();
     assert!(nudge.args.contains(&"w1:p1".to_string()));
+    // The send waits for herdr's own confirmation that the agent took it.
+    assert!(nudge.args.contains(&"--wait".to_string()) && nudge.args.contains(&"--until".to_string()), "{}", nudge.display());
     drop(calls);
 
     // Working and idle again on an unchanged report: nothing.
@@ -3758,6 +3767,254 @@ fn nudges_pin_dies_when_no_coordinator_remains() {
     assert!(crate::steps::load_state(&project).nudge_sessions.is_empty());
 }
 
+const STALLED_PROMPT: &str = r#"{"error":{"code":"agent_prompt_stalled","message":"agent did not start working"}}"#;
+
+/// A project with one idle coordinator `hpc-demo` owning `t-0001`, both panes
+/// listed and an empty Claude box. Unlike `finished_world` it installs no
+/// `agent prompt` rule, so the test scripts its own confirmed/stalled answer
+/// (FakeRunner keeps the first matching rule for a command).
+fn owned_nudge_world() -> (World, Project, Thread) {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    set_front_matter(&project, "nudge = true");
+    let t = world.thread(&project, world.home.path(), |_| {});
+    set_agents(&world, &project, "idle");
+    (world, project, t)
+}
+
+/// Discovers the coordinator, ages its idle guard, then backdates the first
+/// empty-box observation, so the following tick performs the actual send.
+fn reach_send_tick(world: &World, project: &Project, memory: &mut Memory) {
+    let ctx = world.ctx();
+    ticker::tick_for_test(&ctx, memory);
+    idle_for_a_minute(project);
+    ticker::tick_for_test(&ctx, memory);
+    box_empty_for_a_while(project);
+}
+
+/// The production failure shape: an owner-specific item, a real bare-human
+/// `context` read (legacy bucket), then the owner idle with an empty box must
+/// still be nudged. The owner's own bucket read remains the one thing that
+/// suppresses its nudge, and project-wide legacy semantics are unchanged.
+#[test]
+fn a_bare_human_context_read_does_not_silence_an_owner_nudge() {
+    let (world, project, t) = owned_nudge_world();
+    let owned = inbox::write_thread(&project, &t, "thread-state", "idle", "s", "").unwrap();
+    let routine = inbox::write(&project, "routine", "nightly", "due", "d", "").unwrap();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("agent prompt"),
+        |_| Ok(ok(r#"{"result":{}}"#)),
+    );
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+
+    // No Herdr marker and no provable pane: the identity protocol cannot find
+    // a ps table (the FakeRunner has no ps rule), so this is Caller::Human,
+    // the same classification a person's real terminal gets.
+    coordinator::context(&ctx, "demo", false).unwrap();
+    assert!(inbox::seen(&project, None).contains(&owned));
+    assert!(inbox::seen_own(&project, "hpc-demo").is_empty(), "the legacy mark is not the owner's");
+
+    reach_send_tick(&world, &project, &mut memory);
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(nudges(&world), ["[hp inbox] t-0001 idle"]);
+    let state = crate::steps::load_state(&project);
+    assert!(state.nudged.contains_key("hpc-demo"));
+    assert!(state.nudge_attempts.is_empty(), "a confirmed send leaves nothing in flight");
+
+    // A project-wide item marked through the same legacy bucket stays
+    // suppressed: the global queue keeps its project-wide union semantics.
+    assert!(inbox::seen_union(&project).contains(&routine));
+    assert!(!nudges(&world).iter().any(|n| n.contains("nightly")));
+
+    // Negative control: the owner's own `context` write (its named bucket)
+    // suppresses a later item of its own.
+    let second = inbox::write_thread(&project, &t, "thread-state", "new report", "s2", "").unwrap();
+    inbox::mark_seen(&project, Some("hpc-demo"), std::slice::from_ref(&second)).unwrap();
+    assert!(inbox::seen_own(&project, "hpc-demo").contains(&second));
+    for _ in 0..3 {
+        ticker::tick_for_test(&ctx, &mut memory);
+    }
+    assert_eq!(nudges(&world), ["[hp inbox] t-0001 idle"], "the owner-read item never nudges");
+}
+
+/// A confirmed prompt is the normal path: one typed line, one recorded hash,
+/// nothing left in flight.
+#[test]
+fn a_confirmed_nudge_is_recorded_once_and_never_retried() {
+    let (world, project, t) = owned_nudge_world();
+    inbox::write_thread(&project, &t, "thread-state", "idle", "s", "").unwrap();
+    world.runner.on_fn(|cmd| cmd.display().contains("agent prompt"), |_| Ok(ok(r#"{"result":{}}"#)));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    reach_send_tick(&world, &project, &mut memory);
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    for _ in 0..3 {
+        ticker::tick_for_test(&ctx, &mut memory);
+    }
+    assert_eq!(world.runner.count("agent prompt"), 1, "the set is announced once");
+    assert!(crate::steps::load_state(&project).nudged.contains_key("hpc-demo"));
+}
+
+/// herdr could not confirm the send, but the line reached the conversation:
+/// the next tick proves it on screen and records it without typing again.
+#[test]
+fn an_unconfirmed_nudge_visible_above_an_empty_box_is_confirmed_without_a_second_copy() {
+    let (world, project, t) = owned_nudge_world();
+    inbox::write_thread(&project, &t, "thread-state", "idle", "s", "").unwrap();
+    world.runner.on_fn(|cmd| cmd.display().contains("agent prompt"), |_| Ok(fail(1, STALLED_PROMPT)));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    reach_send_tick(&world, &project, &mut memory);
+    ticker::tick_for_test(&ctx, &mut memory); // typed once, unconfirmed
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    assert!(crate::steps::load_state(&project).nudge_attempts.contains_key("hpc-demo"));
+
+    // The line is in the conversation above an empty input box: taken.
+    *world.screen.borrow_mut() = format!("[hp inbox] t-0001 idle\n{}", claude_screen(None));
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent prompt"), 1, "no second copy is typed");
+    assert_eq!(world.runner.count("send-keys"), 0);
+    let state = crate::steps::load_state(&project);
+    assert!(state.nudged.contains_key("hpc-demo"));
+    assert!(state.nudge_attempts.is_empty());
+}
+
+/// The unconfirmed line is sitting in the input box: Enter submits it, and
+/// only once it appears in the conversation is the set recorded.
+#[test]
+fn an_unconfirmed_nudge_left_in_the_box_gets_enter_never_a_second_copy() {
+    let (world, project, t) = owned_nudge_world();
+    inbox::write_thread(&project, &t, "thread-state", "idle", "s", "").unwrap();
+    world.runner.on_fn(|cmd| cmd.display().contains("agent prompt"), |_| Ok(fail(1, STALLED_PROMPT)));
+    world.runner.on("agent send-keys", ok(""));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    reach_send_tick(&world, &project, &mut memory);
+    ticker::tick_for_test(&ctx, &mut memory); // typed once, unconfirmed
+    assert_eq!(world.runner.count("agent prompt"), 1);
+
+    // Our own line in the box: Enter, never a retype.
+    *world.screen.borrow_mut() = claude_screen(Some("[hp inbox] t-0001 idle"));
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    assert_eq!(world.runner.count("agent send-keys w1:p1 enter"), 1);
+    assert!(!crate::steps::load_state(&project).nudged.contains_key("hpc-demo"), "Enter is not yet proof of delivery");
+
+    // Now it is in the conversation: confirmed on the next tick.
+    *world.screen.borrow_mut() = format!("[hp inbox] t-0001 idle\n{}", claude_screen(None));
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    assert!(crate::steps::load_state(&project).nudged.contains_key("hpc-demo"));
+}
+
+/// A send whose text vanished (empty box, line nowhere on screen) may be
+/// typed again, but only `NUDGE_MAX_ATTEMPTS` times for one unchanged set;
+/// afterwards the nudge goes quiet instead of storming, and a changed item
+/// set grants a fresh budget.
+#[test]
+fn a_dropped_nudge_retries_to_a_cap_then_waits_for_a_new_set() {
+    let (world, project, t) = owned_nudge_world();
+    inbox::write_thread(&project, &t, "thread-state", "idle", "s", "").unwrap();
+    // Starts unconfirmed (every send appears dropped on the empty screen);
+    // flipped to a confirmed reply once the new item set arrives.
+    let confirm = std::cell::Cell::new(false);
+    let reply = std::rc::Rc::new(confirm);
+    let answer = reply.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("agent prompt"),
+        move |_| if answer.get() { Ok(ok(r#"{"result":{}}"#)) } else { Ok(fail(1, STALLED_PROMPT)) },
+    );
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    reach_send_tick(&world, &project, &mut memory);
+
+    // The screen keeps reading as an empty box with no line anywhere, so each
+    // reconciliation judges the previous send dropped; reconciliation and the
+    // bounded retype alternate across ticks.
+    for _ in 0..(crate::steps::NUDGE_MAX_ATTEMPTS as usize * 2) {
+        ticker::tick_for_test(&ctx, &mut memory);
+    }
+    assert_eq!(world.runner.count("agent prompt"), crate::steps::NUDGE_MAX_ATTEMPTS as usize, "no duplicate storm past the cap");
+    let state = crate::steps::load_state(&project);
+    assert!(!state.nudged.contains_key("hpc-demo"), "an unconfirmed set is never marked done");
+    assert_eq!(state.nudge_attempts.get("hpc-demo").unwrap().attempts, crate::steps::NUDGE_MAX_ATTEMPTS);
+
+    // A new item changes the set hash: the attempt budget resets. With herdr
+    // now confirming, one further send goes out and the set is recorded.
+    reply.set(true);
+    inbox::write_thread(&project, &t, "thread-state", "new report", "s2", "").unwrap();
+    for _ in 0..3 {
+        ticker::tick_for_test(&ctx, &mut memory);
+    }
+    assert_eq!(world.runner.count("agent prompt"), crate::steps::NUDGE_MAX_ATTEMPTS as usize + 1);
+    let state = crate::steps::load_state(&project);
+    assert!(state.nudged.contains_key("hpc-demo"), "the confirmed new set is marked done");
+    assert!(state.nudge_attempts.is_empty(), "confirmation clears the in-flight record");
+}
+
+/// A refusal before typing (blocked pane, dead pane, unreachable session)
+/// charges no attempt and records nothing: the next tick retries the same
+/// set from a clean slate instead of burning the budget.
+#[test]
+fn a_refused_nudge_types_nothing_and_charges_no_attempt() {
+    let (world, project, t) = owned_nudge_world();
+    inbox::write_thread(&project, &t, "thread-state", "idle", "s", "").unwrap();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("agent prompt"),
+        |_| Ok(fail(1, r#"{"error":{"code":"agent_blocked","message":"blocked"}}"#)),
+    );
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    reach_send_tick(&world, &project, &mut memory);
+    for _ in 0..3 {
+        ticker::tick_for_test(&ctx, &mut memory); // the refusal is logged, not propagated
+    }
+    assert_eq!(world.runner.count("agent prompt"), 3, "one clean retry per tick");
+    let state = crate::steps::load_state(&project);
+    assert!(state.nudge_attempts.is_empty(), "nothing was typed, so nothing is in flight");
+    assert!(!state.nudged.contains_key("hpc-demo"));
+}
+
+/// Two ready routing keys in one tick produce at most one fresh send; the
+/// second key goes on the next tick, bounding how long one tick can block.
+#[test]
+fn only_one_fresh_nudge_is_typed_per_tick() {
+    let (world, project, _env_a, _env_b) = two_coordinator_world();
+    set_front_matter(&project, "nudge = true");
+    let make = |id: &str, owner: &str| {
+        thread::allocate(&project, |t| {
+            t.id = id.into();
+            t.title = "Task".into();
+            t.status = Status::Open;
+            t.owner = owner.into();
+        })
+        .unwrap()
+    };
+    let first = make("t-0001", "hpc-demo");
+    let second = make("t-0002", "hpc-demo-1");
+    inbox::write_thread(&project, &first, "thread-state", "idle", "one", "").unwrap();
+    inbox::write_thread(&project, &second, "thread-state", "idle", "two", "").unwrap();
+    world.runner.on_fn(|cmd| cmd.display().contains("agent prompt"), |_| Ok(ok(r#"{"result":{}}"#)));
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_for_test(&ctx, &mut memory);
+    idle_for_a_minute(&project);
+    ticker::tick_for_test(&ctx, &mut memory);
+    let mut state = crate::steps::load_state(&project);
+    for wait in state.boxes.values_mut() {
+        wait.since = "2026-01-01T00:00:00Z".into();
+    }
+    crate::steps::save_state(&project, &state).unwrap();
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent prompt"), 2);
+    state = crate::steps::load_state(&project);
+    assert!(state.nudged.contains_key("hpc-demo") && state.nudged.contains_key("hpc-demo-1"));
+}
+
 /// Two registered coordinators live on the project's socket: the primary
 /// `hpc-demo` in w1:p1 and `hpc-demo-1` in w2:p1. Their env points each
 /// command at that pane.
@@ -3930,18 +4187,20 @@ fn nudges_route_to_the_owning_coordinators_pane_and_skip_unassigned_threads() {
         wait.since = "2026-01-01T00:00:00Z".into();
     }
     crate::steps::save_state(&project, &state).unwrap();
-    ticker::tick_for_test(&ctx, &mut memory); // both owner nudges go out
+    ticker::tick_for_test(&ctx, &mut memory); // one owner nudge per tick…
+    ticker::tick_for_test(&ctx, &mut memory); // …the second owner on the next one
 
     let prompts = world.runner.calls.borrow();
+    let nudge_line = |c: &crate::runner::Cmd| c.args.iter().find(|a| a.starts_with("[hp inbox]")).cloned();
     let to_primary: Vec<_> = prompts
         .iter()
         .filter(|c| c.display().contains("agent prompt") && c.args.contains(&"w1:p1".to_string()))
-        .filter_map(|c| c.args.last().cloned())
+        .filter_map(nudge_line)
         .collect();
     let to_secondary: Vec<_> = prompts
         .iter()
         .filter(|c| c.display().contains("agent prompt") && c.args.contains(&"w2:p1".to_string()))
-        .filter_map(|c| c.args.last().cloned())
+        .filter_map(nudge_line)
         .collect();
     drop(prompts);
     assert_eq!(to_primary, ["[hp inbox] t-0001 new report"], "{to_primary:?}");

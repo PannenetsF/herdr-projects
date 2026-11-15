@@ -255,9 +255,28 @@ pub fn respond(record: &mut Record, kind: &str, prefix: &str, now: i64) -> Optio
                 record.activity.clear();
                 record.reported_at = 0;
             }
+            // A new top-level request also retires a terminal Done/100: the
+            // follow-up message is a new task whose reminders a permanent Done
+            // would otherwise suppress. A non-terminal percent/activity is
+            // left for the next real report to overwrite — merely receiving a
+            // message is not itself new work.
+            if record.percent == Some(100) {
+                record.activity.clear();
+                record.percent = None;
+                record.reported_at = 0;
+            }
             Some(format!("Before task tools or a blocking question, check whether this request starts new work; if so report a fresh estimate. Then report before waiting for the user, for example `{prefix} report --unknown --activity 'Waiting for you'`."))
         }
         "PostToolUse" => {
+            // Actual new tool work after a terminal Done report proves the
+            // task is no longer finished: clear the completed record so
+            // reminders resume. Passive message receipt is not a tool event,
+            // so it can never trigger this.
+            if record.percent == Some(100) {
+                record.activity.clear();
+                record.percent = None;
+                record.reported_at = 0;
+            }
             let done = record.percent == Some(100);
             let due = now - record.reminded_at >= REMIND_SECS && !done && (record.reported_at == 0 || now - record.reported_at >= REMIND_SECS);
             if due {
@@ -418,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn reminders_are_throttled_to_once_a_minute_and_stop_at_done() {
+    fn reminders_are_throttled_to_once_a_minute_and_done_re_arms_on_new_tool_work() {
         let mut record = Record { reminded_at: 1000, ..Record::default() };
         assert!(respond(&mut record, "PostToolUse", "hp", 1030).is_none());
         assert!(respond(&mut record, "PostToolUse", "hp", 1061).is_some());
@@ -427,13 +446,61 @@ mod tests {
         record.reported_at = 1100;
         assert!(respond(&mut record, "PostToolUse", "hp", 1130).is_none());
         assert!(respond(&mut record, "PostToolUse", "hp", 1200).is_some());
-        record.percent = Some(100);
-        assert!(respond(&mut record, "PostToolUse", "hp", 9000).is_none());
-        assert!(respond(&mut record, "UserPromptSubmit", "hp", 9001).unwrap().contains("Waiting for you"));
-        let mut asked = Record { activity: WAITING.into(), percent: Some(40), reported_at: 5, ..Record::default() };
+        // A terminal Done record: the next PostToolUse proves real new work,
+        // clears the completed record and lets reminders fire again instead
+        // of staying suppressed for the whole follow-up request.
+        let mut done = Record { reminded_at: 1000, activity: DONE.into(), percent: Some(100), reported_at: 8000, ..Record::default() };
+        assert!(respond(&mut done, "PostToolUse", "hp", 9000).is_some());
+        assert_eq!(done.percent, None);
+        assert_eq!(done.reported_at, 0);
+        assert_eq!(done.activity, "");
+        assert!(!done.done());
+        assert!(respond(&mut done, "Stop", "hp", 9002).is_none());
+    }
+
+    #[test]
+    fn a_new_user_prompt_clears_terminal_done_but_keeps_a_live_report() {
+        // Terminal Done: the follow-up request starts a fresh, unreported task.
+        let mut done = Record { reminded_at: 500, activity: DONE.into(), percent: Some(100), reported_at: 500, ..Record::default() };
+        respond(&mut done, "UserPromptSubmit", "hp", 600);
+        assert!(!done.done());
+        assert_eq!(done.percent, None);
+        assert_eq!(done.reported_at, 0);
+        assert_eq!(done.activity, "");
+        assert_eq!(done.reminded_at, 600, "the throttle still resets on every prompt");
+
+        // A non-terminal report survives: passively receiving a message is
+        // not new work, and the next real report overwrites it anyway.
+        let mut active = Record { reminded_at: 400, activity: "Reading code".into(), percent: Some(50), reported_at: 500, ..Record::default() };
+        respond(&mut active, "UserPromptSubmit", "hp", 600);
+        assert_eq!(active.percent, Some(50));
+        assert_eq!(active.reported_at, 500);
+        assert_eq!(active.activity, "Reading code");
+
+        // The Waiting reset is unchanged in shape (percent is not its concern).
+        let mut asked = Record { activity: WAITING.into(), percent: Some(40), reported_at: 5, reminded_at: 1, ..Record::default() };
         respond(&mut asked, "UserPromptSubmit", "hp", 10);
         assert!(!asked.waiting(), "an answer clears the old question");
-        assert!(respond(&mut record, "Stop", "hp", 9002).is_none());
+        assert_eq!(asked.reported_at, 0);
+    }
+
+    #[test]
+    fn subagent_and_foreign_events_never_reach_the_done_reset() {
+        // The eligibility gate is the only thing protecting a Done record
+        // from another session's tool events: these must not look like the
+        // top-level agent's new work.
+        for event in [
+            json!({"hook_event_name":"PostToolUse","agent_id":"child","tool_input":{}}),
+            json!({"hook_event_name":"PostToolUse","subagent_id":"child","tool_input":{}}),
+            json!({"hook_event_name":"PostToolUse","transcript_path":"/x/subagents/y.jsonl","tool_input":{}}),
+        ] {
+            assert!(!eligible(&event), "{event}");
+        }
+        let mut done = Record { reminded_at: 1, activity: DONE.into(), percent: Some(100), reported_at: 1, ..Record::default() };
+        let main = "main";
+        done.session_id = main.into();
+        assert!(foreign_session(&done, &json!({"session_id":"sub"})));
+        assert!(!foreign_session(&done, &json!({"session_id": main})));
     }
 
     #[test]
