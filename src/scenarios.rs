@@ -995,6 +995,23 @@ fn set_agents(world: &World, project: &Project, thread_state: &str) {
     );
 }
 
+fn set_coordinator_session(world: &World, project: &Project, session: &str) {
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let mut coordinator: serde_json::Value = serde_json::from_str(&agent_json(
+        "w1",
+        "w1:t1",
+        "w1:p1",
+        &dir,
+        &crate::names::coordinator(&project.slug, 0),
+        "idle",
+    ))
+    .unwrap();
+    coordinator["agent_session"] = serde_json::json!({ "value": session });
+    let worker = agent_json("w2", "w2:t1", "w2:p1", &cwd, &format!("hp-{}-t-0001", project.slug), "idle");
+    *world.agents.borrow_mut() = format!("[{coordinator},{worker}]");
+}
+
 #[test]
 fn a_finishing_thread_gives_one_item_and_one_nudge_until_a_new_item_arrives() {
     let (world, project, t) = finished_world("done");
@@ -3909,6 +3926,48 @@ fn an_unconfirmed_nudge_left_in_the_box_gets_enter_never_a_second_copy() {
     assert!(crate::steps::load_state(&project).nudged.contains_key("hpc-demo"));
 }
 
+/// A native resume can re-use the pane while replacing the agent session.
+/// Neither its inherited draft nor its restored transcript may confirm or
+/// submit the previous session's in-flight nudge; the new session gets it.
+#[test]
+fn an_unconfirmed_nudge_never_leaks_into_a_replacement_agent_session() {
+    let (world, project, t) = owned_nudge_world();
+    inbox::write_thread(&project, &t, "thread-state", "idle", "s", "").unwrap();
+    let confirm = std::rc::Rc::new(std::cell::Cell::new(false));
+    let answer = confirm.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("agent prompt"),
+        move |_| if answer.get() { Ok(ok(r#"{"result":{}}"#)) } else { Ok(fail(1, STALLED_PROMPT)) },
+    );
+    set_coordinator_session(&world, &project, "sess-old");
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    reach_send_tick(&world, &project, &mut memory);
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+
+    set_coordinator_session(&world, &project, "sess-new");
+    *world.screen.borrow_mut() = claude_screen(Some("[hp inbox] t-0001 idle"));
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent send-keys"), 0, "the old session's draft is not ours to submit");
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    assert!(!crate::steps::load_state(&project).nudged.contains_key("hpc-demo"));
+
+    // The same line restored above an empty box is old transcript, not proof
+    // that this new native session consumed it.
+    *world.screen.borrow_mut() = format!("[hp inbox] t-0001 idle\n{}", claude_screen(None));
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    assert!(!crate::steps::load_state(&project).nudged.contains_key("hpc-demo"));
+
+    *world.screen.borrow_mut() = claude_screen(None);
+    box_empty_for_a_while(&project);
+    confirm.set(true);
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert_eq!(world.runner.count("agent prompt"), 2, "the replacement session receives the set");
+    assert!(crate::steps::load_state(&project).nudged.contains_key("hpc-demo"));
+}
+
 /// A send whose text vanished (empty box, line nowhere on screen) may be
 /// typed again, but only `NUDGE_MAX_ATTEMPTS` times for one unchanged set;
 /// afterwards the nudge goes quiet instead of storming, and a changed item
@@ -3969,12 +4028,39 @@ fn a_refused_nudge_types_nothing_and_charges_no_attempt() {
     let mut memory = Memory::new(&ctx);
     reach_send_tick(&world, &project, &mut memory);
     for _ in 0..3 {
-        ticker::tick_for_test(&ctx, &mut memory); // the refusal is logged, not propagated
+        ticker::tick_for_test(&ctx, &mut memory); // a refusal charges no send
     }
     assert_eq!(world.runner.count("agent prompt"), 3, "one clean retry per tick");
     let state = crate::steps::load_state(&project);
-    assert!(state.nudge_attempts.is_empty(), "nothing was typed, so nothing is in flight");
+    assert!(state.nudge_attempts.is_empty(), "a refused first send has nothing in flight");
     assert!(!state.nudged.contains_key("hpc-demo"));
+}
+
+/// If a retype is refused before typing, the preceding unconfirmed send is
+/// still in flight. Its budget must survive the refusal rather than resetting.
+#[test]
+fn a_refused_retype_preserves_the_previous_attempt_budget() {
+    let (world, project, t) = owned_nudge_world();
+    inbox::write_thread(&project, &t, "thread-state", "idle", "s", "").unwrap();
+    let sends = std::cell::Cell::new(0);
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("agent prompt"),
+        move |_| {
+            sends.set(sends.get() + 1);
+            if sends.get() == 1 {
+                Ok(fail(1, STALLED_PROMPT))
+            } else {
+                Ok(fail(1, r#"{"error":{"code":"agent_blocked","message":"blocked"}}"#))
+            }
+        },
+    );
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    reach_send_tick(&world, &project, &mut memory);
+    ticker::tick_for_test(&ctx, &mut memory); // first send, unconfirmed
+    ticker::tick_for_test(&ctx, &mut memory); // dropped, then retype refused
+    let state = crate::steps::load_state(&project);
+    assert_eq!(state.nudge_attempts.get("hpc-demo").map(|a| a.attempts), Some(1));
 }
 
 /// Two ready routing keys in one tick produce at most one fresh send; the

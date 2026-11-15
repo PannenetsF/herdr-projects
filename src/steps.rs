@@ -118,6 +118,11 @@ pub struct NudgeAttempt {
     pub hash: String,
     /// The pane the text was typed into.
     pub pane: String,
+    /// The native agent session that occupied the pane. A replacement session
+    /// must never inherit screen confirmation or Enter for this attempt.
+    pub agent_session: String,
+    /// Herdr's terminal incarnation for the pane, when available.
+    pub terminal_id: String,
     /// The harness kind of that pane, so the input box can be read back.
     pub kind: String,
     /// The exact line typed, for screen reconciliation.
@@ -543,34 +548,51 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
             continue;
         }
 
+        // Owner keys target exactly their name's pane; the global key keeps
+        // the old primary-preferred, sticky choice across all coordinators.
+        // Compute this before reconciliation too: a stale attempt must never
+        // read or send Enter to a pane no longer hosting that coordinator.
+        let candidates: Vec<crate::coordinator::LivePane> = if key == GLOBAL_NUDGE {
+            coordinators.to_vec()
+        } else {
+            coordinators.iter().filter(|p| p.name == key).cloned().collect()
+        };
+
         // A send from an earlier tick may still be sitting on screen:
         // reconcile it before target selection and the empty-box gate, which
         // a typed-in-but-unconfirmed marker would otherwise block forever.
-        if state.nudge_attempts.get(&key).is_some_and(|a| a.hash == hash) {
-            match reconcile_nudge(state, herdr, &key, &hash)? {
-                Delivery::Confirmed => {
+        if let Some(attempt) = state.nudge_attempts.get(&key).filter(|a| a.hash == hash) {
+            match attempt_incarnation(attempt, &candidates) {
+                Incarnation::Same => match reconcile_nudge(state, herdr, &key, &hash)? {
+                    Delivery::Confirmed => {
+                        state.nudge_attempts.remove(&key);
+                        state.boxes.remove(&key);
+                        state.nudged.insert(key, hash);
+                        continue;
+                    }
+                    Delivery::Waiting => continue,
+                    // The text was dropped: fall through and type it again,
+                    // bounded by the attempt record.
+                    Delivery::Retype => {}
+                },
+                Incarnation::Changed => {
+                    // A different native session or terminal may have inherited
+                    // the visible screen, but not delivery. Discard the old
+                    // attempt and its budget; the replacement gets a fresh send.
                     state.nudge_attempts.remove(&key);
                     state.boxes.remove(&key);
-                    state.nudged.insert(key, hash);
+                }
+                Incarnation::Unknown => {
+                    // One side lost its session/terminal metadata. Without a
+                    // same-incarnation proof, do not press Enter or retype.
                     continue;
                 }
-                Delivery::Waiting => continue,
-                // The text was dropped: fall through and type it again,
-                // bounded by the attempt record.
-                Delivery::Retype => {}
             }
         }
 
         if sent_this_tick {
             continue;
         }
-        // Owner keys target exactly their name's pane; the global key keeps
-        // the old primary-preferred, sticky choice across all coordinators.
-        let candidates: Vec<crate::coordinator::LivePane> = if key == GLOBAL_NUDGE {
-            coordinators.to_vec()
-        } else {
-            coordinators.iter().filter(|p| p.name == key).cloned().collect()
-        };
         let sticky = state.nudge_sessions.get(&key).cloned().unwrap_or_default();
         let preferred = if key == GLOBAL_NUDGE { primary_pane } else { "" };
         let Some(pane) = crate::coordinator::nudge_target(&candidates, now, preferred, &sticky) else {
@@ -584,9 +606,11 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
         let line = nudge_text(&unseen);
         // Reuse the in-flight record so a dropped send keeps its budget; a
         // stale or absent record starts fresh.
-        let mut attempt = state.nudge_attempts.remove(&key).filter(|a| a.hash == hash).unwrap_or_else(|| NudgeAttempt {
+        let attempt = state.nudge_attempts.remove(&key).filter(|a| a.hash == hash).unwrap_or_else(|| NudgeAttempt {
             hash: hash.clone(),
             pane: pane.pane_id.clone(),
+            agent_session: pane.agent_session.clone(),
+            terminal_id: pane.terminal_id.clone(),
             kind: pane.agent.clone(),
             text: line.clone(),
             attempts: 0,
@@ -598,10 +622,15 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
             state.nudge_attempts.insert(key, attempt);
             continue;
         }
-        attempt.attempts += 1;
-        attempt.pane = pane.pane_id.clone();
-        attempt.kind = pane.agent.clone();
-        attempt.text = line.clone();
+        let mut attempt = NudgeAttempt {
+            hash: attempt.hash,
+            pane: pane.pane_id.clone(),
+            agent_session: pane.agent_session.clone(),
+            terminal_id: pane.terminal_id.clone(),
+            kind: pane.agent.clone(),
+            text: line.clone(),
+            attempts: attempt.attempts + 1,
+        };
         match herdr.agent_prompt_confirmed(&pane.pane_id, &line) {
             Ok(()) => {
                 // herdr itself saw the agent take it.
@@ -616,9 +645,15 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
                 sent_this_tick = true;
             }
             Err(error) if crate::herdr::refused_before_typing(&error) => {
-                // Nothing was typed, so the attempt is not charged; the
-                // caller logs the error and the next tick retries cleanly.
-                return Err(error.into());
+                // Nothing new was typed. Restore the previous in-flight record,
+                // including its retry budget; an empty one leaves no trace.
+                attempt.attempts -= 1;
+                if attempt.attempts == 0 {
+                    state.nudge_attempts.remove(&key);
+                } else {
+                    state.nudge_attempts.insert(key, attempt);
+                }
+                sent_this_tick = true;
             }
             Err(_) => {
                 // Unconfirmed: the text may sit in the input box. Record the
@@ -629,6 +664,32 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
         }
     }
     Ok(())
+}
+
+/// Whether the live coordinator is the same incarnation that received an
+/// in-flight nudge. Empty metadata is not proof of a replacement, but it is
+/// also not proof of identity, so a one-sided mismatch waits conservatively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Incarnation {
+    Same,
+    Changed,
+    Unknown,
+}
+
+fn attempt_incarnation(attempt: &NudgeAttempt, candidates: &[crate::coordinator::LivePane]) -> Incarnation {
+    let Some(pane) = candidates.iter().find(|pane| pane.pane_id == attempt.pane) else {
+        return Incarnation::Changed;
+    };
+    if pane.agent != attempt.kind {
+        return Incarnation::Changed;
+    }
+    for (before, now) in [(&attempt.agent_session, &pane.agent_session), (&attempt.terminal_id, &pane.terminal_id)] {
+        if before == now {
+            continue;
+        }
+        return if before.is_empty() || now.is_empty() { Incarnation::Unknown } else { Incarnation::Changed };
+    }
+    Incarnation::Same
 }
 
 /// What one screen reconciliation decided about an in-flight nudge.
@@ -1175,6 +1236,26 @@ mod tests {
 
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(load_state(&project), State::default());
+    }
+
+    #[test]
+    fn an_attempt_without_incarnation_metadata_waits_instead_of_touching_a_new_screen() {
+        let pane = crate::coordinator::LivePane {
+            pane_id: "w1:p1".into(),
+            name: "hpc-demo".into(),
+            agent: "claude".into(),
+            agent_session: "sess-new".into(),
+            terminal_id: "term-new".into(),
+            ..Default::default()
+        };
+        let old = NudgeAttempt { pane: "w1:p1".into(), kind: "claude".into(), ..Default::default() };
+        assert_eq!(attempt_incarnation(&old, std::slice::from_ref(&pane)), Incarnation::Unknown);
+
+        let same = NudgeAttempt { agent_session: "sess-new".into(), terminal_id: "term-new".into(), ..old.clone() };
+        assert_eq!(attempt_incarnation(&same, std::slice::from_ref(&pane)), Incarnation::Same);
+
+        let replaced = NudgeAttempt { agent_session: "sess-old".into(), terminal_id: "term-new".into(), ..old };
+        assert_eq!(attempt_incarnation(&replaced, &[pane]), Incarnation::Changed);
     }
 
     #[test]
