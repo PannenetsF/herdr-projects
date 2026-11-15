@@ -176,7 +176,7 @@ The fork pin in `install-herdr-plugins.sh` (PannenetsF/herdr-projects) moves to 
 - **Sidebar grouping no longer claims root-cwd strays.** Untracked panes in the project home (or merely in the project workspace) fall through to the global `~` tail; only the strict-subfolder guest claim survives. A stray session can no longer take the coordinator head slot or a `focus_agent` number.
 - **Nudges are session-sticky.** `ticker.json` stores `nudge_session`: the native agent session that last received a nudge keeps it while it remains a live registered coordinator (None, not sideways flow, while not idle); after it leaves, the recorded primary pane wins ties then `state_change_seq`. The pin clears with no coordinator left; an empty session id never overwrites it. The once-per-set `nudged` hash is unchanged.
 
-## Coordinator notification and progress repair (2026-11-15, implemented on the v0.2.34-pf.12 base; intended for pf.13)
+## Coordinator notification and progress repair (2026-11-15, v0.2.34-pf.13; based directly on v0.2.34-pf.12)
 
 Three production defects on registered-coordinator projects: owner-specific inbox nudges could be silenced by reader-less/legacy seen marks, a terminal 100%/Done progress record never re-armed reminders after new work, and stale activity/percent kept rendering as live past the activity TTL.
 
