@@ -214,3 +214,108 @@ fn ticker_start_without_projects_creates_nothing() {
     assert!(!home.path().join(".herdr-projects").exists());
     assert!(!home.path().join(".config").exists());
 }
+
+/// Like [`hp`], but with extra environment variables and optional hook stdin.
+/// The same double-fork keeps the child outside this test's Herdr pane.
+fn hp_with(home: &Path, envs: &[(&str, &str)], args: &[&str], stdin: Option<&str>) -> std::process::Output {
+    let status_file = tempfile::NamedTempFile::new_in(home).unwrap();
+    let status_path = shell_escape(status_file.path().to_str().unwrap());
+    let mut quoted: Vec<String> =
+        std::iter::once(BIN.to_string()).chain(args.iter().map(|a| shell_escape(a))).collect();
+    quoted.push(format!("; printf '%s' $? > {status_path}"));
+    let mut cmd = Command::new("/bin/sh");
+    cmd.env_clear().env("HOME", home);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.args(["-c", &quoted.join(" ")]);
+    if let Some(input) = stdin {
+        use std::io::Write;
+        let mut child = cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let mut out = child.wait_with_output().unwrap();
+        let code = std::fs::read_to_string(status_file.path()).ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(99);
+        out.status = ExitStatusExt::from_raw(if code == 0 { 0 } else { code << 8 });
+        return out;
+    }
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            match libc::fork() {
+                0 => Ok(()),
+                pid if pid > 0 => libc::_exit(0),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+    }
+    let mut out = cmd.output().unwrap();
+    let code = std::fs::read_to_string(status_file.path()).ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(99);
+    out.status = ExitStatusExt::from_raw(if code == 0 { 0 } else { code << 8 });
+    out
+}
+
+/// A stub herdr that answers only `pane current --current`, enough for the
+/// progress hook and `report` to resolve the calling pane without a server.
+fn stub_herdr(home: &Path) -> String {
+    let path = home.join("stub-herdr.sh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nif [ \"$1\" = pane ] && [ \"$2\" = current ]; then\n  printf '%s' '{\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"terminal_id\":\"term-1\",\"agent\":\"claude\"}}}'\nfi\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn hook_events_reset_a_terminal_done_record_while_guarded_events_keep_it() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    let stub = stub_herdr(home.path());
+    let socket = home.path().join("s.sock").to_string_lossy().into_owned();
+    let envs = [
+        ("HERDR_ENV", "1"),
+        ("HERDR_PANE_ID", "w1:p1"),
+        ("HERDR_SOCKET_PATH", socket.as_str()),
+        ("HERDR_BIN_PATH", stub.as_str()),
+    ];
+    let run = |args: &[&str], stdin: Option<&str>| hp_with(home.path(), &envs, args, stdin);
+    let percent = || {
+        let out = run(&["--root", root_arg, "progress", "--pane", "w1:p1"], None);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    // Seed a terminal Done record through the real report path.
+    assert!(run(&["--root", root_arg, "report", "--percent", "100", "--activity", "Done"], None).status.success());
+    assert!(percent().contains("\"percent\": 100"));
+
+    // A follow-up user prompt starts a new request: Done/100 is cleared.
+    let prompt = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1"}"#;
+    let out = run(&["--root", root_arg, "hook", "--agent", "claude"], Some(prompt));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let after = percent();
+    assert!(!after.contains("100"), "{after}");
+    assert!(after.contains("\"percent\": null"));
+
+    // Re-arm Done; real top-level tool work clears it again via PostToolUse.
+    assert!(run(&["--root", root_arg, "report", "--percent", "100", "--activity", "Done"], None).status.success());
+    let tool = r#"{"hook_event_name":"PostToolUse","session_id":"s1","tool_input":{"command":"ls"}}"#;
+    assert!(run(&["--root", root_arg, "hook", "--agent", "claude"], Some(tool)).status.success());
+    assert!(percent().contains("\"percent\": null"));
+
+    // Guard 1: a subagent's tool event never touches the top-level record.
+    assert!(run(&["--root", root_arg, "report", "--percent", "100", "--activity", "Done"], None).status.success());
+    let subagent = r#"{"hook_event_name":"PostToolUse","session_id":"s1","agent_id":"child","tool_input":{}}"#;
+    assert!(run(&["--root", root_arg, "hook", "--agent", "claude"], Some(subagent)).status.success());
+    assert!(percent().contains("\"percent\": 100"), "subagent events must not reset Done");
+
+    // Guard 2: the report command's own PostToolUse never resets itself.
+    let self_report = r#"{"hook_event_name":"PostToolUse","session_id":"s1","tool_input":{"command":"/p/herdr-projects --root /r report --percent 5 --activity x"}}"#;
+    assert!(run(&["--root", root_arg, "hook", "--agent", "claude"], Some(self_report)).status.success());
+    assert!(percent().contains("\"percent\": 100"), "the report call must not reset its own record");
+}

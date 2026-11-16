@@ -609,9 +609,14 @@ fn start_when_shell_ready(herdr: &Herdr, name: &str, kind: &str, pane: &str, arg
     }
 }
 
-/// A coordinator's sidebar group and line 3, from Herdr's state and its own report.
+/// A coordinator's sidebar group and line 3, from Herdr's state and its own
+/// report. A report older than [`crate::progress::ACTIVITY_TTL_MS`] is treated
+/// as absent: a stale percent or "Waiting for you"/"Done" must not keep being
+/// presented as live once the activity TTL has elapsed (the sub-line already
+/// drops stale activity via [`crate::progress::fresh`]).
 pub fn row_state(pane: &LivePane, report: Option<&crate::progress::Record>) -> (crate::thread::Group, String) {
     use crate::thread::Group;
+    let report = report.filter(|r| crate::progress::fresh(r));
     let percent = report.and_then(|r| r.percent).filter(|p| *p < 100).map(|p| format!(" · ~{p}%")).unwrap_or_default();
     let waiting = report.is_some_and(|r| r.waiting()) && pane.agent_status != "working";
     if pane.agent_status == "blocked" || waiting {
@@ -1205,6 +1210,38 @@ mod tests {
         assert_eq!(classify("demo", dir, "w6:p1", &elsewhere), Caller::Unverified { pane: "w6:p1".into() });
         let unnamed = named("", agent("w7:p1", "/tmp", "idle", 1));
         assert_eq!(classify("demo", dir, "w7:p1", &unnamed), Caller::Unverified { pane: "w7:p1".into() });
+    }
+
+    #[test]
+    fn a_stale_self_report_is_not_presented_as_live_on_the_coordinator_row() {
+        use crate::thread::Group;
+        let pane = LivePane { agent_status: "idle".into(), ..LivePane::default() };
+        let now = crate::progress::now();
+        let ttl = (crate::progress::ACTIVITY_TTL_MS / 1000) as i64;
+        let record = |reported_at: i64, percent: Option<u8>, activity: &str| crate::progress::Record {
+            activity: activity.into(),
+            percent,
+            reported_at,
+            ..crate::progress::Record::default()
+        };
+        // A fresh report keeps its percent on a working pane.
+        let working = LivePane { agent_status: "working".into(), ..LivePane::default() };
+        let fresh = record(now, Some(40), "Reading code");
+        assert_eq!(row_state(&working, Some(&fresh)), (Group::Working, "working · ~40%".into()));
+        // After the activity TTL every report reads as absent: no stale
+        // percent, no permanent Done, no ghost "needs you" from an old wait.
+        let stale = record(now - ttl - 1, Some(40), "Reading code");
+        assert_eq!(row_state(&pane, Some(&stale)), (Group::Idle, "idle".into()));
+        let stale_done = record(now - ttl - 1, Some(100), crate::progress::DONE);
+        assert_eq!(row_state(&pane, Some(&stale_done)), (Group::Idle, "idle".into()));
+        let stale_wait = record(now - ttl - 1, None, crate::progress::WAITING);
+        assert_eq!(row_state(&pane, Some(&stale_wait)), (Group::Idle, "idle".into()));
+        // A stale percent on a still-working pane loses its percent too.
+        assert_eq!(row_state(&working, Some(&stale)), (Group::Working, "working".into()));
+        // A fresh waiting record still turns an idle-looking pane into needs-you.
+        let fresh_wait = record(now, None, crate::progress::WAITING);
+        assert_eq!(row_state(&pane, Some(&fresh_wait)).0, Group::WaitingOnYou);
+        assert_eq!(row_state(&pane, None), (Group::Idle, "idle".into()));
     }
 
     #[test]

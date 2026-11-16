@@ -686,9 +686,13 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
             pass.transitions.push(Transition { id: t.id.clone(), to: group, note });
         }
         let line = crate::sidebar::state_line(group, &after, &live, now);
+        // Only a report within the activity TTL is persisted onto the thread
+        // record: once it ages out, the snapshot the popup and merge-gate read
+        // goes back to no activity/percent instead of showing a stale "Done"
+        // or percent as if it were current.
         let (activity, percent) = match &live.self_report {
-            Some(record) => (record.activity.clone(), record.percent),
-            None => (String::new(), None),
+            Some(record) if crate::progress::fresh(record) => (record.activity.clone(), record.percent),
+            _ => (String::new(), None),
         };
         let self_changed = !t.is_remote() && (activity != t.activity || percent != t.percent);
         if delivered || state != t.last_state || group.token() != t.last_group || line != t.state_line || self_changed || audience_token != t.audience {
