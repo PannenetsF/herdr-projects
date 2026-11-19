@@ -33,16 +33,38 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::coordinator::Caller;
-use crate::herdr::{Herdr, SessionInfo, IDENTITY_ENV_SCRUB, MIN_VERSION};
+use crate::herdr::{Herdr, IDENTITY_ENV_SCRUB, MIN_VERSION};
 use crate::paths::Ctx;
 use crate::proctab::Facts;
 use crate::project::Project;
 use crate::runner::Cmd;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
-/// Total wall time spent proving a caller. Local calls are ~7ms, so even a
-/// full 55-pane sweep fits; a hung session can never stall a command longer.
-const IDENTITY_BUDGET: Duration = Duration::from_millis(900);
+/// A real runner polls child exit every 20ms. Allow an exhaustive 100+ pane
+/// census on a busy host, while keeping hung servers bounded. Expiry is unknown,
+/// never negative evidence and never a reason to keep issuing 1ms probes.
+const IDENTITY_BUDGET: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+enum Identity {
+    Pane { caller: Caller, socket: PathBuf },
+    Outside,
+    Unknown,
+}
+
+#[derive(Debug, PartialEq)]
+enum TrustedBin {
+    Found(String),
+    Missing,
+    Unknown,
+}
+
+#[derive(Debug)]
+enum PaneProof {
+    Proven(Caller),
+    Unrelated,
+    Unknown,
+}
 
 /// Pane identity, fully proven by process facts.
 pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
@@ -52,161 +74,180 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
 /// Constrain a proven caller to the session whose pane ids the command uses.
 /// A pane on another trusted server must not impersonate a same-id local pane.
 pub(crate) fn identify_in_session(ctx: &Ctx, project: &Project, marked: bool, socket: Option<&Path>) -> Caller {
-    let expected = socket.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
-    let scoped = |caller: Caller, actual: &Path| {
-        if expected.as_ref().is_some_and(|p| *p != actual.canonicalize().unwrap_or_else(|_| actual.to_path_buf())) {
-            Caller::Unverified { pane: String::new() }
-        } else {
-            caller
-        }
-    };
-    let fail = |marked: bool| -> Caller {
-        if marked {
-            Caller::Unverified { pane: String::new() }
-        } else {
-            // No marker and no provable pane: a real terminal, CI or a
-            // detached process the user themselves launched.
-            Caller::Human
-        }
-    };
-
-    // Discovery (ps, real home, trusted binary, registry) runs with its own
-    // generous timeouts: the tools are absolute/scrubbed, and a loaded box
-    // must not turn an overrun into fail-open Human. The shared budget below
-    // bounds only the per-socket pane queries.
-    let Some(facts) = Facts::gather(ctx, QUERY_TIMEOUT) else {
-        return fail(marked);
-    };
-    let Some(home) = real_home(ctx, QUERY_TIMEOUT) else {
-        return fail(marked);
-    };
-    let Some(bin) = trusted_herdr_bin(ctx, &home) else {
-        return fail(marked);
-    };
-
-    let sockets = registry_sockets(ctx, &bin, &home, QUERY_TIMEOUT);
-    if sockets.is_empty() {
-        return fail(marked);
-    }
-    // The project's recorded socket only sets ordering; it must already be a
-    // registry session, so a rewritten coordinator.json cannot add a fake one.
-    let mut ordered_sockets = Vec::new();
-    if let Some(record) = project.coordinator() {
-        let recorded = PathBuf::from(record.socket);
-        if sockets.contains(&recorded) {
-            ordered_sockets.push(recorded);
-        }
-    }
-    for s in sockets.iter() {
-        if !ordered_sockets.contains(s) {
-            ordered_sockets.push(s.clone());
-        }
-    }
-
-    let deadline = Instant::now() + IDENTITY_BUDGET;
-    for socket in ordered_sockets {
-        let herdr = Herdr::for_identity(&bin, &socket, ctx.runner);
-        // Fast path: the pane owning this tty, its shell and foreground pids
-        // in one call. A foreign tty resolves to the focused pane, whose pids
-        // fail the proof.
-        if let Ok(info) = herdr.call(&["pane", "process-info", "--current"], remaining(&deadline)) {
-            if let Some(caller) =
-                proven_identity(&herdr, project, info.get("process_info"), &facts, remaining(&deadline))
-            {
-                return scoped(caller, &socket);
+    let unknown = || Caller::Unverified { pane: String::new() };
+    let Some(facts) = Facts::gather(ctx, QUERY_TIMEOUT) else { return unknown() };
+    let Some(home) = real_home(ctx, QUERY_TIMEOUT) else { return unknown() };
+    let identity = discover(ctx, project, marked, &facts, &home, trusted_herdr_bin(ctx, &home));
+    match identity {
+        Identity::Pane { caller, socket: actual } => {
+            let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            if socket.is_some_and(|expected| canonical(expected) != canonical(&actual)) {
+                unknown()
+            } else {
+                caller
             }
         }
-        // Marker hint for an odd subshell that kept the injected pane id.
+        Identity::Outside => Caller::Human,
+        Identity::Unknown => unknown(),
+    }
+}
+
+fn discover(ctx: &Ctx, project: &Project, marked: bool, facts: &Facts, home: &Path, bin: TrustedBin) -> Identity {
+    let bin = match bin {
+        TrustedBin::Found(bin) => bin,
+        // No install is different from an unreadable, broken or untrusted
+        // install. Only complete process facts with no daemon allow the former.
+        TrustedBin::Missing if !marked && facts.no_herdr_processes() => return Identity::Outside,
+        TrustedBin::Missing | TrustedBin::Unknown => return Identity::Unknown,
+    };
+    let Some(sockets) = registry_sockets(ctx, &bin, home, QUERY_TIMEOUT) else {
+        return Identity::Unknown;
+    };
+    // A project record orders trusted sockets but can never add one.
+    let mut ordered_sockets: Vec<_> = sockets.into_iter().collect();
+    if let Some(record) = project.coordinator() {
+        let recorded = PathBuf::from(record.socket);
+        let recorded = recorded.canonicalize().unwrap_or(recorded);
+        if let Some(at) = ordered_sockets.iter().position(|s| s == &recorded) {
+            ordered_sockets.swap(0, at);
+        }
+    }
+    census(ctx, project, marked, facts, &bin, &ordered_sockets, Instant::now() + IDENTITY_BUDGET)
+}
+
+fn census(
+    ctx: &Ctx,
+    project: &Project,
+    marked: bool,
+    facts: &Facts,
+    bin: &str,
+    sockets: &[PathBuf],
+    deadline: Instant,
+) -> Identity {
+    let mut complete = true;
+    for socket in sockets {
+        let herdr = Herdr::for_identity(bin, socket, ctx.runner);
+        let Some(timeout) = remaining(&deadline) else { return Identity::Unknown };
+        // --current may fail in a genuine outside terminal. Such a miss is
+        // recoverable only by a complete census, not by assuming Human.
+        if let Ok(info) = herdr.call(&["pane", "process-info", "--current"], timeout) {
+            if let PaneProof::Proven(caller) = proven_identity(&herdr, project, info.get("process_info"), facts, &deadline) {
+                return Identity::Pane { caller, socket: socket.clone() };
+            }
+        }
         if marked {
             if let Some(pane) = ctx.env.var("HERDR_PANE_ID") {
-                if let Ok(info) =
-                    herdr.call(&["pane", "process-info", "--pane", pane], remaining(&deadline))
-                {
-                    if let Some(caller) = proven_identity(
-                        &herdr,
-                        project,
-                        info.get("process_info"),
-                        &facts,
-                        remaining(&deadline),
-                    ) {
-                        return scoped(caller, &socket);
+                let Some(timeout) = remaining(&deadline) else { return Identity::Unknown };
+                if let Ok(info) = herdr.call(&["pane", "process-info", "--pane", pane], timeout) {
+                    if let PaneProof::Proven(caller) = proven_identity(&herdr, project, info.get("process_info"), facts, &deadline) {
+                        return Identity::Pane { caller, socket: socket.clone() };
                     }
                 }
             }
         }
-        // Last resort: enumerate every pane on a bounded deadline.
-        let Ok(list) = herdr.call(&["pane", "list"], remaining(&deadline)) else {
+        let Some(timeout) = remaining(&deadline) else { return Identity::Unknown };
+        let Ok(list) = herdr.call(&["pane", "list"], timeout) else {
+            complete = false;
             continue;
         };
-        let Some(panes) = list["panes"].as_array() else { continue };
-        for pane in panes {
-            if deadline.elapsed() >= IDENTITY_BUDGET {
-                break;
-            }
-            let Some(pane) = pane["pane_id"].as_str() else { continue };
-            let Ok(info) =
-                herdr.call(&["pane", "process-info", "--pane", pane], remaining(&deadline))
-            else {
+        let Some(panes) = list["panes"].as_array() else {
+            complete = false;
+            continue;
+        };
+        let mut queried = BTreeSet::new();
+        for row in panes {
+            let Some(pane) = row["pane_id"].as_str().filter(|p| !p.is_empty()) else {
+                complete = false;
                 continue;
             };
-            if let Some(caller) = proven_identity(
-                &herdr,
-                project,
-                info.get("process_info"),
-                &facts,
-                remaining(&deadline),
-            ) {
-                return scoped(caller, &socket);
+            if !queried.insert(pane) { continue; }
+            let Some(timeout) = remaining(&deadline) else { return Identity::Unknown };
+            let info = match herdr.call(&["pane", "process-info", "--pane", pane], timeout) {
+                Ok(info) => info,
+                Err(err) => {
+                    // Restored layout entries can have no terminal because
+                    // their saved directory vanished. The trusted server's
+                    // explicit restore failure AND no-process reply prove
+                    // that entry cannot contain this caller. Other RPC errors
+                    // (including pane_not_found without this evidence) remain
+                    // unknown; a stale layout must not disable human rescue.
+                    if err.code != "pane_not_found" || !row["restore_error"].as_str().is_some_and(|s| !s.is_empty()) {
+                        complete = false;
+                    }
+                    continue;
+                }
+            };
+            if info["process_info"]["pane_id"].as_str() != Some(pane) {
+                complete = false;
+                continue;
+            }
+            match proven_identity(&herdr, project, info.get("process_info"), facts, &deadline) {
+                PaneProof::Proven(caller) => return Identity::Pane { caller, socket: socket.clone() },
+                PaneProof::Unrelated => {},
+                PaneProof::Unknown => complete = false,
             }
         }
     }
-    fail(marked)
+    if remaining(&deadline).is_some() && complete && !marked && facts.permits_outside_proof() {
+        Identity::Outside
+    } else {
+        Identity::Unknown
+    }
 }
 
-fn remaining(deadline: &Instant) -> Duration {
-    QUERY_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())).max(Duration::from_millis(1))
+fn remaining(deadline: &Instant) -> Option<Duration> {
+    let left = deadline.checked_duration_since(Instant::now())?;
+    (!left.is_zero()).then_some(QUERY_TIMEOUT.min(left))
 }
 
-/// Classifies the caller when a server's `process_info` proves its pane
-/// contains THIS process. Returns None when the facts do not match.
+/// Absence of a match is meaningful only for a fully parsed reply. Incomplete
+/// process info and failed agent discovery retain uncertainty instead.
 fn proven_identity(
     herdr: &Herdr,
     project: &Project,
     info: Option<&serde_json::Value>,
     facts: &Facts,
-    timeout: Duration,
-) -> Option<Caller> {
-    let info = info?;
-    let pane = info["pane_id"].as_str()?;
-    let shell_pid = info["shell_pid"].as_u64();
-    let foreground: Vec<u64> = info["foreground_processes"]
-        .as_array()?
-        .iter()
-        .filter_map(|p| p["pid"].as_u64())
-        .collect();
-    if !facts.proves_pane(shell_pid, &foreground) {
-        return None;
-    }
-    let Ok(agents) = herdr.agent_list_within(timeout) else {
-        return Some(Caller::Unverified { pane: pane.to_string() });
+    deadline: &Instant,
+) -> PaneProof {
+    let Some(info) = info else { return PaneProof::Unknown };
+    let Some(pane) = info["pane_id"].as_str().filter(|p| !p.is_empty()) else { return PaneProof::Unknown };
+    let valid_pid = |v: &serde_json::Value| v.as_u64().filter(|pid| *pid > 1 && *pid <= u32::MAX as u64);
+    let shell_pid = match info.get("shell_pid") {
+        Some(serde_json::Value::Null) => None,
+        Some(pid) => match valid_pid(pid) {
+            Some(pid) => Some(pid),
+            None => return PaneProof::Unknown,
+        },
+        None => return PaneProof::Unknown,
     };
-    let Some(agent) = agents.iter().find(|a| a.pane_id == pane) else {
-        // Proven inside a Herdr pane hosting no agent. There is no
-        // marker-free person path here: a real terminal is never a Herdr
-        // pane, while an agent can inject text into a shell tab (`pane run`/
-        // `send-text`) and then strip HERDR_ENV. Treat every proven,
-        // unaccounted-for pane as fail-closed; rescue runs in a terminal
-        // outside Herdr.
-        return Some(Caller::Unverified { pane: pane.to_string() });
+    let Some(processes) = info["foreground_processes"].as_array() else { return PaneProof::Unknown };
+    let Some(foreground) = processes.iter().map(|p| valid_pid(&p["pid"])).collect::<Option<Vec<_>>>() else {
+        return PaneProof::Unknown;
     };
+    if shell_pid.is_none() && foreground.is_empty() { return PaneProof::Unknown; }
+    if !facts.proves_pane(shell_pid, &foreground) { return PaneProof::Unrelated; }
+    // Once pane membership is proven, an agent-list failure must not be
+    // forgotten by a later empty pane list. Keep the denial sticky, but do
+    // not expose a pane id that adopted-worker matching could authorize.
+    let unaccounted = || PaneProof::Proven(Caller::Unverified { pane: String::new() });
+    let Some(timeout) = remaining(deadline) else { return unaccounted() };
+    let Ok(agents) = herdr.agent_list_within(timeout) else { return unaccounted() };
+    if remaining(deadline).is_none() { return unaccounted(); }
+    let mut matches = agents.iter().filter(|a| a.pane_id == pane);
+    let Some(agent) = matches.next() else {
+        // Proven, agentless panes are not outside humans. A nonempty pane is
+        // reserved for positive process proof (including adopted custom names).
+        return PaneProof::Proven(Caller::Unverified { pane: pane.to_string() });
+    };
+    if matches.next().is_some() { return unaccounted(); }
     let dir_path = project.canonical_dir();
     let dir = dir_path.to_string_lossy();
-    Some(crate::coordinator::classify(&project.slug, &dir, pane, agent))
+    PaneProof::Proven(crate::coordinator::classify(&project.slug, &dir, pane, agent))
 }
 
 /// Running sessions the genuine binary lists from the real-home registry.
 /// Environment-set sockets are never consulted.
-fn registry_sockets(ctx: &Ctx, bin: &str, home: &Path, timeout: Duration) -> BTreeSet<PathBuf> {
+fn registry_sockets(ctx: &Ctx, bin: &str, home: &Path, timeout: Duration) -> Option<BTreeSet<PathBuf>> {
     let mut sockets = BTreeSet::new();
     let cmd = Cmd::new(bin, timeout)
         .args(["session", "list", "--json"])
@@ -215,26 +256,30 @@ fn registry_sockets(ctx: &Ctx, bin: &str, home: &Path, timeout: Duration) -> BTr
         .env_remove("HERDR_SESSION")
         .env_remove("XDG_CONFIG_HOME");
     let cmd = scrub(cmd);
-    let Ok(out) = ctx.runner.run(&cmd) else {
-        return sockets;
-    };
-    if !out.success() {
-        return sockets;
-    }
-    if let Some(list) = parse_sessions(&out.stdout) {
-        for s in list {
-            if s.running {
-                sockets.insert(s.socket_path);
-            }
+    let out = ctx.runner.run(&cmd).ok()?;
+    if !out.success() { return None; }
+    for session in parse_sessions(&out.stdout)? {
+        if !session.socket_path.is_absolute() { return None; }
+        if session.running {
+            let socket = session.socket_path;
+            sockets.insert(socket.canonicalize().unwrap_or(socket));
         }
     }
-    sockets
+    Some(sockets)
 }
 
-fn parse_sessions(stdout: &str) -> Option<Vec<SessionInfo>> {
+#[derive(serde::Deserialize)]
+struct IdentitySession {
+    // Unlike general session discovery, a missing `running` cannot silently
+    // default to false and turn a changed registry response into no servers.
+    running: bool,
+    socket_path: PathBuf,
+}
+
+fn parse_sessions(stdout: &str) -> Option<Vec<IdentitySession>> {
     #[derive(serde::Deserialize)]
     struct Reply {
-        sessions: Vec<SessionInfo>,
+        sessions: Vec<IdentitySession>,
     }
     let reply: Reply = serde_json::from_str(stdout.trim()).ok()?;
     Some(reply.sessions)
@@ -243,20 +288,12 @@ fn parse_sessions(stdout: &str) -> Option<Vec<SessionInfo>> {
 /// Absolute, registry-orthogonal locations a genuine herdr client lives at.
 /// `$PATH` and `HERDR_BIN_PATH` are deliberately absent.
 fn bin_candidates(home: &Path) -> Vec<PathBuf> {
-    let mut v = vec![
+    vec![
         PathBuf::from("/opt/homebrew/bin/herdr"),
         PathBuf::from("/usr/local/bin/herdr"),
         home.join(".local/bin/herdr"),
         home.join(".nix-profile/bin/herdr"),
-    ];
-    // A Nix home-manager install is a symlink into /nix/store; add the
-    // per-user profile path the remote hosts use.
-    if let Some(profile) = std::env::var_os("NIX_PROFILES") {
-        for dir in std::env::split_paths(&std::path::PathBuf::from(profile)) {
-            v.push(dir.join("bin/herdr"));
-        }
-    }
-    v
+    ]
 }
 
 /// Prefixes a resolved herdr executable may legitimately sit under. A symlink
@@ -273,43 +310,43 @@ fn trusted_resolved_prefix(path: &Path, home: &Path) -> bool {
 
 /// The first absolute candidate that exists, resolves under a trusted prefix
 /// and reports a supported version with a scrubbed environment.
-fn trusted_herdr_bin(ctx: &Ctx, raw_home: &Path) -> Option<String> {
-    // Tests script the binary explicitly; when they do not, there is no
-    // trusted binary (the candidate scan is production-only so a test host's
-    // real Homebrew install can't make identity nondeterministic).
+fn trusted_herdr_bin(ctx: &Ctx, raw_home: &Path) -> TrustedBin {
+    // Scenario fixtures choose a client explicitly; production discovery is
+    // separately exercised through discover_bin, not compiled out of tests.
     #[cfg(test)]
     {
         let _ = raw_home;
-        return ctx.env.var("HP_TEST_HERDR_BIN").map(str::to_string);
+        return ctx.env.var("HP_TEST_HERDR_BIN")
+            .map(|s| TrustedBin::Found(s.to_string())).unwrap_or(TrustedBin::Missing);
     }
-
     #[cfg(not(test))]
-    {
-        let home = std::fs::canonicalize(raw_home).unwrap_or_else(|_| raw_home.to_path_buf());
-        for candidate in bin_candidates(raw_home) {
-            let Ok(resolved) = std::fs::canonicalize(&candidate) else {
-                continue;
-            };
-            if !resolved.is_file() || !trusted_resolved_prefix(&resolved, &home) {
-                continue;
-            }
-            let cmd = scrub(Cmd::new(
-                resolved.to_string_lossy().as_ref(),
-                QUERY_TIMEOUT,
-            )
-            .arg("--version"));
-            let Ok(out) = ctx.runner.run(&cmd) else {
-                continue;
-            };
-            let text = [out.stdout.trim(), out.stderr.trim()].into_iter().find(|t| !t.is_empty()).unwrap_or("");
-            if let Some(version) = crate::herdr::parse_version(text) {
-                if version >= MIN_VERSION {
-                    return Some(resolved.to_string_lossy().into_owned());
-                }
-            }
+    discover_bin(ctx, raw_home, &bin_candidates(raw_home))
+}
+
+fn discover_bin(ctx: &Ctx, raw_home: &Path, candidates: &[PathBuf]) -> TrustedBin {
+    let Ok(home) = raw_home.canonicalize() else { return TrustedBin::Unknown };
+    let mut missing = true;
+    let mut tried = BTreeSet::new();
+    for candidate in candidates {
+        // A dangling symlink or permission error is not proof of no install.
+        match std::fs::symlink_metadata(candidate) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => { missing = false; continue; },
+            Ok(_) => missing = false,
         }
-        None
+        let Ok(resolved) = candidate.canonicalize() else { continue };
+        if !resolved.is_file() || !trusted_resolved_prefix(&resolved, &home) || !tried.insert(resolved.clone()) {
+            continue;
+        }
+        let cmd = scrub(Cmd::new(resolved.to_string_lossy().as_ref(), QUERY_TIMEOUT).arg("--version"));
+        let Ok(out) = ctx.runner.run(&cmd) else { continue };
+        if !out.success() { continue; }
+        let text = [out.stdout.trim(), out.stderr.trim()].into_iter().find(|t| !t.is_empty()).unwrap_or("");
+        if crate::herdr::parse_version(text).is_some_and(|version| version >= MIN_VERSION) {
+            return TrustedBin::Found(resolved.to_string_lossy().into_owned());
+        }
     }
+    if missing { TrustedBin::Missing } else { TrustedBin::Unknown }
 }
 
 /// Scrubs loader-interposition and shell-hijack variables from a command.
@@ -374,11 +411,215 @@ fn account_home() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod account_tests {
+mod tests {
+    use super::*;
+    use crate::runner::fake::{FakeRunner, fail, ok, timeout};
+    use crate::paths::Env;
+    use crate::scenarios::World;
+    use std::os::unix::fs::symlink;
+
     #[test]
     fn account_home_is_absolute_without_shell_expansion() {
-        let home = super::account_home().expect("current uid must have an account home");
+        let home = account_home().expect("current uid must have an account home");
         assert!(home.is_absolute(), "{home:?}");
-        assert_ne!(home, std::path::Path::new("~"));
+        assert_ne!(home, Path::new("~"));
+    }
+
+    #[test]
+    fn client_candidates_are_fixed_absolute_paths() {
+        let home = Path::new("/home/person");
+        assert_eq!(bin_candidates(home), [
+            PathBuf::from("/opt/homebrew/bin/herdr"),
+            PathBuf::from("/usr/local/bin/herdr"),
+            home.join(".local/bin/herdr"),
+            home.join(".nix-profile/bin/herdr"),
+        ]);
+    }
+
+    #[test]
+    fn production_client_discovery_requires_a_successful_supported_version() {
+        for output in [fail(1, "herdr 0.9.5"), timeout(), ok("garbage"), ok("herdr 0.1.0")] {
+            let world = World::new();
+            let bin = world.home.path().join(".local/bin/herdr");
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, "").unwrap();
+            world.runner.on("--version", output);
+            assert_eq!(discover_bin(&world.ctx(), world.home.path(), &[bin]), TrustedBin::Unknown);
+        }
+        let world = World::new();
+        let bin = world.home.path().join(".local/bin/herdr");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "").unwrap();
+        let alias = world.home.path().join(".local/bin/herdr-alias");
+        symlink(&bin, &alias).unwrap();
+        world.runner.on("--version", ok("herdr 0.9.5"));
+        assert_eq!(discover_bin(&world.ctx(), world.home.path(), &[bin.clone(), alias]),
+            TrustedBin::Found(bin.canonicalize().unwrap().to_string_lossy().into_owned()));
+        assert_eq!(world.runner.count("--version"), 1);
+        let calls = world.runner.calls.borrow();
+        let command = calls.iter().find(|c| c.args == ["--version"]).unwrap();
+        for var in IDENTITY_ENV_SCRUB { assert!(command.env_remove.iter().any(|v| v == var)); }
+    }
+
+    #[test]
+    fn absent_client_is_distinct_from_a_deleted_or_untrusted_install() {
+        let world = World::new();
+        let bin = world.home.path().join(".local/bin/herdr");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        assert_eq!(discover_bin(&world.ctx(), world.home.path(), &[bin.clone()]), TrustedBin::Missing);
+        symlink(world.home.path().join("deleted-herdr"), &bin).unwrap();
+        assert_eq!(discover_bin(&world.ctx(), world.home.path(), &[bin.clone()]), TrustedBin::Unknown);
+        std::fs::remove_file(&bin).unwrap();
+        let rogue = world.home.path().join("rogue-herdr");
+        std::fs::write(&rogue, "").unwrap();
+        symlink(&rogue, &bin).unwrap();
+        assert_eq!(discover_bin(&world.ctx(), world.home.path(), &[bin]), TrustedBin::Unknown);
+        assert_eq!(world.runner.count("--version"), 0);
+    }
+
+    #[test]
+    fn registry_failure_is_not_an_empty_registry_and_aliases_are_deduplicated() {
+        for output in [fail(1, "unavailable"), timeout(), ok("garbage"), ok(r#"{"sessions":[{"socket_path":"/s"}]}"#), ok(r#"{"sessions":[{"running":true,"socket_path":"relative.sock"}]}"#)] {
+            let world = World::new();
+            let runner = FakeRunner::new();
+            runner.on("session list", output);
+            let ctx = Ctx { runner: &runner, ..world.ctx() };
+            assert!(registry_sockets(&ctx, "herdr", world.home.path(), QUERY_TIMEOUT).is_none());
+        }
+        let world = World::new();
+        let runner = FakeRunner::new();
+        runner.on("session list", ok(r#"{"sessions":[]}"#));
+        let ctx = Ctx { runner: &runner, ..world.ctx() };
+        assert_eq!(registry_sockets(&ctx, "herdr", world.home.path(), QUERY_TIMEOUT), Some(BTreeSet::new()));
+        let socket = world.home.path().join("session.sock");
+        std::fs::write(&socket, "").unwrap();
+        let alias = world.home.path().join("alias.sock");
+        symlink(&socket, &alias).unwrap();
+        let runner = FakeRunner::new();
+        runner.on("session list", ok(&format!(r#"{{"sessions":[{{"running":true,"socket_path":"{}"}},{{"running":true,"socket_path":"{}"}}]}}"#, socket.display(), alias.display())));
+        let ctx = Ctx { runner: &runner, ..world.ctx() };
+        assert_eq!(registry_sockets(&ctx, "herdr", world.home.path(), QUERY_TIMEOUT), Some(BTreeSet::from([socket.canonicalize().unwrap()])));
+    }
+
+    #[test]
+    fn complete_outside_proof_allows_no_install_or_no_running_server() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let ctx = world.ctx();
+        let facts = Facts::gather(&ctx, QUERY_TIMEOUT).unwrap();
+        assert!(matches!(discover(&ctx, &project, false, &facts, world.home.path(), TrustedBin::Missing), Identity::Outside));
+        assert!(matches!(discover(&ctx, &project, false, &facts, world.home.path(), TrustedBin::Found("herdr".into())), Identity::Outside));
+        assert!(matches!(discover(&ctx, &project, false, &facts, world.home.path(), TrustedBin::Unknown), Identity::Unknown));
+        assert!(matches!(discover(&ctx, &project, true, &facts, world.home.path(), TrustedBin::Missing), Identity::Unknown));
+        world.script_inside_herdr(&[]);
+        let facts = Facts::gather(&ctx, QUERY_TIMEOUT).unwrap();
+        for bin in [TrustedBin::Missing, TrustedBin::Found("herdr".into())] {
+            assert!(matches!(discover(&ctx, &project, false, &facts, world.home.path(), bin), Identity::Unknown));
+        }
+    }
+
+    #[test]
+    fn missing_self_ancestor_home_or_process_probe_never_means_human() {
+        for table in ["", "1 0 1 init\n", "9000 4 9000 sh\n", "9000 9000 9000 sh\n", "9000 1 9000\n"] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            *world.ps_table.borrow_mut() = table.into();
+            assert_eq!(identify(&world.ctx(), &project, false), Caller::Unverified { pane: String::new() }, "{table:?}");
+        }
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let env = Env::for_test(world.home.path(), &[("HP_TEST_SELF_PID", "9000")]);
+        assert_eq!(identify(&Ctx { env: &env, ..world.ctx() }, &project, false), Caller::Unverified { pane: String::new() });
+        let runner = FakeRunner::new();
+        runner.on("ps ", timeout());
+        assert_eq!(identify(&Ctx { runner: &runner, ..world.ctx() }, &project, false), Caller::Unverified { pane: String::new() });
+    }
+
+    fn unrelated(pane: &str) -> crate::runner::Output {
+        ok(&format!(r#"{{"result":{{"process_info":{{"pane_id":"{pane}","shell_pid":7777,"foreground_processes":[{{"pid":7778}}]}}}}}}"#))
+    }
+
+    #[test]
+    fn census_requires_every_panes_complete_negative_result() {
+        for output in [fail(1, "busy"), timeout(), ok(r#"{"result":{}}"#), ok(r#"{"result":{"process_info":{"pane_id":"p","shell_pid":7777,"foreground_processes":[{}]}}}"#)] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let facts = Facts::gather(&world.ctx(), QUERY_TIMEOUT).unwrap();
+            let runner = FakeRunner::new();
+            runner.on("pane list", ok(r#"{"result":{"panes":[{"pane_id":"p"}]}}"#));
+            runner.on("process-info", output);
+            let ctx = Ctx { runner: &runner, ..world.ctx() };
+            assert!(matches!(census(&ctx, &project, false, &facts, "herdr", &[PathBuf::from("/session")], Instant::now() + IDENTITY_BUDGET), Identity::Unknown));
+        }
+    }
+
+    #[test]
+    fn unstarted_layout_entries_require_explicit_trusted_negative_evidence() {
+        for (restore_error, code, outside) in [
+            ("saved directory unavailable", "pane_not_found", true),
+            ("", "pane_not_found", false),
+            ("saved directory unavailable", "timeout", false),
+        ] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let facts = Facts::gather(&world.ctx(), QUERY_TIMEOUT).unwrap();
+            let runner = FakeRunner::new();
+            runner.on("pane list", ok(&serde_json::json!({"result":{"panes":[{"pane_id":"p","restore_error":restore_error}]}}).to_string()));
+            runner.on("process-info", fail(1, &serde_json::json!({"error":{"code":code}}).to_string()));
+            let ctx = Ctx { runner: &runner, ..world.ctx() };
+            let got = census(&ctx, &project, false, &facts, "herdr", &[PathBuf::from("/session")], Instant::now() + IDENTITY_BUDGET);
+            assert_eq!(matches!(got, Identity::Outside), outside, "{got:?}");
+        }
+    }
+
+    #[test]
+    fn a_proven_pane_with_failed_agent_discovery_cannot_later_become_human() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let facts = Facts::gather(&world.ctx(), QUERY_TIMEOUT).unwrap();
+        let runner = FakeRunner::new();
+        runner.on("process-info", ok(r#"{"result":{"process_info":{"pane_id":"p","shell_pid":301,"foreground_processes":[{"pid":9000}]}}}"#));
+        runner.on("agent list", fail(1, "busy"));
+        runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
+        let ctx = Ctx { runner: &runner, ..world.ctx() };
+        let got = census(&ctx, &project, false, &facts, "herdr", &[PathBuf::from("/session")], Instant::now() + IDENTITY_BUDGET);
+        assert!(matches!(got, Identity::Pane { caller: Caller::Unverified { ref pane }, .. } if pane.is_empty()), "{got:?}");
+        assert_eq!(runner.count("pane list"), 0);
+    }
+
+    #[test]
+    fn a_healthy_120_pane_census_is_not_cut_off_at_900_milliseconds() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let facts = Facts::gather(&world.ctx(), QUERY_TIMEOUT).unwrap();
+        let runner = FakeRunner::new();
+        let panes: Vec<_> = (0..120).map(|i| serde_json::json!({"pane_id": format!("p{i}")})).collect();
+        runner.on("pane list", ok(&serde_json::json!({"result":{"panes":panes}}).to_string()));
+        runner.on_fn(|c| c.display().contains("process-info"), |cmd| {
+            std::thread::sleep(Duration::from_millis(10));
+            let pane = cmd.args.last().unwrap();
+            Ok(unrelated(pane))
+        });
+        let ctx = Ctx { runner: &runner, ..world.ctx() };
+        assert!(matches!(census(&ctx, &project, false, &facts, "herdr", &[PathBuf::from("/session")], Instant::now() + IDENTITY_BUDGET), Identity::Outside));
+        assert_eq!(runner.count("process-info --pane"), 120);
+    }
+
+    #[test]
+    fn expired_deadlines_stop_probes_instead_of_renewing_one_millisecond() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let facts = Facts::gather(&world.ctx(), QUERY_TIMEOUT).unwrap();
+        let runner = FakeRunner::new();
+        let ctx = Ctx { runner: &runner, ..world.ctx() };
+        let sockets = [PathBuf::from("/one"), PathBuf::from("/two")];
+        assert!(matches!(census(&ctx, &project, false, &facts, "herdr", &sockets, Instant::now()), Identity::Unknown));
+        assert!(runner.calls.borrow().is_empty());
+        runner.on_fn(|_| true, |_| {
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(unrelated("p"))
+        });
+        assert!(matches!(census(&ctx, &project, false, &facts, "herdr", &sockets, Instant::now() + Duration::from_millis(5)), Identity::Unknown));
+        assert_eq!(runner.calls.borrow().len(), 1);
     }
 }

@@ -29,6 +29,7 @@ mod routine;
 mod runner;
 mod safety;
 mod schedule;
+mod scope;
 #[cfg(test)]
 mod scenarios;
 mod settings;

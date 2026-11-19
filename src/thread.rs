@@ -20,7 +20,7 @@ pub const NOT_READY_SECS: i64 = 60;
 pub const STALL_UPGRADE_SECS: i64 = 600;
 /// Overrides [`STALL_UPGRADE_SECS`], parsed the way the other env knobs are.
 pub const STALL_UPGRADE_ENV: &str = "HERDR_PROJECTS_STALL_UPGRADE_SECS";
-pub const MEMORY_CAP_CHARS: usize = 32_000;
+pub const MEMORY_CAP_BYTES: usize = 32 * 1024;
 pub const LIBRARY_CAP_KB: u64 = 50 * 1024;
 pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 
@@ -411,27 +411,22 @@ pub fn compose_brief(input: &BriefInput) -> String {
     }
     brief.push_str("# Project instructions\n\n");
     brief.push_str(input.instructions.trim());
-    brief.push_str("\n\n# Project memory\n\n");
-    brief.push_str(input.memory_index.trim());
-    brief.push('\n');
-
-    let mut used = input.memory_index.chars().count();
-    let mut left_out = Vec::new();
+    brief.push_str("\n\n# Owner-scoped memory\n\n");
+    let mut memory = crate::scope::bounded(input.memory_index.trim(), MEMORY_CAP_BYTES.saturating_sub(256), "read the owner's scoped memory index");
+    memory.push('\n');
+    let mut left_out = 0;
     for (name, text) in input.memory_files {
-        let size = text.chars().count();
-        if used + size <= MEMORY_CAP_CHARS {
-            used += size;
-            brief.push_str(&format!("\n## memory/{name}\n\n{}\n", text.trim()));
+        let section = format!("\n## memory/{name}\n\n{}\n", text.trim());
+        if memory.len() + section.len() <= MEMORY_CAP_BYTES - 256 {
+            memory.push_str(&section);
         } else {
-            left_out.push(format!("memory/{name}"));
+            left_out += 1;
         }
     }
-    if !left_out.is_empty() {
-        brief.push_str(&format!(
-            "\nNot inlined because project memory is over {MEMORY_CAP_CHARS} characters: {}.\n",
-            left_out.join(", ")
-        ));
+    if left_out > 0 {
+        memory.push_str(&format!("\n{left_out} memory files not inlined: the index and files share a {MEMORY_CAP_BYTES}-byte budget. Read only relevant owner-scoped files.\n"));
     }
+    brief.push_str(&memory);
 
     brief.push_str("\n# Progress\n\n");
     if input.report_prefix.is_empty() {
@@ -455,26 +450,26 @@ pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) 
     let project_name = project::display_name(&settings.name, &project.slug);
     let uploads = project.dir().join("uploads").to_string_lossy().into_owned();
     let prefix = if thread.is_remote() { String::new() } else { crate::coordinator::current_prefix(&project.root).unwrap_or_default() };
-    let memory_index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
-    let mut names: Vec<String> = std::fs::read_dir(project.dir().join("memory"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.ends_with(".md") && !n.starts_with('.'))
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    let memory_files: Vec<(String, String)> = names
-        .into_iter()
-        .filter_map(|name| {
-            let path = project.dir().join("memory").join(&name);
-            // Regular files only: a symbolic link in memory/ is never followed.
-            let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
-            regular.then(|| std::fs::read_to_string(&path).ok()).flatten().map(|text| (name, text))
-        })
-        .collect();
+    // Unassigned workers inherit no coordinator or legacy/shared memory.
+    let mut memory_index = String::new();
+    let mut memory_files = Vec::new();
+    if !thread.owner.is_empty() {
+        let scope = crate::scope::Scope::coordinator(project, &thread.owner)?;
+        memory_index = scope.preview("MEMORY.md", MEMORY_CAP_BYTES - 256)?;
+        let mut names: Vec<String> = match std::fs::read_dir(scope.path("memory", true)?) {
+            Ok(entries) => entries.filter_map(|e| e.ok()?.file_name().into_string().ok()).filter(|n| n.ends_with(".md") && !n.starts_with('.')).collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        names.sort();
+        let mut remaining = MEMORY_CAP_BYTES.saturating_sub(memory_index.len() + 256);
+        for name in names {
+            if remaining < 256 { break; }
+            let text = scope.preview(&format!("memory/{name}"), remaining.saturating_sub(name.len() + 32))?;
+            remaining = remaining.saturating_sub(text.len() + name.len() + 32);
+            memory_files.push((name, text));
+        }
+    }
     Ok(compose_brief(&BriefInput {
         project_name: &project_name,
         slug: &project.slug,
@@ -1375,7 +1370,7 @@ mod tests {
     fn brief_order_and_memory_cap() {
         let files = vec![
             ("a.md".to_string(), "alpha fact".to_string()),
-            ("b.md".to_string(), "x".repeat(MEMORY_CAP_CHARS)),
+            ("b.md".to_string(), "x".repeat(MEMORY_CAP_BYTES)),
             ("c.md".to_string(), "gamma fact".to_string()),
         ];
         let repos = vec![
@@ -1418,7 +1413,7 @@ mod tests {
         assert!(brief.contains("/bin/hp --root /r coordinator prompt demo --text-file -"));
         assert!(brief.contains("delivery uses the current thread record"));
         assert!(brief.contains("gamma fact"));
-        assert!(brief.contains("Not inlined because project memory is over 32000 characters: memory/b.md."));
+        assert!(brief.contains("1 memory files not inlined: the index and files share a 32768-byte budget."));
         assert!(!brief.contains(&"x".repeat(100)));
         // No operational settings reach a thread.
         for word in ["auto_resolve_days", "nudge", "coordinator_agent", "thread_agent"] {
@@ -1432,6 +1427,32 @@ mod tests {
         assert!(!fresh.contains("coordinator prompt"));
         let unassigned = compose_brief(&BriefInput { owner: "", ..input });
         assert!(unassigned.contains("Owner at briefing: unassigned"));
+    }
+
+    #[test]
+    fn brief_memory_follows_current_owner_and_bounds_the_index_too() {
+        let home = tempfile::tempdir().unwrap();
+        let project = project::create(home.path(), "demo", "", vec![]).unwrap();
+        std::fs::write(project.dir().join("MEMORY.md"), "ROOT_MEMORY").unwrap();
+        std::fs::write(project.dir().join("memory/root.md"), "ROOT_FILE").unwrap();
+        for (owner, marker) in [("hpc-demo", "OWNER_A"), ("hpc-demo-1", "OWNER_B")] {
+            let scope = crate::scope::ensure(&project, owner).unwrap();
+            std::fs::write(scope.dir.join("MEMORY.md"), format!("{marker}\n{}", "界🙂".repeat(20000))).unwrap();
+            std::fs::write(scope.dir.join("memory/fact.md"), format!("{marker}_FILE")).unwrap();
+        }
+        let t = allocate(&project, |t| t.owner = "hpc-demo".into()).unwrap();
+        let memory_part = |brief: &str| brief.split("# Owner-scoped memory\n\n").nth(1).unwrap().split("\n# Progress").next().unwrap().to_string();
+        let a = brief_for(&project, &t, "task", false).unwrap();
+        assert!(a.contains("OWNER_A") && !a.contains("OWNER_B") && !a.contains("ROOT_MEMORY") && !a.contains("ROOT_FILE"));
+        assert!(memory_part(&a).len() <= MEMORY_CAP_BYTES);
+        let changed = Thread { owner: "hpc-demo-1".into(), ..t.clone() };
+        let b = brief_for(&project, &changed, "task", false).unwrap();
+        assert!(b.contains("OWNER_B") && !b.contains("OWNER_A"));
+        assert!(memory_part(&b).len() <= MEMORY_CAP_BYTES);
+        let unassigned = brief_for(&project, &Thread { owner: String::new(), ..t.clone() }, "task", false).unwrap();
+        assert!(!unassigned.contains("ROOT_MEMORY") && !unassigned.contains("OWNER_A") && !unassigned.contains("OWNER_B"));
+        let missing = brief_for(&project, &Thread { owner: "hpc-demo-2".into(), ..t }, "task", false).unwrap();
+        assert!(!missing.contains("ROOT_MEMORY") && !missing.contains("OWNER_A"));
     }
 
     #[test]

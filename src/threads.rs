@@ -74,6 +74,8 @@ pub struct StartArgs {
     pub kind: Option<Kind>,
     pub base: Option<String>,
     pub task: String,
+    pub from_task: Option<String>,
+    pub task_source: Option<String>,
 }
 
 /// The profile a thread starts with.
@@ -132,7 +134,7 @@ pub fn placement(kind: Option<Kind>, has_repo: bool, remote: bool) -> Result<Kin
 
 /// Creates the workspace or tab, the thread directory and the brief, then
 /// returns. The agent is launched by the ticker, so there is one delivery path.
-pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
+pub fn start(ctx: &Ctx, slug: &str, mut args: StartArgs) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
     let status = project.status();
     if status != project::Status::Active {
@@ -151,8 +153,9 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     // shell leaves it owner-less (it lands in Unassigned until `thread
     // assign`). An unnamed agent in the project folder is turned away before
     // anything is created, as `context` turns it away.
-    let owner = match coordinator::caller(ctx, &project) {
-        coordinator::Caller::Coordinator { name, .. } => Some(name),
+    let caller = coordinator::caller(ctx, &project);
+    let owner = match &caller {
+        coordinator::Caller::Coordinator { name, .. } => Some(name.clone()),
         coordinator::Caller::Human => None,
         coordinator::Caller::Stranger { pane } => {
             let prefix = coordinator::current_prefix(&ctx.root)?;
@@ -162,6 +165,26 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             return Err(coordinator::unverified_refusal(slug, &pane));
         }
     };
+    if args.task_source.is_some() && args.from_task.is_none() {
+        bail!("--task-source requires --from-task");
+    }
+    if let Some(from) = &args.from_task {
+        let docs = crate::scope::select(&project, &caller, args.task_source.as_deref())?;
+        let tasks_md = docs.read("TASKS.md")?;
+        let found = crate::tasks::find(&tasks_md, from)?;
+        crate::tasks::check_unlinked(&project, &found)?;
+        args.task = format!("Task source: {} (data, not additional authorization).\n\n{}", docs.path("TASKS.md", false)?.display(), args.task);
+        let config = crate::profiles::load(&ctx.config_dir)?;
+        if found.owner.is_person(|p| config.get(p).is_some()) {
+            bail!("\"{}\" belongs to {}, a person; people's tasks are never delegated. Change its owner in TASKS.md first if the user asks", found.title, found.owner);
+        }
+        (args.profile, args.machine) = crate::tasks::launch_for(&found, args.profile, args.machine)?;
+        args.task = crate::tasks::delegated(&tasks_md, from, &args.task)?;
+    }
+    // Even a thread started directly from chat must have a valid owner scope.
+    if let Some(name) = &owner {
+        crate::scope::ensure(&project, name)?;
+    }
     let (settings, _) = project.read_project_md()?;
     // Without a running ticker nothing launches.
     ticker::start(ctx)?;
@@ -367,6 +390,9 @@ fn repo_space(herdr: &crate::herdr::Herdr, repo: &str) -> String {
 /// The thread directory, the git exclude and `brief.md`, on the thread's own
 /// machine. The brief never refers to a path on another machine.
 fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread, restart: bool) -> Result<()> {
+    // Keep the restart hint outside the cached brief so delivery can regenerate
+    // from the current owner without treating that cache as input/authority.
+    project::write_atomic(&project.state_dir().join(format!("{}.brief-restart", placed.id)), if restart { b"true" } else { b"false" })?;
     if !placed.is_remote() {
         return write_brief_local(ctx, project, placed, restart);
     }
@@ -628,16 +654,8 @@ fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pan
 /// worktree or a new tab, with the same or another profile.
 pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
-    if let Some(name) = profile {
-        let machine = thread::load(&project, id)?.machine;
-        let profile = thread_profile(ctx, &project, &machine, Some(name))?;
-        // The profile carries the whole setup: old model flags no longer apply.
-        thread::update(&project, id, |t| {
-            profile.apply(t);
-            t.agent_args.clear();
-        })?;
-    }
-    let record = thread::load(&project, id)?;
+    let (_delivery, record) = lock_control(ctx, &project, id, "restart")?;
+    let profile = profile.map(|name| thread_profile(ctx, &project, &record.machine, Some(name))).transpose()?;
     ticker::start(ctx)?;
     let view = require_session(ctx, &project)?;
     let (agents, panes) = lists_for(&view, &record)?;
@@ -653,7 +671,15 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
         }
     };
 
-    match restart_plan(&record, &live, branch_exists, now)? {
+    let plan = restart_plan(&record, &live, branch_exists, now)?;
+    if let Some(profile) = profile {
+        // The profile carries the whole setup: old model flags no longer apply.
+        thread::update(&project, id, |t| {
+            profile.apply(t);
+            t.agent_args.clear();
+        })?;
+    }
+    match plan {
         RestartPlan::Create => {
             let placed = place_and_brief(ctx, &project, &view, id, true)?;
             let _ = crate::steps::note_one_legacy_checkout(&project, &placed);
@@ -710,22 +736,54 @@ pub(crate) fn validate_prompt_target(ctx: &Ctx, slug: &str, id: &str, text: &str
     Ok((project, record))
 }
 
+/// Explicitly unlock before closing: a concurrent fork can inherit the open
+/// file description until exec, even though the descriptor is CLOEXEC. Closing
+/// only our copy would let that child retain the lock past the guarded command.
+#[derive(Debug)]
+pub(crate) struct DeliveryLock(std::fs::File);
+
+impl Drop for DeliveryLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Serializes owner-bound delivery with reassignment without holding the project
 /// lock across Herdr. The side effect and the owner change have a definite
 /// order: either reassignment wins and delivery revalidation refuses, or the
 /// authorized prompt finishes before the new owner takes over.
-pub(crate) fn prompt_delivery_lock(project: &Project, id: &str) -> Result<std::fs::File> {
+pub(crate) fn prompt_delivery_lock(project: &Project, id: &str) -> Result<DeliveryLock> {
     thread::validate_id(id)?;
     let path = project.state_dir().join(format!("{id}.prompt-delivery.lock"));
     let file = std::fs::File::options().create(true).truncate(false).write(true).open(&path)?;
     file.lock()?;
+    let lock = DeliveryLock(file);
     if !project.project_md().is_file() {
         bail!("project `{}` is gone", project.slug);
     }
-    Ok(file)
+    Ok(lock)
 }
 
-fn lock_owned_delivery(project: &Project, stale: &Thread, owner: &str) -> Result<std::fs::File> {
+/// Caller identity is established before waiting, but ownership and the target
+/// are read only after taking the same lock as assignment and automatic sends.
+fn lock_control(ctx: &Ctx, project: &Project, id: &str, action: &str) -> Result<(DeliveryLock, Thread)> {
+    thread::validate_id(id)?;
+    let caller = coordinator::caller(ctx, project);
+    lock_control_as(project, id, caller, action)
+}
+
+fn lock_control_as(project: &Project, id: &str, caller: coordinator::Caller, action: &str) -> Result<(DeliveryLock, Thread)> {
+    let lock = prompt_delivery_lock(project, id)?;
+    let current = thread::load(project, id)?;
+    authorize_owner(caller, project, &current, action)?;
+    Ok((lock, current))
+}
+
+fn lock_owned_delivery(project: &Project, stale: &Thread, owner: &str) -> Result<DeliveryLock> {
+    lock_prompt_delivery(project, stale, Some(owner))
+}
+
+fn lock_prompt_delivery(project: &Project, stale: &Thread, owner: Option<&str>) -> Result<DeliveryLock> {
     let lock = prompt_delivery_lock(project, &stale.id)?;
     let current = thread::load(project, &stale.id)?;
     if current.status == Status::Resolved {
@@ -734,13 +792,15 @@ fn lock_owned_delivery(project: &Project, stale: &Thread, owner: &str) -> Result
     if current.prompt_pending {
         bail!("{} has not received its brief yet", stale.id);
     }
-    if current.owner.is_empty() {
-        bail!("prompt: {} is unassigned; its original owner no longer owns it", stale.id);
+    if let Some(owner) = owner {
+        if current.owner.is_empty() && !owner.is_empty() {
+            bail!("prompt: {} is unassigned; its original owner no longer owns it", stale.id);
+        }
+        if current.owner != owner {
+            bail!("prompt: {} is owned by coordinator `{}`, not the authorizing coordinator `{owner}`", stale.id, current.owner);
+        }
     }
-    if current.owner != owner {
-        bail!("prompt: {} is owned by coordinator `{}`, not the authorizing coordinator `{owner}`", stale.id, current.owner);
-    }
-    if current.pane_id != stale.pane_id || current.machine != stale.machine {
+    if current.pane_id != stale.pane_id || current.machine != stale.machine || current.cwd != stale.cwd || current.agent_name != stale.agent_name || current.agent != stale.agent {
         bail!("prompt: {} changed pane while delivery was being prepared; not sending to a stale pane", stale.id);
     }
     Ok(lock)
@@ -760,6 +820,27 @@ pub fn scheduled_prompt(ctx: &Ctx, slug: &str, id: &str, owner: &str, text: &str
 }
 
 fn deliver_prompt(ctx: &Ctx, project: &Project, record: &Thread, text: &str, delivery_owner: Option<&str>) -> Result<String> {
+    let _delivery = match delivery_owner {
+        Some(owner) => lock_owned_delivery(project, record, owner)?,
+        None => lock_prompt_delivery(project, record, None)?,
+    };
+    let current = thread::load(project, &record.id)?;
+    deliver_prompt_locked(ctx, project, &current, text)
+}
+
+/// Project-authorized automatic routines, never public CLI caller inference.
+/// An ownerless routine may match an ownerless record; this does not grant any
+/// agent control over unassigned work. Exact equality is rechecked under the
+/// delivery lock, including the empty-owner case (no recursive wrapper call).
+pub(crate) fn prompt_internal(ctx: &Ctx, slug: &str, id: &str, text: &str, expected_owner: &str) -> Result<()> {
+    let (project, record) = validate_prompt_target(ctx, slug, id, text)?;
+    let _delivery = lock_prompt_delivery(&project, &record, Some(expected_owner))?;
+    let current = thread::load(&project, id)?;
+    deliver_prompt_locked(ctx, &project, &current, text).map(|_| ())
+}
+
+/// The caller owns the delivery guard across all pane effects and task writes.
+fn deliver_prompt_locked(ctx: &Ctx, project: &Project, record: &Thread, text: &str) -> Result<String> {
     let id = &record.id;
     let slug = &project.slug;
     let view = require_session(ctx, project)?;
@@ -779,11 +860,6 @@ fn deliver_prompt(ctx: &Ctx, project: &Project, record: &Thread, text: &str, del
     if crate::prompt_box::check(kind, &screen) == crate::prompt_box::Draft::Typed {
         bail!("draft_in_box: {id}'s input box holds text someone typed ({}); not sending, so it is not merged into their prompt. Try again once it is empty; `thread read` shows it", record.pane_id);
     }
-    // Reassignment uses this same per-thread lock. Re-read after acquiring it
-    // so the earlier Herdr calls cannot leave a stale owner authorizing text.
-    let _delivery = delivery_owner
-        .map(|owner| lock_owned_delivery(project, record, owner))
-        .transpose()?;
     // Confirmed only once herdr sees the agent start on it. A try that was
     // typed but not confirmed is never typed again: it may sit in the box.
     let sent = herdr.agent_prompt_confirmed(&record.pane_id, text.trim());
@@ -883,7 +959,7 @@ fn authorize_assignment(caller: &coordinator::Caller, project: &Project, record:
 /// Recheck the current record after acquiring the same lock used by scheduled
 /// delivery. A caller authorized before a competing handoff must not overwrite
 /// its new owner, including when merely re-asserting that new owner's name.
-fn lock_assignment(project: &Project, id: &str, caller: &coordinator::Caller, target: &str) -> Result<(std::fs::File, Thread)> {
+fn lock_assignment(project: &Project, id: &str, caller: &coordinator::Caller, target: &str) -> Result<(DeliveryLock, Thread)> {
     let lock = prompt_delivery_lock(project, id)?;
     let current = thread::load(project, id)?;
     authorize_assignment(caller, project, &current, target)?;
@@ -928,10 +1004,9 @@ pub fn assign(ctx: &Ctx, slug: &str, id: &str, coordinator_name: &str) -> Result
 /// a line the coordinator wants on that list.
 pub fn next(ctx: &Ctx, slug: &str, id: &str, line: Option<usize>, add: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    let record = thread::load(&project, id)?;
+    thread::load(&project, id)?;
     if let Some(text) = add {
-        // Adding to the Next list is driving the thread: owner only.
-        require_owner(ctx, &project, &record, "add a Next line")?;
+        let (_delivery, _) = lock_control(ctx, &project, id, "add a Next line")?;
         let text = text.trim();
         if text.is_empty() || text.contains('\n') {
             bail!("a Next line is one non-empty line");
@@ -944,6 +1019,9 @@ pub fn next(ctx: &Ctx, slug: &str, id: &str, line: Option<usize>, add: Option<&s
         println!("added to {id}'s Next list");
         return Ok(());
     }
+    // A numbered Next action is a control operation too. Resolve its payload
+    // only after taking the guard; a handoff must not send an old-owner list.
+    let control = line.map(|_| lock_control(ctx, &project, id, "send a Next line")).transpose()?;
     let lines = thread::all_next(&project, id);
     match line {
         None => {
@@ -957,7 +1035,9 @@ pub fn next(ctx: &Ctx, slug: &str, id: &str, line: Option<usize>, add: Option<&s
         }
         Some(n) => {
             let text = lines.get(n.wrapping_sub(1)).with_context(|| format!("{id} has no Next line {n} ({} lines)", lines.len()))?;
-            let state = prompt(ctx, slug, id, text)?;
+            let _guard = control.as_ref().expect("numbered Next holds the control lock");
+            let (_, current) = validate_prompt_target(ctx, slug, id, text)?;
+            let state = deliver_prompt_locked(ctx, &project, &current, text)?;
             println!("sent Next line {n} to {id} (agent was {state}): {text}");
             Ok(())
         }
@@ -967,16 +1047,12 @@ pub fn next(ctx: &Ctx, slug: &str, id: &str, line: Option<usize>, add: Option<&s
 /// `thread stop`: Escape in the thread's pane, the harness's own interrupt.
 pub fn stop(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    let record = thread::load(&project, id)?;
-    if record.status == Status::Resolved || record.pane_id.is_empty() {
-        bail!("{id} has no pane");
-    }
-    let view = require_session(ctx, &project)?;
-    view.herdr
-        .on_machine(&record.machine)
-        .agent_send_keys(&record.pane_id, &["esc".to_string()])
+    let (_delivery, _) = lock_control(ctx, &project, id, "stop")?;
+    let pane = pane_agent(ctx, slug, id)?;
+    pane.herdr
+        .agent_send_keys(&pane.record.pane_id, &["esc".to_string()])
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    println!("sent Escape to {id} (pane {})", record.pane_id);
+    println!("sent Escape to {id} (pane {})", pane.record.pane_id);
     Ok(())
 }
 
@@ -1032,8 +1108,7 @@ pub fn keys(ctx: &Ctx, slug: &str, id: &str, keys: &[String], text: Option<&str>
     }
     // Arbitrary keystrokes steer the agent exactly like a prompt: owner only.
     let project = Project::load(&ctx.root, slug)?;
-    let record = thread::load(&project, id)?;
-    require_owner(ctx, &project, &record, "send keys to")?;
+    let (_delivery, _) = lock_control(ctx, &project, id, "send keys to")?;
     let pane = pane_agent(ctx, slug, id)?;
     let fail = |error: crate::herdr::HerdrError| anyhow::anyhow!("{error}");
     // With `trust_screens = user`, a trust answer is the user's alone.
@@ -1060,7 +1135,7 @@ pub fn keys(ctx: &Ctx, slug: &str, id: &str, keys: &[String], text: Option<&str>
 /// is claimed under the project lock first, so the ticker does not send it too.
 pub fn brief(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    let record = thread::load(&project, id)?;
+    let (_delivery, record) = lock_control(ctx, &project, id, "send the brief to")?;
     if !record.prompt_pending {
         println!("{id} already has its brief; send more with `thread prompt`");
         return Ok(());
@@ -1068,16 +1143,15 @@ pub fn brief(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     if record.status != Status::Open {
         bail!("{id} is {}; `thread restart` brings it back", format!("{:?}", record.status).to_lowercase());
     }
-    // Delivering the brief by hand is steering the thread: owner only (the
-    // ticker's own delivery goes through brief::deliver, not this command).
-    require_owner(ctx, &project, &record, "send the brief to")?;
+    // The ticker uses the internally locked wrapper; this command already
+    // holds the delivery guard through the owner check and pane lookup.
     let pane = pane_agent(ctx, slug, id).map_err(|e| anyhow::anyhow!("{e:#}; the ticker launches the agent on its next pass"))?;
     match pane.state.as_str() {
         "blocked" => bail!("{id}'s pane shows a prompt: `thread read` shows it, `thread keys` answers it; then run `thread brief` again"),
         state if !pane.agent.ready_for_brief(if pane.agent.agent.is_empty() { &record.agent } else { &pane.agent.agent }) && record.brief_attempts == 0 => bail!("{id}'s agent is {state}, not ready for its brief yet; try again shortly"),
         _ => {}
     }
-    match crate::brief::deliver(&project, &pane.herdr, &pane.record, &pane.agent, crate::brief::Sender::Manual)? {
+    match crate::brief::deliver_locked(&project, &pane.herdr, &pane.record, &pane.agent, crate::brief::Sender::Manual, Some(&ctx.config_dir))? {
         crate::brief::Outcome::Delivered => println!("{id} has its brief (agent was {})", pane.state),
         crate::brief::Outcome::Taken => println!("{id}'s brief is being sent by the ticker, or it just got it"),
         crate::brief::Outcome::Waiting(why) => bail!("{id}'s brief is not delivered yet: {why}; `thread read` shows the pane, then run `thread brief` again"),
@@ -1109,10 +1183,7 @@ pub fn prompt_state(record: &Thread, agents: &[Agent]) -> Result<String> {
 
 pub fn ack(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    let record = thread::load(&project, id)?;
-    // Acking moves the owner's Ready-for-review row; a foreign coordinator
-    // must not silently change another one's board.
-    require_owner(ctx, &project, &record, "acknowledge the report of")?;
+    let (_delivery, _) = lock_control(ctx, &project, id, "acknowledge the report of")?;
     let record = thread::update(&project, id, |t| t.acked_report_hash = t.report_hash.clone())?;
     if record.report_hash.is_empty() {
         println!("{id} has no report yet; nothing to acknowledge");
@@ -1134,7 +1205,7 @@ pub struct ResolveArgs {
 
 pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    let record = thread::load(&project, id)?;
+    let (_delivery, record) = lock_control(ctx, &project, id, if args.reopen { "reopen" } else { "resolve" })?;
     if args.reopen {
         if record.status != Status::Resolved {
             bail!("{id} is not resolved");
@@ -1198,7 +1269,8 @@ pub struct Clean {
 /// Cleans up after a resolved thread: its worktree (never forced), its local
 /// branch when the pull request is merged, its tab. Reports and library are
 /// never touched. Returns one note per thing, for the output and the inbox.
-pub fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Vec<String> {
+/// The caller must hold the thread's delivery lock and reload eligibility.
+pub(crate) fn clean(ctx: &Ctx, project: &Project, t: &Thread, options: &Clean) -> Vec<String> {
     let mut notes = Vec::new();
     let view = session_view(ctx, project);
     let mut merged = t.pr_state.eq_ignore_ascii_case("merged");
@@ -1535,6 +1607,193 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn control_world(name: &str) -> (crate::scenarios::World, Project, crate::paths::Env) {
+        use crate::scenarios::{World, agent_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let socket = project.coordinator().unwrap().socket;
+        let dir = project.canonical_dir().to_string_lossy().into_owned();
+        world.thread(&project, world.home.path(), |t| t.kind = Kind::Adopted);
+        *world.agents.borrow_mut() = format!("[{},{}]",
+            agent_json("w1", "w1:t1", "w1:p1", &dir, name, "idle"),
+            agent_json("w2", "w2:t1", "w2:p1", &world.home.path().to_string_lossy(), "hp-demo-t-0001", "idle"));
+        world.script_inside_herdr(&[&socket]);
+        world.procinfo_proves("w1:p1", 200, 9000, 500);
+        let env = crate::paths::Env::for_test(world.home.path(), &[
+            ("HERDR_ENV", "1"), ("HP_TEST_SELF_PID", "9000"),
+            ("HP_TEST_REAL_HOME", &world.home.path().to_string_lossy()),
+            ("HP_TEST_HERDR_BIN", "herdr"),
+        ]);
+        (world, project, env)
+    }
+
+    #[test]
+    fn every_cli_control_refuses_a_foreign_owner_before_side_effects() {
+        let (world, project, env) = control_world("hpc-demo-1");
+        let ctx = Ctx { env: &env, ..world.ctx() };
+        let path = thread::record_path(&project, "t-0001");
+        let before = std::fs::read(&path).unwrap();
+        let operations = [
+            stop(&ctx, "demo", "t-0001"),
+            restart(&ctx, "demo", "t-0001", Some("nonexistent-profile")).map(|_| ()),
+            resolve(&ctx, "demo", "t-0001", &ResolveArgs::default()),
+            resolve(&ctx, "demo", "t-0001", &ResolveArgs { reopen: true, ..ResolveArgs::default() }),
+            keys(&ctx, "demo", "t-0001", &["enter".into()], Some("foreign text")),
+            next(&ctx, "demo", "t-0001", None, Some("foreign Next")),
+            next(&ctx, "demo", "t-0001", Some(1), None),
+            ack(&ctx, "demo", "t-0001"),
+            brief(&ctx, "demo", "t-0001"),
+            prompt(&ctx, "demo", "t-0001", "foreign prompt").map(|_| ()),
+        ];
+        for result in operations {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("owned by coordinator `hpc-demo`"), "{error}");
+        }
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(!thread::extra_next_path(&project, "t-0001").exists());
+        for effect in ["agent prompt", "agent send-keys", "pane send-text", "agent start", "tab close", "git ", "ssh "] {
+            assert_eq!(world.runner.count(effect), 0, "unexpected effect: {effect}");
+        }
+    }
+
+    #[test]
+    fn owner_controls_keep_the_delivery_lock_through_all_pane_effects() {
+        use crate::runner::fake::ok;
+        let (world, project, env) = control_world("hpc-demo");
+        let lock_path = project.state_dir().join("t-0001.prompt-delivery.lock");
+        world.runner.on_fn(
+            |cmd| ["agent prompt", "agent send-keys", "pane send-text"].iter().any(|s| cmd.display().contains(s)),
+            move |_| {
+                let contender = std::fs::File::options().write(true).open(&lock_path).unwrap();
+                assert!(contender.try_lock().is_err(), "pane effect escaped the assignment lock");
+                let project_lock = std::fs::File::options().write(true).open(lock_path.parent().unwrap().join("lock")).unwrap();
+                assert!(project_lock.try_lock().is_ok(), "global project lock held across Herdr");
+                // This probe must not itself leave a fork-inherited lock behind.
+                project_lock.unlock().unwrap();
+                Ok(ok(r#"{"result":{}}"#))
+            },
+        );
+        let ctx = Ctx { env: &env, ..world.ctx() };
+        keys(&ctx, "demo", "t-0001", &["enter".into()], Some("typed text")).unwrap();
+        stop(&ctx, "demo", "t-0001").unwrap();
+        prompt(&ctx, "demo", "t-0001", "follow up").unwrap();
+        next(&ctx, "demo", "t-0001", None, Some("next step")).unwrap();
+        next(&ctx, "demo", "t-0001", Some(1), None).unwrap();
+        // The real-human branch has no owner token but still serializes with
+        // assignment; only the authorization exception differs.
+        let current = thread::load(&project, "t-0001").unwrap();
+        deliver_prompt(&ctx, &project, &current, "human follow up", None).unwrap();
+        assert_eq!(world.runner.count("agent prompt"), 3);
+        assert_eq!(world.runner.count("agent send-keys"), 2);
+        assert_eq!(world.runner.count("pane send-text"), 1);
+        // The guard is dropped when the command returns, not held forever.
+        let contender = std::fs::File::options().write(true).open(project.state_dir().join("t-0001.prompt-delivery.lock")).unwrap();
+        let released = contender.try_lock();
+        assert!(released.is_ok(), "delivery guard was not released: {released:?}");
+    }
+
+    fn assert_guard_releases_with_inherited_file<T>(held: T, path: &std::path::Path) {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let contender = std::fs::File::options().write(true).open(path).unwrap();
+        let (mut release, child_release) = UnixStream::pair().unwrap();
+        let parent_fd = release.as_raw_fd();
+        let child_fd = child_release.as_raw_fd();
+        // Model another test/thread forking just before this guard is dropped.
+        // CLOEXEC does not close the child's inherited descriptor until exec.
+        // SAFETY: the child calls only async-signal-safe functions and _exit;
+        // no Rust allocation/destructors or inherited mutexes are touched.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::close(parent_fd);
+                let mut byte = 0_u8;
+                let read = libc::read(child_fd, (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(if read == 1 { 0 } else { 1 });
+            }
+        }
+        drop(child_release);
+        drop(held);
+        let released = contender.try_lock();
+        // Reap the child before asserting, including when the regression fails.
+        release.write_all(&[1]).unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(status, 0);
+        assert!(released.is_ok(), "inherited file retained {}: {released:?}", path.display());
+    }
+
+    #[test]
+    fn delivery_guard_releases_before_a_forked_child_closes_its_inherited_file() {
+        let (_world, project, _) = control_world("hpc-demo");
+        let held = prompt_delivery_lock(&project, "t-0001").unwrap();
+        assert_guard_releases_with_inherited_file(held, &project.state_dir().join("t-0001.prompt-delivery.lock"));
+    }
+
+    #[test]
+    fn project_guard_releases_before_a_forked_child_closes_its_inherited_file() {
+        let (_world, project, _) = control_world("hpc-demo");
+        let held = project.lock().unwrap();
+        assert_guard_releases_with_inherited_file(held, &project.state_dir().join("lock"));
+    }
+
+    #[test]
+    fn a_waiting_control_reauthorizes_after_the_owner_changes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_world, project, _) = control_world("hpc-demo");
+        let held = prompt_delivery_lock(&project, "t-0001").unwrap();
+        let root = project.root.clone();
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        // Independent contender: identity is already proven before it waits
+        // for the same production guard held by the handoff side.
+        let contender = std::thread::spawn(move || {
+            let project = Project::load(&root, "demo").unwrap();
+            let caller = coordinator_caller("hpc-demo");
+            arrived_tx.send(()).unwrap();
+            let result = lock_control_as(&project, "t-0001", caller, "stop");
+            done_tx.send(result.map(|_| ()).map_err(|e| e.to_string())).unwrap();
+        });
+        arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        thread::update(&project, "t-0001", |t| t.owner = "hpc-demo-1".into()).unwrap();
+        drop(held);
+        let error = done_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err();
+        assert!(error.contains("hpc-demo-1"), "{error}");
+        contender.join().unwrap();
+    }
+
+    #[test]
+    fn internal_ownerless_prompts_are_explicit_and_never_reenter_the_lock() {
+        let (world, project, _) = control_world("hpc-demo");
+        world.runner.on("agent prompt", crate::runner::fake::ok(r#"{"result":{}}"#));
+        thread::update(&project, "t-0001", |t| t.owner.clear()).unwrap();
+        prompt_internal(&world.ctx(), "demo", "t-0001", "routine follow up", "").unwrap();
+        assert_eq!(world.runner.count("agent prompt"), 1);
+        thread::update(&project, "t-0001", |t| t.owner = "hpc-demo-1".into()).unwrap();
+        assert!(prompt_internal(&world.ctx(), "demo", "t-0001", "stale routine", "").is_err());
+        assert_eq!(world.runner.count("agent prompt"), 1);
+    }
+
+    #[test]
+    fn owner_can_resolve_and_reopen_without_replacing_the_record() {
+        let (world, project, env) = control_world("hpc-demo");
+        let ctx = Ctx { env: &env, ..world.ctx() };
+        resolve(&ctx, "demo", "t-0001", &ResolveArgs { skip_copy: true, ..ResolveArgs::default() }).unwrap();
+        assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Resolved);
+        resolve(&ctx, "demo", "t-0001", &ResolveArgs { reopen: true, ..ResolveArgs::default() }).unwrap();
+        let current = thread::load(&project, "t-0001").unwrap();
+        assert_eq!(current.status, Status::Open);
+        assert_eq!(current.owner, "hpc-demo");
+        assert_eq!(thread::list(&project).len(), 1);
+        assert_eq!(world.runner.count("tab close"), 0);
+        assert_eq!(world.runner.count("agent start"), 0);
+    }
 
     fn now() -> jiff::Timestamp {
         "2026-09-17T12:00:00Z".parse().unwrap()

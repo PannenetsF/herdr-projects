@@ -75,6 +75,7 @@ pub struct ThreadRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskRow {
     pub slug: String,
+    pub source: String,
     pub list: String,
     pub title: String,
     pub owner: String,
@@ -108,10 +109,15 @@ pub enum RowKind {
 }
 
 /// Parses TASKS.md (see `tasks::parse`) into popup rows.
+#[cfg(test)]
 pub fn parse_tasks(slug: &str, text: &str) -> Vec<TaskRow> {
+    parse_tasks_from(slug, "shared", text)
+}
+
+fn parse_tasks_from(slug: &str, source: &str, text: &str) -> Vec<TaskRow> {
     crate::tasks::parse(text)
         .into_iter()
-        .map(|t| TaskRow { slug: slug.to_string(), list: t.list, title: t.title, owner: t.owner.to_string(), thread: t.thread, description: t.description })
+        .map(|t| TaskRow { slug: slug.to_string(), source: source.to_string(), list: t.list, title: t.title, owner: t.owner.to_string(), thread: t.thread, description: t.description })
         .collect()
 }
 
@@ -286,7 +292,7 @@ fn group_color(group: Group, human: bool) -> Option<Color> {
 
 /// A task's notes as a detail screen.
 fn task_detail(task: &TaskRow) -> Mode {
-    let mut lines = vec![format!("{} · {}", task.list, if task.owner.is_empty() { "no owner" } else { &task.owner }), String::new()];
+    let mut lines = vec![format!("{} · source {} · {}", task.list, task.source, if task.owner.is_empty() { "no owner" } else { &task.owner }), String::new()];
     if task.description.trim().is_empty() {
         lines.push("(no notes; ask the coordinator to add some)".into());
     } else {
@@ -364,20 +370,25 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
         }
         Section::Tasks => {
             for project in projects_in_scope(root, scope, false) {
-                let text = std::fs::read_to_string(project.dir().join("TASKS.md")).unwrap_or_default();
-                let tasks = parse_tasks(&project.slug, &text);
-                let mut list = None;
-                for task in tasks {
-                    if list.as_ref() != Some(&task.list) {
-                        list = Some(task.list.clone());
-                        rows.push(header(if scope.is_none() { format!("{} · {}", project.slug, task.list) } else { task.list.clone() }));
-                    }
-                    let mut owner = if task.owner.is_empty() { String::new() } else { format!("  ({})", task.owner) };
-                    if let Some(thread) = &task.thread {
-                        owner.push_str(&format!(" · {thread}"));
-                    }
-                    let notes = if task.description.trim().is_empty() { "" } else { "  ≡" };
-                    rows.push(Row { header: false, text: format!("  {}{owner}{notes}", task.title), color: None, kind: RowKind::Task(task) });
+                match crate::scope::sources(&project) {
+                    Err(error) => rows.push(header(format!("{}: {error}", project.slug))),
+                    Ok(sources) => for source in sources {
+                        let text = match source.read("TASKS.md") {
+                            Ok(text) => text,
+                            Err(error) => { rows.push(header(format!("{}: {error}", source.source))); continue; }
+                        };
+                        let mut list = None;
+                        for task in parse_tasks_from(&project.slug, &source.source, &text) {
+                            if list.as_ref() != Some(&task.list) {
+                                list = Some(task.list.clone());
+                                rows.push(header(format!("{} · {} · {}", project.slug, source.source, task.list)));
+                            }
+                            let mut owner = if task.owner.is_empty() { String::new() } else { format!("  ({})", task.owner) };
+                            if let Some(thread) = &task.thread { owner.push_str(&format!(" · {thread}")); }
+                            let notes = if task.description.trim().is_empty() { "" } else { "  ≡" };
+                            rows.push(Row { header: false, text: format!("  {}{owner}{notes}", task.title), color: None, kind: RowKind::Task(task) });
+                        }
+                    },
                 }
             }
             if rows.is_empty() {
@@ -477,13 +488,22 @@ pub fn build(ctx: &Ctx, section: Section, scope: Option<&str>) -> Vec<Row> {
         },
         Section::Memory => {
             for project in projects_in_scope(root, scope, false) {
-                rows.push(header(format!("{} · MEMORY.md (read only; change it by asking the coordinator)", project.slug)));
-                rows.push(Row { header: false, text: "  MEMORY.md".into(), color: None, kind: RowKind::Memory { path: project.dir().join("MEMORY.md") } });
-                let mut files: Vec<PathBuf> = std::fs::read_dir(project.dir().join("memory")).map(|e| e.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect()).unwrap_or_default();
-                files.sort();
-                for path in files {
-                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    rows.push(Row { header: false, text: format!("  memory/{name}"), color: None, kind: RowKind::Memory { path } });
+                match crate::scope::sources(&project) {
+                    Err(error) => rows.push(header(format!("{}: {error}", project.slug))),
+                    Ok(sources) => for source in sources {
+                        rows.push(header(format!("{} · {} · memory (read only)", project.slug, source.source)));
+                        if let Ok(path) = source.path("MEMORY.md", false) {
+                            rows.push(Row { header: false, text: "  MEMORY.md".into(), color: None, kind: RowKind::Memory { path } });
+                        }
+                        let files = source.path("memory", true).ok().and_then(|p| std::fs::read_dir(p).ok());
+                        let mut names: Vec<_> = files.into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| n.ends_with(".md")).collect();
+                        names.sort();
+                        for name in names {
+                            if let Ok(path) = source.path(&format!("memory/{name}"), false) {
+                                rows.push(Row { header: false, text: format!("  memory/{name}"), color: None, kind: RowKind::Memory { path } });
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -1077,15 +1097,10 @@ impl<'a> Popup<'a> {
         }
     }
 
-    fn coordinator_says(&mut self, slug: &str, text: String) {
-        self.run(&["coordinator".into(), "prompt".into(), slug.to_string(), "--text-file".into(), "-".into()], Some(&text));
-    }
-
     fn task_key(&mut self, key: KeyEvent) {
         let Some(RowKind::Task(task)) = self.current().map(|r| r.kind.clone()) else {
             return;
         };
-        let sentence = |verb: &str| format!("(from the projects popup) {verb} the task \"{}\" in TASKS.md.", task.title);
         match key.code {
             KeyCode::Enter => match &task.thread {
                 Some(id) => {
@@ -1102,9 +1117,14 @@ impl<'a> Popup<'a> {
                 None => self.message = "this task has no thread yet; d delegates it".into(),
             },
             KeyCode::Char('i') => self.mode = task_detail(&task),
-            KeyCode::Char('d') => self.coordinator_says(&task.slug, sentence("Please delegate")),
-            KeyCode::Char('m') => self.coordinator_says(&task.slug, sentence("Please mark as done")),
-            KeyCode::Char('D') => self.coordinator_says(&task.slug, sentence("Please drop")),
+            KeyCode::Char('d' | 'm' | 'D') => {
+                let command = format!("herdr-projects thread start {} --title {} --from-task {} --task-source {} --task-file -", crate::remote::quote(&task.slug), crate::remote::quote(&task.title), crate::remote::quote(&task.title), crate::remote::quote(&task.source));
+                self.mode = Mode::Detail {
+                    title: "Exact-source task action required".into(),
+                    lines: vec![format!("Source: {} / TASKS.md", task.source), "Nothing was sent to a coordinator. Generic primary dispatch is disabled.".into(), "Ask the coordinator owning this source to edit this exact task, or delegate explicitly from your own terminal:".into(), command, "Supply the task text on stdin; choose --repo/--profile/--machine as needed. This human CLI launch is unassigned until explicitly assigned.".into()],
+                    files: Vec::new(), selected: 0, scroll: 0,
+                };
+            }
             _ => {}
         }
     }
@@ -1698,12 +1718,36 @@ mod tests {
         std::fs::write(project.dir().join("TASKS.md"), "# Tasks\n\n## Backlog\n- [ ] Fix login (claude) · t-0003\n  Safari drops the cookie.\n  See issue 42.\n- [ ] Docs (me)\n").unwrap();
         let tasks = build(&world.ctx(), Section::Tasks, Some("demo"));
         let texts: Vec<(&str, bool)> = tasks.iter().map(|r| (r.text.as_str(), r.header)).collect();
-        assert_eq!(texts, [("Backlog", true), ("  Fix login  (claude) · t-0003  ≡", false), ("  Docs  (me)", false)]);
+        assert_eq!(texts, [("demo · shared · Backlog", true), ("  Fix login  (claude) · t-0003  ≡", false), ("  Docs  (me)", false)]);
         let RowKind::Task(task) = &tasks[1].kind else { panic!() };
         let Mode::Detail { title, lines, .. } = task_detail(task) else { panic!() };
-        assert_eq!((title.as_str(), lines), ("Fix login", vec!["Backlog · claude".to_string(), String::new(), "  Safari drops the cookie.".into(), "  See issue 42.".into()]));
+        assert_eq!((title.as_str(), lines), ("Fix login", vec!["Backlog · source shared · claude".to_string(), String::new(), "  Safari drops the cookie.".into(), "  See issue 42.".into()]));
         assert!(!build(&world.ctx(), Section::Memory, Some("demo")).is_empty());
         assert_eq!(summary(&world.root), "1 project · 1 need you");
+    }
+
+    #[test]
+    fn scoped_task_actions_show_exact_source_instead_of_prompting_primary() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let scope = crate::scope::ensure(&project, "hpc-demo-1").unwrap();
+        std::fs::write(scope.dir.join("TASKS.md"), "## Backlog\n- [ ] Fix login\n  Relevant notes\n").unwrap();
+        let ctx = world.ctx();
+        let mut popup = Popup::new(&ctx, Some("demo".into()), String::new());
+        popup.section = 1;
+        popup.reload();
+        for key in ['d', 'm', 'D'] {
+            popup.task_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            let Mode::Detail { lines, .. } = &popup.mode else { panic!("expected explicit-source guidance"); };
+            let text = lines.join("\n");
+            assert!(text.contains("hpc-demo-1") && text.contains("--task-source"));
+            assert!(text.contains("Nothing was sent"));
+        }
+        popup.task_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        let Mode::Detail { lines, .. } = &popup.mode else { panic!(); };
+        assert!(lines.iter().any(|l| l.contains("Relevant notes")));
+        assert_eq!(world.runner.count("agent prompt"), 0);
+        assert_eq!(world.runner.count("coordinator prompt"), 0);
     }
 
     #[test]

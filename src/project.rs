@@ -322,6 +322,14 @@ pub struct ProjectLock {
     _file: File,
 }
 
+impl Drop for ProjectLock {
+    fn drop(&mut self) {
+        // Close alone may leave a concurrent fork's inherited copy locked
+        // until exec, extending a short project update across unrelated RPCs.
+        let _ = self._file.unlock();
+    }
+}
+
 impl Project {
     /// An existing project. Validates the slug before building any path.
     pub fn load(root: &Path, slug: &str) -> Result<Project> {
@@ -366,10 +374,11 @@ impl Project {
             .open(&path)
             .with_context(|| format!("project `{}` is gone ({})", self.slug, path.display()))?;
         file.lock()?;
+        let lock = ProjectLock { _file: file };
         if !self.project_md().is_file() {
             bail!("project `{}` is gone", self.slug);
         }
-        Ok(ProjectLock { _file: file })
+        Ok(lock)
     }
 
     pub fn read_project_md(&self) -> Result<(Settings, String)> {
@@ -584,8 +593,8 @@ popup or by asking the coordinator.
 pub const SUBDIRS: [&str; 9] = ["memory", "scratch", "routines", "threads", "inbox", "inbox/done", "library", "uploads", ".state"];
 
 /// The text of `AGENTS.md`. Harnesses load it from every ancestor of their
-/// working directory, and tab threads run under `threads/<id>/`, so it says
-/// who is who by working directory. `prefix` is `<absolute binary> --root
+/// working directory, and tab threads run under `threads/<id>/`, so it puts
+/// registered identity before directory-based worker guidance. `prefix` is `<absolute binary> --root
 /// <root>`: bare `hp` is on no harness's `PATH`.
 pub fn agents_md(name: &str, slug: &str, prefix: &str) -> String {
     let coordinator_name = crate::names::coordinator(slug, 0);
@@ -594,16 +603,17 @@ pub fn agents_md(name: &str, slug: &str, prefix: &str) -> String {
         "# {name}\n\n\
          This folder is the home of the Herdr project \"{name}\" (`{slug}`). Written by herdr-projects; `doctor --fix` refreshes it.\n\n\
          Coordinator identity is REGISTERED, not inferred from this folder: a coordinator of {name} carries the Herdr agent name `{coordinator_name}` (or `{next_name}` for later ones). `open` sets that name; `{prefix} coordinator adopt {slug} --pane <id>` registers an already-running pane (`herdr agent list` shows names and pane ids). A session merely started in this folder is not a coordinator.\n\n\
-         If your working directory is exactly this folder AND you carry a registered coordinator name (`{coordinator_name}` or `{next_name}`), you are the coordinator of {name}: run `{prefix} skill` now and follow what it prints, and run `{prefix} context {slug}` now and whenever you need project state.\n\n\
-         If your working directory is exactly this folder but you have NO registered coordinator name, run `{prefix} context {slug}` once before anything else. With the user's `auto_adopt` safety setting on, that command registers this pane itself and you are the coordinator from then on. If it instead refuses with \"... NOT a registered coordinator ...\", you are NOT the coordinator: do not act as one and do not mark inbox items handled; give the user the `{prefix} coordinator adopt {slug} --pane <this pane id>` line it prints, then wait.\n\n\
-         If your working directory is under `threads/`, you are a thread: your brief is in your own folder (`.herdr-project/{slug}-<id>/brief.md`); ignore the rest of this file.\n"
+         If you carry a registered coordinator name of this project (`{coordinator_name}`, `{next_name}`, or a later numbered member), you remain its coordinator even after changing directory under `threads/`: run `{prefix} skill` now and follow what it prints, and run `{prefix} context {slug}` now and whenever you need project state.\n\n\
+         If your working directory is exactly this folder but you have NO registered coordinator name, and the human has not explicitly detached you from this coordinator workflow, run `{prefix} context {slug}` once before anything else. With the user's `auto_adopt` safety setting on, that command registers this pane itself and you are the coordinator from then on. If it instead refuses with \"... NOT a registered coordinator ...\", you are NOT the coordinator: do not act as one and do not mark inbox items handled; give the user the `{prefix} coordinator adopt {slug} --pane <this pane id>` line it prints, then wait.\n\n\
+         Coordinator documents are scoped: use only `coordinators/<your exact registered name>/TASKS.md`, `MEMORY.md`, `memory/` and `scratch/`. Root TASKS/MEMORY are legacy/shared data and require explicit inspection, never fallback or authorization. Missing or omitted threads are not proof of completion.\n\n\
+         If you are a worker (not a registered coordinator), follow the brief in your own folder (`.herdr-project/{slug}-<id>/brief.md`); do not read coordinator context, claim ownership or act on other threads. A human-detached diagnostic session is not a project coordinator and must not re-register itself; follow the human's direct task outside this coordinator workflow.\n"
     )
 }
 
 /// The command prefix `AGENTS.md` carries, so `doctor` can check that its
 /// binary still exists.
 pub fn prefix_in_agents_md(text: &str) -> Option<String> {
-    let line = text.lines().find(|l| l.starts_with("If your working directory is exactly this folder AND you carry"))?;
+    let line = text.lines().find(|l| l.starts_with("If you carry a registered coordinator name") || l.starts_with("If your working directory is exactly this folder AND you carry"))?;
     // The line mentions the coordinator name in earlier backticks; the prefix
     // is the backtick span directly before ` skill`.
     let skill = line.find(" skill`")?;
@@ -619,6 +629,7 @@ pub const REGISTERED_COORDINATOR_MARKER: &str = "Coordinator identity is REGISTE
 /// tells an unregistered pane to try `context` once instead of refusing up
 /// front. Doctor uses it to refresh projects whose text is otherwise current.
 pub const AUTO_ADOPT_MARKER: &str = "With the user's `auto_adopt` safety setting on";
+pub const SCOPED_COORDINATOR_MARKER: &str = "Coordinator documents are scoped:";
 
 pub const PR_FOLLOWUP: &str = "routines/pr-followup.md";
 
@@ -686,6 +697,9 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
             }
             if !text.contains(AUTO_ADOPT_MARKER) {
                 problems.push("AGENTS.md predates auto_adopt-aware registration".into());
+            }
+            if !text.contains(SCOPED_COORDINATOR_MARKER) {
+                problems.push("AGENTS.md predates scoped coordinator documents".into());
             }
             match prefix_in_agents_md(&text) {
                 None => problems.push("AGENTS.md does not name the binary".into()),
@@ -872,11 +886,12 @@ mod tests {
         let prefix = format!("{} --root {}", std::env::current_exe().unwrap().display(), root.path().display());
         write_priming(&project, &prefix).unwrap();
         let text = std::fs::read_to_string(project.dir().join("AGENTS.md")).unwrap();
-        assert!(text.contains("you are the coordinator of Demo Project"));
+        assert!(text.contains("you remain its coordinator even after changing directory under `threads/`"));
         assert!(text.contains(&format!("`{prefix} skill`")));
         assert!(text.contains(&format!("`{prefix} context demo-project`")));
         assert!(text.contains(AUTO_ADOPT_MARKER));
-        assert!(text.contains("under `threads/`, you are a thread"));
+        assert!(text.contains("If you are a worker (not a registered coordinator)"));
+        assert!(text.contains(SCOPED_COORDINATOR_MARKER));
         assert_eq!(prefix_in_agents_md(&text).as_deref(), Some(prefix.as_str()));
         assert_eq!(std::fs::read_link(project.dir().join("CLAUDE.md")).unwrap(), Path::new("AGENTS.md"));
         assert!(project.dir().join("uploads").is_dir());
@@ -902,6 +917,15 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("auto_adopt-aware")), "{problems:?}");
         write_priming(&project, &prefix).unwrap();
         assert!(priming_problems(&project, &prefix).is_empty());
+
+        // The new marker refreshes otherwise-current pre-scope priming. Prefix
+        // discovery still reads the old coordinator sentence as well.
+        let old = agents_md("Demo Project", "demo-project", &prefix).replace(SCOPED_COORDINATOR_MARKER, "Old shared documents:");
+        std::fs::write(project.dir().join("AGENTS.md"), old).unwrap();
+        assert!(priming_problems(&project, &prefix).iter().any(|p| p.contains("scoped coordinator")));
+        let legacy = format!("If your working directory is exactly this folder AND you carry a registered name: run `{prefix} skill` now.");
+        assert_eq!(prefix_in_agents_md(&legacy).as_deref(), Some(prefix.as_str()));
+        write_priming(&project, &prefix).unwrap();
 
         // A foreign AGENTS.md is kept beside ours.
         std::fs::write(project.dir().join("AGENTS.md"), "codex notes").unwrap();

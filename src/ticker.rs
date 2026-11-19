@@ -400,7 +400,7 @@ pub fn brief_pass(ctx: &Ctx, log: &Log) -> bool {
                 waiting = true;
                 continue;
             };
-            match crate::brief::deliver(&project, &on, t, agent, crate::brief::Sender::Ticker) {
+            match crate::brief::deliver_with_config(&project, &on, t, agent, crate::brief::Sender::Ticker, &ctx.config_dir) {
                 Ok(crate::brief::Outcome::Delivered | crate::brief::Outcome::Stuck) => {}
                 Ok(_) => waiting = true,
                 Err(error) => log.line(&format!("{slug}: {}: brief: {error:#}", t.id)),
@@ -602,28 +602,74 @@ struct Pass {
 /// the failure never rings). Returns the transition so the normal
 /// announcement path rings once and writes the inbox item.
 fn mark_failed(project: &Project, id: &str, error: String) -> Result<steps::Transition> {
+    // The caller holds the delivery lock. Also guard the mutation itself so a
+    // stale failure can never resurrect a resolved thread.
+    let mut changed = false;
     thread::update(project, id, |t| {
-        t.status = thread::Status::Failed;
-        t.error = error;
-        t.last_group = thread::Group::WaitingOnYou.token().to_string();
-        // A failed launch is a rule-3 cause: always for the human.
-        t.audience = thread::Audience::Human.token().to_string();
-        t.state_line = "needs you · failed".to_string();
+        if matches!(t.status, thread::Status::Open | thread::Status::Starting) {
+            t.status = thread::Status::Failed;
+            t.error = error;
+            t.last_group = thread::Group::WaitingOnYou.token().to_string();
+            // A failed launch is a rule-3 cause: always for the human.
+            t.audience = thread::Audience::Human.token().to_string();
+            t.state_line = "needs you · failed".to_string();
+            changed = true;
+        }
     })?;
+    if !changed {
+        anyhow::bail!("{id}: launch failure is stale; its status changed");
+    }
     Ok(steps::Transition { id: id.to_string(), to: thread::Group::WaitingOnYou, note: "failed".to_string() })
 }
 
-fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>, stall_secs: i64) -> Result<Pass> {
+fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>, stall_secs: i64, config_dir: &Path) -> Result<Pass> {
     let slug = &project.slug;
     let now = jiff::Timestamp::now();
     let mut pass = Pass { transitions: Vec::new(), recorded_panes: 0, missing_panes: 0, error: None };
-    for t in threads {
+    for snapshot in threads {
+        let _delivery = crate::threads::prompt_delivery_lock(project, &snapshot.id)?;
+        let current = thread::load(project, &snapshot.id)?;
+        let t = &current;
+        if !matches!(t.status, thread::Status::Open | thread::Status::Starting)
+            || t.machine != snapshot.machine || t.pane_id != snapshot.pane_id || t.cwd != snapshot.cwd
+        {
+            continue;
+        }
         if t.status == thread::Status::Starting {
             if thread::seconds_since(&t.created, now) >= thread::STARTING_TIMEOUT_SECS {
                 pass.transitions.push(mark_failed(project, &t.id, "still starting after five minutes".into())?);
             }
             continue;
         }
+        // A native-resume rename is a pane mutation, not a read of the tick's
+        // census. A lock wait may outlive that unnamed agent. Refresh only the
+        // candidate path (ordinary remote polling keeps its existing cadence),
+        // and defer all state/group effects if its incarnation or pane changed.
+        let refreshed = if let Some(candidate) = agents.iter().find(|a| thread::needs_rename(t, a)) {
+            let target = herdr.on_machine(&t.machine);
+            let evidence = (|| -> Result<(Vec<Agent>, Vec<Pane>)> {
+                Ok((target.agent_list()?, target.pane_list()?))
+            })();
+            let (fresh_agents, fresh_panes) = match evidence {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    if !t.pane_id.is_empty() { pass.recorded_panes += 1; }
+                    pass.error = pass.error.or(Some(error.context(format!("{}: rename recheck", t.id))));
+                    continue;
+                }
+            };
+            if fresh_agents.iter().find(|a| a.pane_id == candidate.pane_id) != Some(candidate)
+                || fresh_panes.iter().find(|p| p.pane_id == t.pane_id) != panes.iter().find(|p| p.pane_id == t.pane_id)
+            {
+                // Unknown/replaced targets are not evidence of a lost session.
+                if !t.pane_id.is_empty() { pass.recorded_panes += 1; }
+                continue;
+            }
+            Some((fresh_agents, fresh_panes))
+        } else {
+            None
+        };
+        let (agents, panes) = refreshed.as_ref().map(|(a, p)| (a.as_slice(), p.as_slice())).unwrap_or((agents, panes));
         let mut live = thread::live_with_report(t, agents, panes, now, &project.root, socket);
         // Herdr's native resume starts our agent again without its name.
         if let Some(agent) = agents.iter().find(|a| thread::needs_rename(t, a))
@@ -661,7 +707,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
             && !hold_brief
             && let Some(agent) = agents.iter().find(|a| thread::agent_matches(t, a))
         {
-            match crate::brief::deliver(project, herdr, t, agent, crate::brief::Sender::Ticker) {
+            match crate::brief::deliver_locked(project, herdr, t, agent, crate::brief::Sender::Ticker, Some(config_dir)) {
                 Ok(outcome) => delivered = outcome == crate::brief::Outcome::Delivered,
                 Err(error) => pass.error = pass.error.or(Some(anyhow::anyhow!("{}: brief: {error:#}", t.id))),
             }
@@ -736,6 +782,35 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
         if live.agent_state.is_some() || !live.pane_exists {
             continue;
         }
+        let control = (|| -> Result<Option<(crate::threads::DeliveryLock, thread::Thread)>> {
+            let delivery = crate::threads::prompt_delivery_lock(project, &t.id)?;
+            let current = thread::load(project, &t.id)?;
+            if current.status != thread::Status::Open || !current.prompt_pending
+                || current.machine != t.machine || current.pane_id != t.pane_id || current.cwd != t.cwd
+            {
+                return Ok(None);
+            }
+            // The tick's census predates the lock. Another command may have
+            // resolved/restarted it, or a native agent may already have appeared.
+            let target = herdr.on_machine(&current.machine);
+            let agents = target.agent_list()?;
+            let panes = target.pane_list()?;
+            if agents.iter().any(|agent| agent.pane_id == current.pane_id)
+                || !thread::live_state(&current, &agents, &panes, jiff::Timestamp::now()).pane_exists
+            {
+                return Ok(None);
+            }
+            Ok(Some((delivery, current)))
+        })();
+        let (_delivery, current) = match control {
+            Ok(Some(control)) => control,
+            Ok(None) => continue,
+            Err(error) => {
+                errors.push(error.context(format!("{}: launch recheck", t.id)));
+                continue;
+            }
+        };
+        let t = &current;
         if t.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
             match mark_failed(
                 project,
@@ -883,7 +958,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
     // visibly blinking out and back every time a thread misbehaves.
     sessions.parts.entry(record.socket.clone()).or_default().insert(slug.clone(), part(ctx, project, &record, &coordinators, &agents, false));
 
-    let pass = match thread_pass(project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None, stall_secs) {
+    let pass = match thread_pass(project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None, stall_secs, &ctx.config_dir) {
         Ok(pass) => pass,
         Err(error) => {
             eprintln!("{slug}: thread pass: {error:#}");
@@ -942,7 +1017,7 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
     let dirs: Vec<(String, String)> = threads.iter().filter(|t| !t.thread_dir.is_empty()).map(|t| (t.id.clone(), t.thread_dir.clone())).collect();
     let hashes = crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
-    let mut pass = thread_pass(project, &remote, "", threads, &agents, &panes, Some(&hashes), thread::stall_upgrade_secs(ctx.env.var(thread::STALL_UPGRADE_ENV))).map_err(|e| format!("{e:#}"))?;
+    let mut pass = thread_pass(project, &remote, "", threads, &agents, &panes, Some(&hashes), thread::stall_upgrade_secs(ctx.env.var(thread::STALL_UPGRADE_ENV)), &ctx.config_dir).map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error.take());
 
     for t in threads {
@@ -1223,6 +1298,203 @@ mod tests {
         assert!(!tick_project(&ctx, &f.project).unwrap());
         assert!(runner.calls.borrow().iter().all(|c| !c.env.iter().any(|(_, v)| *v == gone)));
         assert_eq!(runner.count("agent list"), 0);
+    }
+
+    fn pending_launch(world: &crate::scenarios::World, project: &Project, attempts: u32) -> thread::Thread {
+        let record = world.thread(project, &world.home.path().join("wt"), |t| {
+            t.prompt_pending = true;
+            t.launch_attempts = attempts;
+        });
+        *world.panes.borrow_mut() = format!("[{}]", crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", &record.cwd));
+        record
+    }
+
+    #[test]
+    fn stale_launch_cannot_restart_or_fail_a_resolved_thread() {
+        for attempts in [0, thread::MAX_LAUNCH_ATTEMPTS] {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            let stale = pending_launch(&world, &project, attempts);
+            let socket = project.coordinator().unwrap().socket;
+            let herdr = Herdr::new("herdr", Path::new(&socket), &world.runner);
+            let panes = herdr.pane_list().unwrap();
+            // A resolve completed after the ticker took its snapshot.
+            thread::update(&project, &stale.id, |t| t.status = thread::Status::Resolved).unwrap();
+            let mut errors = Vec::new();
+            assert!(launch_pass(&world.ctx(), &project, &herdr, &[stale.clone()], &[], &panes, &mut true, &mut errors).is_empty());
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(thread::load(&project, &stale.id).unwrap().status, thread::Status::Resolved);
+            assert_eq!(world.runner.count("agent start"), 0);
+            assert!(mark_failed(&project, &stale.id, "late failure".into()).is_err());
+            assert_eq!(thread::load(&project, &stale.id).unwrap().status, thread::Status::Resolved);
+        }
+    }
+
+    #[test]
+    fn stale_starting_timeout_cannot_fail_a_resolved_thread() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let stale = world.thread(&project, &world.home.path().join("wt"), |t| {
+            t.status = thread::Status::Starting;
+            t.created = "2020-01-01T00:00:00Z".into();
+        });
+        thread::update(&project, &stale.id, |t| t.status = thread::Status::Resolved).unwrap();
+        let socket = project.coordinator().unwrap().socket;
+        let herdr = Herdr::new("herdr", Path::new(&socket), &world.runner);
+        let pass = thread_pass(&project, &herdr, &socket, &[stale.clone()], &[], &[], None, 60, &world.ctx().config_dir).unwrap();
+        assert!(pass.transitions.is_empty());
+        assert_eq!(thread::load(&project, &stale.id).unwrap().status, thread::Status::Resolved);
+    }
+
+    #[test]
+    fn waiting_timeout_reloads_resolution_after_the_delivery_lock() {
+        use std::sync::mpsc;
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let stale = world.thread(&project, &world.home.path().join("wt"), |t| {
+            t.status = thread::Status::Starting;
+            t.created = "2020-01-01T00:00:00Z".into();
+        });
+        let held = crate::threads::prompt_delivery_lock(&project, &stale.id).unwrap();
+        let root = world.root.clone();
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let project = Project::load(&root, "demo").unwrap();
+            let runner = FakeRunner::new();
+            let socket = project.coordinator().unwrap().socket;
+            let herdr = Herdr::new("herdr", Path::new(&socket), &runner);
+            arrived_tx.send(()).unwrap();
+            let pass = thread_pass(&project, &herdr, &socket, &[stale], &[], &[], None, 60, &root.join("cfg")).unwrap();
+            done_tx.send(pass.transitions.len()).unwrap();
+        });
+        arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        thread::update(&project, "t-0001", |t| t.status = thread::Status::Resolved).unwrap();
+        drop(held);
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+        waiter.join().unwrap();
+        assert_eq!(thread::load(&project, "t-0001").unwrap().status, thread::Status::Resolved);
+    }
+
+    #[test]
+    fn native_resume_rename_defers_all_effects_after_a_locked_target_replacement() {
+        use std::sync::mpsc;
+        for machine in ["", "box"] {
+            for replacement_name in ["", "unrelated-session"] {
+                let world = crate::scenarios::World::new();
+                let project = world.project("demo", "a.sock");
+                let record = world.thread(&project, &world.home.path().join("wt"), |t| {
+                    t.machine = machine.into();
+                    t.last_group = "working".into();
+                    t.last_state = "working".into();
+                });
+                let cached_json = serde_json::json!({
+                    "pane_id": record.pane_id, "tab_id": record.tab_id,
+                    "workspace_id": record.workspace_id, "cwd": record.cwd,
+                    "name": "", "agent": "claude", "agent_status": "idle",
+                    "terminal_id": "terminal-a", "agent_session": {"value": "session-a"}
+                });
+                let cached: Agent = serde_json::from_value(cached_json.clone()).unwrap();
+                assert!(thread::needs_rename(&record, &cached));
+                let pane_json = crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", &record.cwd);
+                let pane: Pane = serde_json::from_str(&pane_json).unwrap();
+                let mut fresh = cached_json;
+                fresh["name"] = replacement_name.into();
+                fresh["terminal_id"] = "terminal-b".into();
+                fresh["agent_session"]["value"] = "session-b".into();
+                let reply = serde_json::json!({"result": {"agents": [fresh]}}).to_string();
+                let held = crate::threads::prompt_delivery_lock(&project, &record.id).unwrap();
+                let root = world.root.clone();
+                let stale = record.clone();
+                let (arrived_tx, arrived_rx) = mpsc::channel();
+                let (done_tx, done_rx) = mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    let project = Project::load(&root, "demo").unwrap();
+                    let runner = FakeRunner::new();
+                    let state = project.state_dir();
+                    runner.on_fn(|cmd| cmd.display().contains("agent list"), move |cmd| {
+                        let remote = cmd.args.windows(2).any(|args| args == ["--machine", "box"]);
+                        assert_eq!(remote, !machine.is_empty());
+                        let delivery = File::options().write(true).open(state.join("t-0001.prompt-delivery.lock")).unwrap();
+                        assert!(delivery.try_lock().is_err());
+                        Ok(ok(&reply))
+                    });
+                    runner.on("pane list", ok(&format!(r#"{{"result":{{"panes":[{pane_json}]}}}}"#)));
+                    let socket = project.coordinator().unwrap().socket;
+                    let herdr = Herdr::new("herdr", Path::new(&socket), &runner).on_machine(machine);
+                    arrived_tx.send(()).unwrap();
+                    let pass = thread_pass(&project, &herdr, &socket, &[stale], &[cached], &[pane], None, 60, &root.join("cfg")).unwrap();
+                    done_tx.send((pass.transitions.len(), runner.count("agent rename"), runner.count("report-metadata"))).unwrap();
+                });
+                arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+                // The next RPC sees B, after the lock wait which began with A.
+                drop(held);
+                assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap(), (0, 0, 0));
+                waiter.join().unwrap();
+                assert_eq!(thread::load(&project, &record.id).unwrap(), record);
+            }
+        }
+    }
+
+    #[test]
+    fn unchanged_native_resume_candidate_is_still_renamed() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let record = world.thread(&project, &world.home.path().join("wt"), |_| {});
+        *world.agents.borrow_mut() = format!("[{}]", crate::scenarios::agent_json("w2", "w2:t1", "w2:p1", &record.cwd, "", "working"));
+        *world.panes.borrow_mut() = format!("[{}]", crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", &record.cwd));
+        world.runner.on("agent rename", ok(r#"{"result":{}}"#));
+        let socket = project.coordinator().unwrap().socket;
+        let herdr = Herdr::new("herdr", Path::new(&socket), &world.runner);
+        let agents = herdr.agent_list().unwrap();
+        let panes = herdr.pane_list().unwrap();
+        let pass = thread_pass(&project, &herdr, &socket, &[record], &agents, &panes, None, 60, &world.ctx().config_dir).unwrap();
+        assert!(pass.error.is_none(), "{:?}", pass.error);
+        assert_eq!(world.runner.count("agent rename"), 1);
+        assert_eq!(world.runner.count("report-metadata"), 1);
+    }
+
+    #[test]
+    fn launch_rechecks_live_agents_including_foreign_incarnations() {
+        for name in ["hp-demo-t-0001", "unrelated-session"] {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            let stale = pending_launch(&world, &project, thread::MAX_LAUNCH_ATTEMPTS);
+            let socket = project.coordinator().unwrap().socket;
+            let herdr = Herdr::new("herdr", Path::new(&socket), &world.runner);
+            let panes = herdr.pane_list().unwrap();
+            *world.agents.borrow_mut() = format!("[{}]", crate::scenarios::agent_json("w2", "w2:t1", "w2:p1", &stale.cwd, name, "working"));
+            let mut errors = Vec::new();
+            assert!(launch_pass(&world.ctx(), &project, &herdr, &[stale.clone()], &[], &panes, &mut true, &mut errors).is_empty());
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(thread::load(&project, &stale.id).unwrap().status, thread::Status::Open);
+            assert_eq!(world.runner.count("agent start"), 0);
+        }
+    }
+
+    #[test]
+    fn launch_holds_delivery_but_not_project_lock_through_start() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let stale = pending_launch(&world, &project, 0);
+        let state = project.state_dir();
+        world.runner.on_fn(|cmd| cmd.display().contains("agent start"), move |_| {
+            let lock = File::options().write(true).open(state.join("t-0001.prompt-delivery.lock")).unwrap();
+            assert!(lock.try_lock().is_err());
+            let global = File::options().write(true).open(state.join("lock")).unwrap();
+            assert!(global.try_lock().is_ok());
+            Ok(ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"}}}"#))
+        });
+        let socket = project.coordinator().unwrap().socket;
+        let herdr = Herdr::new("herdr", Path::new(&socket), &world.runner);
+        let panes = herdr.pane_list().unwrap();
+        let mut errors = Vec::new();
+        launch_pass(&world.ctx(), &project, &herdr, &[stale.clone()], &[], &panes, &mut true, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(world.runner.count("agent start"), 1);
+        assert_eq!(thread::load(&project, &stale.id).unwrap().launch_attempts, 1);
     }
 
     #[test]

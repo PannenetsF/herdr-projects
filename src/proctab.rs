@@ -28,6 +28,7 @@ struct Row {
     pid: u32,
     ppid: u32,
     pgid: u32,
+    comm: String,
 }
 
 /// What this process can prove about where it runs.
@@ -39,6 +40,10 @@ pub(crate) struct Facts {
     ancestry: HashSet<u32>,
     /// Pids sharing a process group with any ancestor.
     group_peers: HashSet<u32>,
+    /// Negative evidence requires a complete walk to init, not merely no match.
+    ancestry_complete: bool,
+    herdr_ancestry: bool,
+    herdr_running: bool,
 }
 
 impl Facts {
@@ -68,7 +73,7 @@ impl Facts {
         if !out.success() {
             return None;
         }
-        let rows = parse(&out.stdout);
+        let rows = parse(&out.stdout)?;
         Some(Self::from_rows(&rows, self_pid(ctx)))
     }
 
@@ -76,14 +81,21 @@ impl Facts {
         let by_pid: std::collections::HashMap<_, _> = rows.iter().map(|r| (r.pid, r)).collect();
 
         let mut ancestry = HashSet::new();
+        let mut ancestry_complete = false;
+        let mut herdr_ancestry = false;
         let mut current = seed;
         for _ in 0..MAX_ANCESTORS {
             let Some(row) = by_pid.get(&current) else { break };
             // pid 1 (launchd/init) anchors everyone; stop before it so its
             // process group never joins the peer set.
-            if row.pid == 1 || !ancestry.insert(row.pid) {
+            if row.pid == 1 {
+                ancestry_complete = row.ppid == 0;
                 break;
             }
+            if !ancestry.insert(row.pid) {
+                break;
+            }
+            herdr_ancestry |= looks_like_herdr(&row.comm);
             if row.ppid == 0 || row.ppid == row.pid {
                 break;
             }
@@ -100,7 +112,23 @@ impl Facts {
             .map(|r| r.pid)
             .collect();
 
-        Facts { ancestry, group_peers }
+        Facts {
+            ancestry,
+            group_peers,
+            ancestry_complete,
+            herdr_ancestry,
+            herdr_running: rows.iter().any(|row| looks_like_herdr(&row.comm)),
+        }
+    }
+
+    /// Command names only deny privilege; they never prove a pane or agent.
+    pub(crate) fn permits_outside_proof(&self) -> bool {
+        self.ancestry_complete && !self.herdr_ancestry
+    }
+
+    /// With no installed client, a complete table must also show no daemon.
+    pub(crate) fn no_herdr_processes(&self) -> bool {
+        self.permits_outside_proof() && !self.herdr_running
     }
 
     /// True if a pane whose shell is `shell_pid` and whose foreground pids are
@@ -108,7 +136,7 @@ impl Facts {
     /// ancestor/group peer, or a reported foreground pid is.
     pub(crate) fn proves_pane(&self, shell_pid: Option<u64>, foreground: &[u64]) -> bool {
         let known = |pid: u64| {
-            let pid = pid as u32;
+            let Ok(pid) = u32::try_from(pid) else { return false };
             self.ancestry.contains(&pid) || self.group_peers.contains(&pid)
         };
         shell_pid.is_some_and(known) || foreground.iter().any(|pid| known(*pid))
@@ -128,17 +156,30 @@ fn self_pid(_ctx: &Ctx) -> u32 {
     std::process::id()
 }
 
-fn parse(text: &str) -> Vec<Row> {
-    text.lines()
-        .filter_map(|line| {
+fn parse(text: &str) -> Option<Vec<Row>> {
+    let mut seen = HashSet::new();
+    let rows: Vec<Row> = text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
             let mut parts = line.split_whitespace();
             let pid = parts.next()?.parse().ok()?;
             let ppid = parts.next()?.parse().ok()?;
             let pgid = parts.next()?.parse().ok()?;
-            // The trailing comm column is consumed but not needed.
-            Some(Row { pid, ppid, pgid })
+            let comm = parts.collect::<Vec<_>>().join(" ");
+            if pid == 0 || !seen.insert(pid) || comm.is_empty() || comm == "-" || comm == "?" {
+                return None;
+            }
+            Some(Row { pid, ppid, pgid, comm })
         })
-        .collect()
+        .collect::<Option<_>>()?;
+    (!rows.is_empty()).then_some(rows)
+}
+
+fn looks_like_herdr(comm: &str) -> bool {
+    let command = comm.split_whitespace().next().unwrap_or("");
+    let name = std::path::Path::new(command).file_name().and_then(|s| s.to_str()).unwrap_or(command);
+    let name = name.trim_start_matches('-');
+    name == "herdr" || name == "herdr-server" || name == "herdr-daemon"
 }
 
 #[cfg(test)]
@@ -158,7 +199,7 @@ mod tests {
 ";
 
     fn facts_with(seed: &str, table: &str) -> Facts {
-        Facts::from_rows(&parse(table), seed.parse().unwrap())
+        Facts::from_rows(&parse(table).unwrap(), seed.parse().unwrap())
     }
 
     #[test]
@@ -183,10 +224,37 @@ mod tests {
     }
 
     #[test]
-    fn cycles_terminate_the_walk() {
+    fn cycles_terminate_the_walk_without_proving_outside() {
         let cyclic = "5 5 5 anything\n";
         let facts = facts_with("5", cyclic);
         assert_eq!(facts.ancestry, HashSet::from([5]));
         assert!(facts.proves_pane(Some(5), &[]));
+        assert!(!facts.permits_outside_proof());
+    }
+
+    #[test]
+    fn only_complete_non_herdr_ancestry_permits_negative_proof() {
+        assert!(facts_with("302", TABLE).permits_outside_proof());
+        assert!(!facts_with("4000", TABLE).permits_outside_proof());
+        assert!(!facts_with("99999", TABLE).permits_outside_proof());
+        assert!(!facts_with("5", "1 0 1 init\n5 8 5 sh\n").permits_outside_proof());
+        assert!(!facts_with("302", TABLE).no_herdr_processes());
+        assert!(facts_with("5", "1 0 1 init\n5 1 5 sshd\n").no_herdr_processes());
+    }
+
+    #[test]
+    fn malformed_or_missing_process_provenance_is_not_an_empty_table() {
+        for text in ["", "5 1 5", "5 1 5 ?", "5 1 5 -", "x 1 5 sh", "5 1 5 sh\n5 1 5 herdr\n", "0 0 0 kernel"] {
+            assert!(parse(text).is_none(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn depth_exhaustion_and_oversized_pids_do_not_grant_identity() {
+        let mut table = "1 0 1 init\n".to_string();
+        for pid in 2..=100 { table.push_str(&format!("{pid} {} {pid} sh\n", pid - 1)); }
+        let facts = facts_with("100", &table);
+        assert!(!facts.permits_outside_proof());
+        assert!(!facts.proves_pane(Some(u32::MAX as u64 + 101), &[]));
     }
 }

@@ -13,7 +13,9 @@
 //!   typed on top of a copy.
 //! - `MAX_ATTEMPTS` tries, then one inbox item; `thread brief` still sends it.
 
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
 
 use crate::herdr::{Agent, Herdr};
 use crate::project::{self, Project};
@@ -72,14 +74,53 @@ fn claim(project: &Project, id: &str, now: jiff::Timestamp) -> Result<Option<Thr
     Ok(claimed)
 }
 
-/// One delivery step for a thread whose brief is pending, `agent` being its
-/// agent as just listed.
+/// Internally authorized delivery (ticker/adoption), not CLI caller inference.
+/// Legacy callers have native saved-machine transport only; callers with a Ctx
+/// should use `deliver_with_config` to retain explicit SSH config fallbacks.
+#[allow(dead_code)]
 pub fn deliver(project: &Project, herdr: &Herdr, record: &Thread, agent: &Agent, sender: Sender) -> Result<Outcome> {
+    let _delivery = crate::threads::prompt_delivery_lock(project, &record.id)?;
+    deliver_locked(project, herdr, record, agent, sender, None)
+}
+
+pub fn deliver_with_config(project: &Project, herdr: &Herdr, record: &Thread, agent: &Agent, sender: Sender, config_dir: &Path) -> Result<Outcome> {
+    let _delivery = crate::threads::prompt_delivery_lock(project, &record.id)?;
+    deliver_locked(project, herdr, record, agent, sender, Some(config_dir))
+}
+
+/// Caller holds the existing per-thread delivery lock, including throughout
+/// authorization, pane lookup, regeneration, send/Enter, and claim completion.
+pub(crate) fn deliver_locked(project: &Project, herdr: &Herdr, record: &Thread, agent: &Agent, sender: Sender, config_dir: Option<&Path>) -> Result<Outcome> {
+    let current = thread::load(project, &record.id)?;
+    if current.status != thread::Status::Open || !current.prompt_pending {
+        return Ok(Outcome::Taken);
+    }
+    if current.machine != record.machine || current.pane_id != record.pane_id
+        || current.cwd != record.cwd || current.agent_name != record.agent_name
+        || current.agent != record.agent || current.thread_dir != record.thread_dir
+        || current.workspace_id != record.workspace_id || current.tab_id != record.tab_id
+        || herdr.machine() != current.machine || !thread::agent_matches(&current, agent)
+    {
+        bail!("{} changed pane while its brief was being prepared; not delivering a stale brief", current.id);
+    }
+    // A ticker snapshot may predate the lock. Never send/Enter based on that
+    // stale readiness; lookup the matching live agent again under the guard.
+    let agents = herdr.agent_list()?;
+    let live = agents.iter().find(|a| thread::agent_matches(&current, a))
+        .with_context(|| format!("no matching agent remains in {}'s pane", current.id))?;
+    if live.workspace_id != agent.workspace_id || live.tab_id != agent.tab_id
+        || live.name != agent.name || live.agent != agent.agent
+        || (!agent.terminal_id.is_empty() && live.terminal_id != agent.terminal_id)
+        || (!agent.session_id().is_empty() && live.session_id() != agent.session_id())
+    {
+        bail!("{} changed agent incarnation while its brief was being prepared; retry with a fresh live snapshot", current.id);
+    }
+    let agent = live;
     let now = jiff::Timestamp::now();
     let Some(mut t) = claim(project, &record.id, now)? else {
         return Ok(Outcome::Taken);
     };
-    let outcome = step(project, herdr, &mut t, agent, sender, now);
+    let outcome = step(project, herdr, &mut t, agent, sender, now, config_dir);
     let delivered = matches!(outcome, Ok(Outcome::Delivered));
     thread::update(project, &t.id, |r| {
         r.brief_claimed.clear();
@@ -95,7 +136,7 @@ pub fn deliver(project: &Project, herdr: &Herdr, record: &Thread, agent: &Agent,
     outcome
 }
 
-fn step(project: &Project, herdr: &Herdr, t: &mut Thread, agent: &Agent, sender: Sender, now: jiff::Timestamp) -> Result<Outcome> {
+fn step(project: &Project, herdr: &Herdr, t: &mut Thread, agent: &Agent, sender: Sender, now: jiff::Timestamp, config_dir: Option<&Path>) -> Result<Outcome> {
     let state = agent.agent_status.as_str();
     if matches!(state, "blocked" | "") {
         t.brief_seen.clear();
@@ -133,6 +174,11 @@ fn step(project: &Project, herdr: &Herdr, t: &mut Thread, agent: &Agent, sender:
             Some(_) if in_box_has_line && ready => {
                 if let Some(stuck) = out_of_tries(project, t, sender)? {
                     return Ok(stuck);
+                }
+                refresh_pending_brief(project, herdr, t, config_dir)?;
+                if !delivery_evidence_current(herdr, t, agent, &screen)? {
+                    t.brief_seen.clear();
+                    return Ok(Outcome::Waiting("agent or input changed while refreshing its brief".into()));
                 }
                 bump(project, t)?;
                 return Ok(match herdr.agent_send_keys(&t.pane_id, &["enter".to_string()]) {
@@ -175,6 +221,11 @@ fn step(project: &Project, herdr: &Herdr, t: &mut Thread, agent: &Agent, sender:
             return Ok(Outcome::Waiting("settling".into()));
         }
     }
+    refresh_pending_brief(project, herdr, t, config_dir)?;
+    if !delivery_evidence_current(herdr, t, agent, &screen)? {
+        t.brief_seen.clear();
+        return Ok(Outcome::Waiting("agent or input changed while refreshing its brief".into()));
+    }
     bump(project, t)?;
     match herdr.agent_prompt_confirmed(&t.pane_id, &thread::launch_prompt(&project.slug, &t.id)) {
         Ok(()) => Ok(Outcome::Delivered),
@@ -184,6 +235,48 @@ fn step(project: &Project, herdr: &Herdr, t: &mut Thread, agent: &Agent, sender:
         }
         Err(error) => Ok(Outcome::Waiting(format!("not confirmed ({error}); the screen is checked before any retry"))),
     }
+}
+
+/// Remote brief writes may take long enough for a new native session or draft
+/// to appear. Recheck the styled screen (dim placeholders matter), then the
+/// live incarnation/readiness after that read, immediately before sending.
+fn delivery_evidence_current(herdr: &Herdr, t: &Thread, expected: &Agent, screen: &str) -> Result<bool> {
+    if herdr.agent_screen(&t.pane_id)? != screen {
+        return Ok(false);
+    }
+    Ok(herdr.agent_list()?.iter().any(|live| thread::agent_matches(t, live) && live == expected))
+}
+
+/// Refresh only immediately before typing/submitting a pending launch line.
+/// If the screen already proves delivery, leave the running agent's file and
+/// history alone. Assignment shares our guard, so `t.owner` is current here.
+fn refresh_pending_brief(project: &Project, herdr: &Herdr, t: &Thread, config_dir: Option<&Path>) -> Result<()> {
+    if t.thread_dir.is_empty() {
+        bail!("{} has no brief directory; restart it before delivering", t.id);
+    }
+    let task = std::fs::read_to_string(thread::task_path(project, &t.id)).unwrap_or_default();
+    let restart = std::fs::read_to_string(project.state_dir().join(format!("{}.brief-restart", t.id)))
+        .is_ok_and(|value| value == "true") || !t.report_hash.is_empty();
+    let text = thread::brief_for(project, t, &task, restart)?;
+    if !t.is_remote() {
+        std::fs::create_dir_all(Path::new(&t.thread_dir).join("library"))?;
+        return project::write_atomic(&Path::new(&t.thread_dir).join("brief.md"), text.as_bytes());
+    }
+    let target = if let Some(config_dir) = config_dir {
+        crate::remote::ssh_target(herdr.runner(), herdr.bin(), config_dir, &t.machine)?
+    } else {
+        // No ambient Env/config reconstruction. The old signature can use
+        // Herdr's native saved machines; explicit config requires the wrapper.
+        let out = herdr.runner().run(&crate::runner::Cmd::new(herdr.bin(), crate::remote::SSH_TIMEOUT).args(["machine", "list", "--json"]))?;
+        if !out.success() {
+            bail!("could not list saved machines while refreshing {}'s brief", t.id);
+        }
+        let machines: Vec<serde_json::Value> = serde_json::from_str(&out.stdout)?;
+        machines.iter().find(|m| m["label"].as_str() == Some(&t.machine) || m["id"].as_str() == Some(&t.machine))
+            .and_then(|m| m["target"].as_str()).filter(|s| !s.is_empty()).map(str::to_owned)
+            .with_context(|| format!("machine `{}` needs an SSH target; call deliver_with_config with the explicit config directory", t.machine))?
+    };
+    crate::remote::write_brief(herdr.runner(), &target, &t.cwd, &t.thread_dir, &text)
 }
 
 /// Counts a try before it is made, so a sender that dies mid-way still
@@ -293,6 +386,158 @@ mod tests {
 
     fn prompts(world: &World) -> usize {
         world.runner.count("agent prompt")
+    }
+
+    fn pending_snapshot(world: &World, project: &Project) -> (Thread, Agent) {
+        let t = record(project);
+        let agents: Vec<Agent> = serde_json::from_str(&world.agents.borrow()).unwrap();
+        let agent = agents.into_iter().find(|a| thread::agent_matches(&t, a)).unwrap();
+        (t, agent)
+    }
+
+    #[test]
+    fn pending_brief_is_regenerated_from_the_new_owner_before_delivery() {
+        let (world, project, _) = world("idle");
+        let (stale, agent) = pending_snapshot(&world, &project);
+        let path = Path::new(&stale.thread_dir).join("brief.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "OLD OWNER CACHED BRIEF").unwrap();
+        std::fs::write(thread::task_path(&project, &stale.id), "original task").unwrap();
+        thread::update(&project, &stale.id, |t| t.owner = "hpc-demo-1".into()).unwrap();
+        let socket = project.coordinator().unwrap().socket;
+        let herdr = Herdr::new("herdr", socket, &world.runner);
+        assert_eq!(deliver_with_config(&project, &herdr, &stale, &agent, Sender::Manual, &world.ctx().config_dir).unwrap(), Outcome::Delivered);
+        let brief = std::fs::read_to_string(path).unwrap();
+        assert!(brief.contains("Owner at briefing: hpc-demo-1"), "{brief}");
+        assert!(brief.contains("original task"));
+        assert!(!brief.contains("OLD OWNER CACHED BRIEF"));
+        assert_eq!(prompts(&world), 1);
+    }
+
+    #[test]
+    fn a_taken_brief_is_not_rewritten_after_handoff() {
+        let (world, project, _) = world("working");
+        thread::update(&project, "t-0001", |t| t.brief_attempts = 1).unwrap();
+        let (stale, agent) = pending_snapshot(&world, &project);
+        let path = Path::new(&stale.thread_dir).join("brief.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "already delivered history").unwrap();
+        thread::update(&project, &stale.id, |t| t.owner = "hpc-demo-1".into()).unwrap();
+        *world.screen.borrow_mut() = taken_screen();
+        let socket = project.coordinator().unwrap().socket;
+        let herdr = Herdr::new("herdr", socket, &world.runner);
+        assert_eq!(deliver(&project, &herdr, &stale, &agent, Sender::Ticker).unwrap(), Outcome::Delivered);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "already delivered history");
+        assert_eq!(prompts(&world), 0);
+    }
+
+    #[test]
+    fn reconciliation_enter_refreshes_a_pending_brief_under_the_delivery_lock() {
+        let (world, project, _) = world("idle");
+        thread::update(&project, "t-0001", |t| t.brief_attempts = 1).unwrap();
+        let (stale, agent) = pending_snapshot(&world, &project);
+        thread::update(&project, &stale.id, |t| t.owner = "hpc-demo-1".into()).unwrap();
+        *world.screen.borrow_mut() = claude_screen(Some(&line()));
+        let socket = project.coordinator().unwrap().socket;
+        let herdr = Herdr::new("herdr", socket, &world.runner);
+        let result = deliver(&project, &herdr, &stale, &agent, Sender::Ticker).unwrap();
+        assert!(matches!(result, Outcome::Waiting(_)));
+        assert_eq!(world.runner.count("agent send-keys w2:p1 enter"), 1);
+        let brief = std::fs::read_to_string(Path::new(&stale.thread_dir).join("brief.md")).unwrap();
+        assert!(brief.contains("Owner at briefing: hpc-demo-1"));
+        assert_eq!(prompts(&world), 0);
+    }
+
+    #[test]
+    fn pending_brief_rechecks_live_readiness_and_incarnation_under_lock() {
+        let (world, project, _) = world("idle");
+        let (stale, mut agent) = pending_snapshot(&world, &project);
+        let socket = project.coordinator().unwrap().socket;
+        let herdr = Herdr::new("herdr", socket, &world.runner);
+        set_state(&world, "working");
+        assert!(matches!(deliver(&project, &herdr, &stale, &agent, Sender::Manual).unwrap(), Outcome::Waiting(_)));
+        assert_eq!(prompts(&world), 0);
+        set_state(&world, "idle");
+        agent.terminal_id = "old-terminal".into();
+        let error = deliver(&project, &herdr, &stale, &agent, Sender::Manual).unwrap_err().to_string();
+        assert!(error.contains("changed agent incarnation"), "{error}");
+        assert_eq!(prompts(&world), 0);
+    }
+
+    #[test]
+    fn remote_refresh_uses_the_explicit_config_and_current_owner() {
+        let (world, project, _) = world("idle");
+        thread::update(&project, "t-0001", |t| t.machine = "box".into()).unwrap();
+        let (stale, agent) = pending_snapshot(&world, &project);
+        thread::update(&project, &stale.id, |t| t.owner = "hpc-demo-1".into()).unwrap();
+        let config = world.home.path().join("explicit-config");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "[machines.box]\nssh = 'explicit-host'\n").unwrap();
+        world.runner.on("machine list", fail(1, "no saved machines"));
+        let lock_path = project.state_dir().join("t-0001.prompt-delivery.lock");
+        world.runner.on_fn(|cmd| cmd.display().starts_with("ssh "), move |cmd| {
+            assert!(cmd.args.iter().any(|arg| arg == "explicit-host"));
+            assert!(cmd.stdin.as_deref().unwrap().contains("Owner at briefing: hpc-demo-1"));
+            let contender = std::fs::File::options().write(true).open(&lock_path).unwrap();
+            assert!(contender.try_lock().is_err(), "remote brief write escaped the delivery lock");
+            Ok(ok(""))
+        });
+        let socket = project.coordinator().unwrap().socket;
+        let herdr = Herdr::new("herdr", socket, &world.runner).on_machine("box");
+        assert_eq!(deliver_with_config(&project, &herdr, &stale, &agent, Sender::Manual, &config).unwrap(), Outcome::Delivered);
+        assert_eq!(world.runner.count("ssh "), 1);
+        assert_eq!(prompts(&world), 1);
+    }
+
+    #[test]
+    fn remote_brief_refresh_rechecks_incarnation_readiness_and_input_before_send() {
+        for attempts in [0, 1] {
+            for change in ["session", "working", "draft", "trust"] {
+                let (world, project, _) = world("idle");
+                thread::update(&project, "t-0001", |t| {
+                    t.machine = "box".into();
+                    t.brief_attempts = attempts;
+                }).unwrap();
+                if attempts > 0 {
+                    *world.screen.borrow_mut() = claude_screen(Some(&line()));
+                }
+                let (record, agent) = pending_snapshot(&world, &project);
+                let config = world.home.path().join("explicit-config");
+                std::fs::create_dir(&config).unwrap();
+                std::fs::write(config.join("config.toml"), "[machines.box]\nssh = 'explicit-host'\n").unwrap();
+                world.runner.on("machine list", fail(1, "no saved machines"));
+                let agents = world.agents.clone();
+                let screen = world.screen.clone();
+                world.runner.on_fn(|cmd| cmd.display().starts_with("ssh "), move |_| {
+                    match change {
+                        "session" | "working" => {
+                            let mut live: serde_json::Value = serde_json::from_str(&agents.borrow()).unwrap();
+                            if change == "session" {
+                                live[0]["terminal_id"] = "replacement-terminal".into();
+                                live[0]["agent_session"] = serde_json::json!({"value": "replacement-session"});
+                            } else {
+                                live[0]["agent_status"] = "working".into();
+                            }
+                            *agents.borrow_mut() = live.to_string();
+                        }
+                        "draft" => *screen.borrow_mut() = claude_screen(Some("unrelated draft")),
+                        "trust" => *screen.borrow_mut() = "Do you trust the files in this folder?".into(),
+                        _ => unreachable!(),
+                    }
+                    Ok(ok(""))
+                });
+                let socket = project.coordinator().unwrap().socket;
+                let herdr = Herdr::new("herdr", socket, &world.runner).on_machine("box");
+                let result = deliver_with_config(&project, &herdr, &record, &agent, Sender::Manual, &config).unwrap();
+                assert!(matches!(result, Outcome::Waiting(_)), "{attempts}/{change}: {result:?}");
+                assert_eq!(world.runner.count("ssh "), 1);
+                assert_eq!(prompts(&world), 0, "{attempts}/{change}");
+                assert_eq!(world.runner.count("agent send-keys"), 0, "{attempts}/{change}");
+                let current = thread::load(&project, &record.id).unwrap();
+                assert!(current.prompt_pending && current.brief_claimed.is_empty());
+                assert_eq!(current.brief_attempts, attempts);
+            }
+        }
     }
 
     #[test]
@@ -473,6 +718,9 @@ mod tests {
         let (world, project, _) = world("idle");
         let ctx = world.ctx();
         thread::update(&project, "t-0001", |t| t.machine = "box".into()).unwrap();
+        // Delivery now refreshes the brief on the actual worker machine.
+        world.runner.on("machine list", ok(r#"[{"id":"box","label":"box","target":"box.local"}]"#));
+        world.runner.on("ssh ", ok(""));
         pass(&ctx);
         settled(&project);
         assert!(!pass(&ctx));

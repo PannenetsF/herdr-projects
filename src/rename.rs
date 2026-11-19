@@ -310,10 +310,13 @@ pub fn run(ctx: &Ctx, args: &Args) -> Result<Outcome> {
     if resumable {
         step(&mut out, format!("keep the coordinator's {} conversation {} for a resume in the new folder", record.agent, record.agent_session));
     } else if !record.agent_session.is_empty() {
-        out.left.push(format!("the coordinator's conversation: {} cannot resume one by id, so `open` starts a new one (MEMORY.md, TASKS.md and the inbox carry over)", record.agent));
+        out.left.push(format!("the coordinator's conversation: {} cannot resume one by id, so `open` starts a new one; shared files and historical coordinator scopes are preserved, not inherited by the new coordinator", record.agent));
     }
     if reopen {
         step(&mut out, format!("reopen the coordinator in {}{}", new_dir.display(), if resumable { ", resuming its conversation" } else { "" }));
+    }
+    if project.dir().join("coordinators").is_dir() {
+        out.left.push(format!("coordinator scope directories and thread owner names stay unchanged; a person outside Herdr can inspect an existing historical scope with `context {to} --coordinator <old-name> --peek` (read only; no automatic migration)"));
     }
     if args.dry_run {
         return Ok(out);

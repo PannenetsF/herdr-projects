@@ -145,6 +145,18 @@ impl<'a> Herdr<'a> {
         }
     }
 
+    pub(crate) fn runner(&self) -> &'a dyn Runner {
+        self.runner
+    }
+
+    pub(crate) fn bin(&self) -> &str {
+        &self.bin
+    }
+
+    pub(crate) fn machine(&self) -> &str {
+        self.machine.as_deref().unwrap_or("")
+    }
+
     /// Every call is pinned to the session this object was built for. We set
     /// the socket explicitly rather than trusting an inherited
     /// `HERDR_SOCKET_PATH` — identity checks must talk to a trusted session,

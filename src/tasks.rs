@@ -4,7 +4,6 @@
 
 use anyhow::{bail, Result};
 use std::fmt;
-use std::path::Path;
 
 /// Who a task is assigned to: the text in its `(...)`. The thread running it
 /// is status, kept apart in `Task::thread`.
@@ -176,12 +175,9 @@ fn split_line(rest: &str) -> (String, Owner, Option<String>) {
     (title, owner, thread)
 }
 
-pub fn read(project_dir: &Path) -> String {
-    std::fs::read_to_string(project_dir.join("TASKS.md")).unwrap_or_default()
-}
-
 /// TASKS.md for `hp context`: every description folded into one line, so a
 /// long body costs a few tokens; the coordinator reads the file for the rest.
+#[cfg(test)]
 pub fn compact(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
@@ -220,10 +216,26 @@ pub fn delegated(tasks_md: &str, title: &str, task: &str) -> Result<String> {
 /// The TASKS.md task titled `title`, ignoring case.
 pub fn find(tasks_md: &str, title: &str) -> Result<Task> {
     let wanted = title.trim().to_lowercase();
-    match parse(tasks_md).into_iter().find(|t| t.title.to_lowercase() == wanted) {
-        Some(task) => Ok(task),
-        None => bail!("TASKS.md has no task titled \"{title}\"; --from-task takes the title exactly as it is written there"),
+    let mut matches = parse(tasks_md).into_iter().filter(|t| t.title.to_lowercase() == wanted);
+    let task = matches.next().ok_or_else(|| anyhow::anyhow!("TASKS.md has no task titled \"{title}\"; --from-task takes the title exactly as it is written there"))?;
+    if matches.next().is_some() {
+        bail!("TASKS.md has duplicate tasks titled \"{title}\"; give them unique titles before delegating");
     }
+    Ok(task)
+}
+
+/// A linked task is never silently duplicated, even if the linked record is
+/// missing, resolved, unassigned or owned by someone else. The user must inspect
+/// that record and deliberately clear the link before a new delegation.
+pub fn check_unlinked(project: &crate::project::Project, task: &Task) -> Result<()> {
+    if let Some(id) = &task.thread {
+        let state = match crate::thread::load(project, id) {
+            Ok(t) => format!("status {:?}, owner {}", t.status, if t.owner.is_empty() { "unassigned" } else { &t.owner }),
+            Err(_) => "record missing or unreadable".into(),
+        };
+        bail!("\"{}\" is already linked to {id} ({state}); inspect it with `thread show {} {id}` and explicitly clear the task link before delegating again", task.title, project.slug);
+    }
+    Ok(())
 }
 
 /// The `--profile` and `--machine` a delegated task starts with: its owner's,
@@ -266,6 +278,21 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!((tasks[0].title.as_str(), &tasks[0].owner, tasks[0].description.as_str()), ("Write the docs", &Owner::Me, ""));
         assert_eq!(tasks[1].owner, Owner::Unassigned);
+    }
+
+    #[test]
+    fn duplicate_titles_and_existing_links_never_delegate_again() {
+        assert!(find("## A\n- [ ] Same\n## B\n- [ ] same\n", "Same").unwrap_err().to_string().contains("duplicate"));
+        let home = tempfile::tempdir().unwrap();
+        let project = crate::project::create(home.path(), "demo", "", vec![]).unwrap();
+        for (owner, status) in [("hpc-demo", crate::thread::Status::Open), ("hpc-demo-1", crate::thread::Status::Open), ("", crate::thread::Status::Open), ("hpc-demo", crate::thread::Status::Resolved)] {
+            let record = crate::thread::allocate(&project, |t| { t.owner = owner.into(); t.status = status; }).unwrap();
+            let task = find(&format!("- [ ] Task · {}\n", record.id), "Task").unwrap();
+            assert!(check_unlinked(&project, &task).is_err());
+        }
+        let missing = find("- [ ] Task · t-9999\n", "Task").unwrap();
+        assert!(check_unlinked(&project, &missing).unwrap_err().to_string().contains("record missing"));
+        assert!(check_unlinked(&project, &find("- [ ] Task\n", "Task").unwrap()).is_ok());
     }
 
     #[test]

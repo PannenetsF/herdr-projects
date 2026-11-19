@@ -24,8 +24,8 @@ pub struct World {
     pub panes: Rc<RefCell<String>>,
     /// JSON array served by a cleaned-environment `herdr session list --json`.
     pub sessions: Rc<RefCell<String>>,
-    /// Raw table served for the identity checker's `ps -ax …` probe: "" makes
-    /// the process unprovable (a bare terminal / CI).
+    /// Raw table served for identity's `ps -ax …` probe. Empty/malformed
+    /// output is unknown, never evidence of a bare terminal or CI caller.
     pub ps_table: Rc<RefCell<String>>,
     /// pane_id → process_info JSON the trusted server answers; queries for an
     /// unlisted pane get `procinfo_fallback`.
@@ -55,7 +55,10 @@ impl World {
     pub fn new() -> World {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        let env = Env::for_test(home.path(), &[]);
+        let env = Env::for_test(home.path(), &[
+            ("HP_TEST_SELF_PID", "9000"),
+            ("HP_TEST_REAL_HOME", &home.path().to_string_lossy()),
+        ]);
         let world = World {
             env,
             root,
@@ -110,8 +113,9 @@ impl World {
         let current = world.current.clone();
         let fallback = world.procinfo_fallback.clone();
         let pi_enabled = world.identity_enabled.clone();
+        let pi_rows = world.procinfo.clone();
         world.runner.on_fn(
-            move |cmd| pi_enabled.get() && cmd.display().contains("pane process-info"),
+            move |cmd| pi_enabled.get() && !pi_rows.borrow().is_empty() && cmd.display().contains("pane process-info"),
             move |cmd| {
                 let pane = if cmd.args.iter().any(|a| a == "--current") {
                     current.borrow().clone()
@@ -130,6 +134,7 @@ impl World {
             },
         );
         world.runner.on("report-metadata", ok(r#"{"result":{}}"#));
+        world.script_plain_terminal();
         world
     }
 
@@ -304,7 +309,7 @@ fn thread_start_returns_without_an_agent_and_the_ticker_launches_then_prompts() 
     let started = threads::start(
         &ctx,
         "demo",
-        StartArgs {
+        StartArgs { from_task: None, task_source: None,
             title: "Fix $(it)".into(),
             repo: Some(repo.to_string_lossy().into_owned()),
             machine: None,
@@ -419,7 +424,7 @@ fn a_local_worktree_create_retries_a_config_lock_and_cleans_its_empty_branch() {
     let started = threads::start(
         &world.ctx(),
         "demo",
-        StartArgs {
+        StartArgs { from_task: None, task_source: None,
             title: "Lock".into(),
             repo: Some(repo.to_string_lossy().into_owned()),
             machine: None,
@@ -464,7 +469,7 @@ fn a_persistent_config_lock_fails_the_thread_after_five_creates() {
     let error = threads::start(
         &world.ctx(),
         "demo",
-        StartArgs {
+        StartArgs { from_task: None, task_source: None,
             title: "Held".into(),
             repo: Some(repo.to_string_lossy().into_owned()),
             machine: None,
@@ -511,7 +516,7 @@ fn an_ssh_worktree_create_uses_the_commit_and_retries_a_config_lock() {
     let started = threads::start(
         &world.ctx(),
         "demo",
-        StartArgs {
+        StartArgs { from_task: None, task_source: None,
             title: "Lock".into(),
             repo: Some("/home/me/repo".into()),
             machine: Some("box".into()),
@@ -879,7 +884,7 @@ fn thread_start_is_refused_when_paused() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     project.set_status(project::Status::Paused).unwrap();
-    let args = StartArgs { title: "x".into(), repo: None, machine: None, profile: None, kind: None, base: None, task: "t".into() };
+    let args = StartArgs { from_task: None, task_source: None, title: "x".into(), repo: None, machine: None, profile: None, kind: None, base: None, task: "t".into() };
     let error = threads::start(&world.ctx(), "demo", args).unwrap_err().to_string();
     assert!(error.contains("paused"), "{error}");
     assert!(thread::list(&project).is_empty());
@@ -903,7 +908,7 @@ fn thread_start_and_open_refuse_profiles_off_the_allow_list() {
     let project = world.project("demo", "a.sock");
     write_profiles(&world, PROFILES);
     for bad in ["deep", "codex", "nope"] {
-        let args = StartArgs { title: "x".into(), repo: None, machine: None, profile: Some(bad.into()), kind: Some(Kind::Tab), base: None, task: "t".into() };
+        let args = StartArgs { from_task: None, task_source: None, title: "x".into(), repo: None, machine: None, profile: Some(bad.into()), kind: Some(Kind::Tab), base: None, task: "t".into() };
         let error = threads::start(&world.ctx(), "demo", args).unwrap_err().to_string();
         assert!(error.contains("not allowed for threads") || error.contains("no profile `nope`"), "{error}");
         let options = coordinator::OpenOptions { session: Default::default(), rebind: false, profile: Some(bad.into()), new: true, here: false };
@@ -2091,8 +2096,9 @@ fn every_project_sharing_a_machine_is_polled_in_its_due_tick() {
     for project in [&demo, &other] {
         ticker::tick_project_with(&ctx, project, &mut memory).unwrap();
     }
+    // Both projects poll; the pending launch makes one fresh, locked check.
     // The first project asked does not use up the machine's turn.
-    assert_eq!(remote_polls(&world), 2);
+    assert_eq!(remote_polls(&world), 3);
     assert_eq!(thread::load(&other, &waiting.id).unwrap().launch_attempts, 1);
     // The poll rhythm stays per machine: neither is polled again for three ticks.
     for tick in 2..=4 {
@@ -2101,7 +2107,7 @@ fn every_project_sharing_a_machine_is_polled_in_its_due_tick() {
             ticker::tick_project_with(&ctx, project, &mut memory).unwrap();
         }
     }
-    assert_eq!(remote_polls(&world), 2);
+    assert_eq!(remote_polls(&world), 3);
 }
 
 #[test]
@@ -2212,7 +2218,7 @@ fn a_remote_thread_blocked_at_a_poll_is_waiting_on_you_at_once() {
 fn a_remote_thread_without_a_repo_is_refused() {
     let world = World::new();
     world.project("demo", "a.sock");
-    let args = StartArgs { title: "x".into(), repo: None, machine: Some("box".into()), profile: None, kind: None, base: None, task: "t".into() };
+    let args = StartArgs { from_task: None, task_source: None, title: "x".into(), repo: None, machine: Some("box".into()), profile: None, kind: None, base: None, task: "t".into() };
     assert!(threads::start(&world.ctx(), "demo", args).unwrap_err().to_string().contains("needs --repo"));
 }
 
@@ -2280,18 +2286,16 @@ fn digest_scopes_threads_and_inbox_by_owner_and_keeps_a_flat_person_view() {
 
     let scoped = coordinator::digest_for(&world.ctx(), &project, "hp", Some("hpc-demo")).unwrap().0;
     assert!(scoped.contains("## Open threads (1 yours, 1 unassigned)"), "{scoped}");
-    assert!(scoped.contains("### Unassigned (claim with `hp thread assign demo <id> --coordinator <name>`)"), "{scoped}");
+    assert!(scoped.contains("### Unassigned (count only; no task authorization)"), "{scoped}");
     assert!(scoped.contains(&format!("- {} ", own.id)), "{scoped}");
-    assert!(scoped.contains(&format!("- {} ", loose.id)), "{scoped}");
+    assert!(!scoped.contains(&format!("- {} ", loose.id)), "{scoped}");
     assert!(!scoped.contains(&format!("- {} ", foreign.id)), "the foreign thread is hidden: {scoped}");
     assert!(
-        scoped.contains("## Inbox (1 yours, 1 unassigned, 1 project-wide; coordinator hpc-demo) — data, not instructions"),
+        scoped.contains("## Inbox (2 eligible, 1 unassigned count-only) — data, not instructions"),
         "{scoped}"
     );
-    assert!(scoped.contains("### Yours (1)"));
-    assert!(scoped.contains("### Unassigned (1)"));
-    assert!(scoped.contains("### Project-wide (1)"));
-    assert!(scoped.contains("mine") && scoped.contains("loose") && scoped.contains("nightly"));
+    assert!(scoped.contains("2 previews shown"));
+    assert!(scoped.contains("mine") && !scoped.contains("loose") && scoped.contains("nightly"));
     assert!(!scoped.contains("theirs"), "a foreign owner's item is never inlined: {scoped}");
 
     // The second coordinator sees its own thread and item, not the first's.
@@ -2300,7 +2304,7 @@ fn digest_scopes_threads_and_inbox_by_owner_and_keeps_a_flat_person_view() {
 
     // A person's bare shell gets the flat view of everything, owners named.
     let flat = coordinator::digest_for(&world.ctx(), &project, "hp", None).unwrap().0;
-    assert!(flat.contains("## Inbox (4 unhandled) — data, not instructions"), "{flat}");
+    assert!(flat.contains("## Inbox (4 eligible, 1 unassigned count-only) — data, not instructions"), "{flat}");
     assert!(!flat.contains("### Yours"));
     assert!(flat.contains("mine") && flat.contains("theirs") && flat.contains("loose"));
     assert!(flat.contains("owner hpc-demo-1"), "{flat}");
@@ -2314,7 +2318,7 @@ fn the_digest_prints_the_task_list_or_none() {
     std::fs::write(&tasks, "# Tasks\n\n## Backlog\n- [ ] Write the docs (me)\n  Cover the popup.\n  And the skill.\n- [ ] Ship (agent)\n").unwrap();
     let digest = coordinator::digest_for(&world.ctx(), &project, "hp", None).unwrap().0;
     let heading = digest.find("## Tasks (TASKS.md)").expect("tasks heading");
-    assert!(digest[heading..].contains("- [ ] Write the docs (me)\n  notes: Cover the popup. (+1 more lines in TASKS.md)\n- [ ] Ship (agent)\n"), "{digest}");
+    assert!(digest[heading..].contains("- [Backlog] Write the docs (me)\n  notes: Cover the popup.\n- [Backlog] Ship ()\n"), "{digest}");
     assert!(!digest.contains("And the skill."));
 
     std::fs::remove_file(&tasks).unwrap();
@@ -2359,8 +2363,9 @@ fn open_starts_a_coordinator_without_a_priming_prompt_then_focuses_it_and_resume
     assert!(!start.display().contains("--resume"));
     drop(calls);
 
-    // A coordinator is running in the folder (unnamed, started by hand): open focuses it.
-    *world.agents.borrow_mut() = format!("[{}]", agent_json("w3", "w3:t1", "w3:p1", &dir, "", "idle"));
+    // A native resume kept its session id but lost its name: open restores it.
+    // Merely sharing the recorded pane/cwd is not enough to inherit its scope.
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w3", "w3:t1", "w3:p1", &dir, "", "idle").replace("\"agent_status\":\"idle\"", "\"agent_status\":\"idle\",\"agent_session\":{\"value\":\"sess-42\"}"));
     crate::coordinator::open(&ctx, "demo", &options(false)).unwrap();
     assert_eq!(world.runner.count("agent start"), 1);
     assert_eq!(world.runner.count("agent focus"), 1);
@@ -2451,12 +2456,12 @@ fn a_repo_less_tab_thread_gets_its_brief_seconds_after_its_agent_is_ready() {
     let refused = threads::start(
         &ctx,
         "demo",
-        StartArgs { title: "Clean up".into(), repo: Some(world.home.path().join("repo").to_string_lossy().into_owned()), machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Tidy.".into() },
+        StartArgs { from_task: None, task_source: None, title: "Clean up".into(), repo: Some(world.home.path().join("repo").to_string_lossy().into_owned()), machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Tidy.".into() },
     )
     .unwrap_err()
     .to_string();
     assert!(refused.contains("a tab is for a task with no repository"), "{refused}");
-    let args = StartArgs { title: "Clean up".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Tidy.".into() };
+    let args = StartArgs { from_task: None, task_source: None, title: "Clean up".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Tidy.".into() };
     let t = threads::start(&ctx, "demo", args).unwrap();
     assert_eq!((t.kind, t.cwd.as_str(), t.prompt_pending), (Kind::Tab, cwd.as_str(), true));
     assert_eq!((t.workspace_id.as_str(), t.pane_id.as_str()), ("w7", "w7:p2"));
@@ -2576,7 +2581,7 @@ fn a_coordinator_started_thread_is_owned_by_its_registered_name_and_persists_it(
     let t = threads::start(
         &ctx,
         "demo",
-        StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() },
+        StartArgs { from_task: None, task_source: None, title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() },
     )
     .unwrap();
     assert_eq!(t.owner, "hpc-demo");
@@ -2626,7 +2631,7 @@ fn a_coordinator_started_thread_is_owned_by_its_registered_name_and_persists_it(
     let t2 = threads::start(
         &ctx2,
         "demo",
-        StartArgs { title: "More".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look too.".into() },
+        StartArgs { from_task: None, task_source: None, title: "More".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look too.".into() },
     )
     .unwrap();
     assert_eq!(t2.owner, "hpc-demo-1");
@@ -2654,7 +2659,7 @@ fn a_thread_started_from_a_bare_shell_is_owner_less_and_omits_owner_from_its_rec
     let t = threads::start(
         &world.ctx(),
         "demo",
-        StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() },
+        StartArgs { from_task: None, task_source: None, title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() },
     )
     .unwrap();
     assert!(t.owner.is_empty());
@@ -2676,7 +2681,7 @@ fn an_unregistered_agent_in_the_project_folder_cannot_start_threads() {
     let error = threads::start(
         &ctx,
         "demo",
-        StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() },
+        StartArgs { from_task: None, task_source: None, title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() },
     )
     .unwrap_err()
     .to_string();
@@ -2700,6 +2705,26 @@ fn stripped_caller_env(world: &World, self_pid: &str) -> Env {
             ("HP_TEST_HERDR_BIN", "herdr"),
         ],
     )
+}
+
+#[test]
+fn stripped_markers_and_failed_process_info_cannot_restore_human_authority() {
+    let world = World::new();
+    let socket = default_socket(&world);
+    let project = world.project("demo", "a.sock");
+    world.script_inside_herdr(&[&socket]);
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    world.runner.on("pane process-info", fail(1, "temporary RPC failure"));
+    let t = world.thread(&project, Path::new("/worker"), |t| t.owner = "hpc-demo-1".into());
+    let env = stripped_caller_env(&world, "9000");
+    let ctx = Ctx { env: &env, ..world.ctx() };
+    assert_eq!(coordinator::caller(&ctx, &project), coordinator::Caller::Unverified { pane: String::new() });
+    assert!(threads::assign(&ctx, "demo", &t.id, "hpc-demo").is_err());
+    assert!(coordinator::prompt(&ctx, "demo", "not a human instruction").is_err());
+    assert_eq!(thread::load(&project, &t.id).unwrap().owner, "hpc-demo-1");
+    assert_eq!(world.runner.count("agent prompt"), 0);
 }
 
 #[test]
@@ -2845,7 +2870,7 @@ fn a_recorded_socket_that_left_the_session_registry_is_not_a_trust_root() {
 
     let env = stripped_caller_env(&world, "9000");
     let caller = coordinator::caller(&Ctx { env: &env, ..world.ctx() }, &project);
-    assert_eq!(caller, coordinator::Caller::Human, "{caller:?}");
+    assert!(matches!(caller, coordinator::Caller::Unverified { ref pane } if pane.is_empty()), "{caller:?}");
     let queried_rogue = world
         .runner
         .calls
@@ -2923,9 +2948,9 @@ fn the_focused_pane_fallback_for_a_foreign_tty_is_not_accepted_as_proof() {
     let project = world.project("demo", "a.sock");
     let dir = project.canonical_dir().to_string_lossy().into_owned();
     world.script_inside_herdr(&[&socket]);
-    // The trusted server's `pane current` falls back to a focused pane whose
-    // process-info places unrelated pids there; no pane's process info proves
-    // this command. Unmarked, it is an unplaceable (plain) process: Human.
+    world.script_plain_terminal();
+    // A complete outside-terminal ancestry plus a complete negative census
+    // proves Human. A focused-pane fallback alone proves nothing.
     world.procinfo.borrow_mut().push((
         "w9:p9".into(),
         ok(r#"{"result":{"process_info":{"pane_id":"w9:p9","shell_pid":4242,"foreground_process_group_id":4242,"foreground_processes":[{"pid":4242,"name":"zsh"}]}}}"#).stdout,
@@ -3005,6 +3030,42 @@ fn a_plain_terminal_without_markers_is_a_human_anywhere_on_disk() {
 }
 
 #[test]
+fn from_task_uses_the_proven_coordinators_scope_and_rejects_foreign_sources() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let socket = project.coordinator().unwrap().socket;
+    world.script_inside_herdr(&[&socket]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"));
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let own = crate::scope::ensure(&project, "hpc-demo").unwrap();
+    let other = crate::scope::ensure(&project, "hpc-demo-1").unwrap();
+    std::fs::write(own.dir.join("TASKS.md"), "## Backlog\n- [ ] Research\n  OWN_NOTES\n").unwrap();
+    std::fs::write(own.dir.join("MEMORY.md"), "OWN_MEMORY").unwrap();
+    std::fs::write(other.dir.join("TASKS.md"), "## Backlog\n- [ ] Research\n  FOREIGN_NOTES\n").unwrap();
+    std::fs::write(project.dir().join("TASKS.md"), "## Backlog\n- [ ] Research\n  ROOT_NOTES\n").unwrap();
+    let env = stripped_caller_env(&world, "9000");
+    let ctx = Ctx { env: &env, ..world.ctx() };
+    let args = |source: Option<&str>| StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Explicit task".into(), from_task: Some("Research".into()), task_source: source.map(str::to_string) };
+    assert!(threads::start(&ctx, "demo", args(Some("hpc-demo-1"))).unwrap_err().to_string().contains("cannot select"));
+    assert!(thread::list(&project).is_empty());
+    assert!(coordinator::context_selected(&ctx, "demo", true, false, Some("hpc-demo-1")).unwrap_err().to_string().contains("human-only"));
+    world.runner.on("workspace create", ok(r#"{"result":{"root_pane":{"workspace_id":"w7","tab_id":"w7:t1","pane_id":"w7:p1"}}}"#));
+    world.runner.on("tab create", ok(r#"{"result":{"root_pane":{"workspace_id":"w7","tab_id":"w7:t2","pane_id":"w7:p2"}}}"#));
+    world.runner.on("tab close", ok(r#"{"result":{}}"#));
+    let t = threads::start(&ctx, "demo", args(None)).unwrap();
+    assert_eq!(t.owner, "hpc-demo");
+    let brief = std::fs::read_to_string(Path::new(&t.thread_dir).join("brief.md")).unwrap();
+    assert!(brief.contains("OWN_NOTES") && brief.contains("OWN_MEMORY"));
+    assert!(!brief.contains("FOREIGN_NOTES") && !brief.contains("ROOT_NOTES"));
+    assert!(brief.contains("coordinators/hpc-demo/TASKS.md"));
+    std::fs::write(own.dir.join("TASKS.md"), format!("## Backlog\n- [ ] Research · {}\n", t.id)).unwrap();
+    assert!(threads::start(&ctx, "demo", args(None)).unwrap_err().to_string().contains("already linked"));
+    assert_eq!(thread::list(&project).len(), 1);
+}
+
+#[test]
 fn a_tab_thread_gets_a_brief_with_the_project_header_and_prompts_are_recorded() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
@@ -3023,8 +3084,8 @@ fn a_tab_thread_gets_a_brief_with_the_project_header_and_prompts_are_recorded() 
     let ctx = world.ctx();
     // Delegated from TASKS.md: the task's notes reach the brief.
     std::fs::write(project.dir().join("TASKS.md"), "# Tasks\n\n## Backlog\n- [ ] Research (agent)\n  Start with the 2025 papers.\n").unwrap();
-    let task = crate::tasks::delegated(&crate::tasks::read(&project.dir()), "Research", "Look into it.").unwrap();
-    let t = threads::start(&ctx, "demo", StartArgs { title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task }).unwrap();
+    let task = "Look into it.".to_string();
+    let t = threads::start(&ctx, "demo", StartArgs { from_task: Some("Research".into()), task_source: Some("shared".into()), title: "Research".into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task }).unwrap();
     assert_eq!(t.kind, Kind::Tab);
     let brief = std::fs::read_to_string(Path::new(&t.thread_dir).join("brief.md")).unwrap();
     assert!(brief.contains("Look into it.\n\n## Notes from the task list\n\nStart with the 2025 papers."), "{brief}");
@@ -3198,31 +3259,86 @@ fn open_from_a_shell_pane_runs_the_coordinator_there_then_focuses_it_and_new_sta
 
 #[test]
 fn open_in_a_pane_resumes_the_recorded_session_and_starts_fresh_when_that_fails() {
-    let h = Here::new(&[]);
-    h.project
-        .update_coordinator(|c| {
+    for new_session in ["sess-9", ""] {
+        let h = Here::new(&[]);
+        let old_scope = crate::scope::ensure(&h.project, "hpc-demo").unwrap();
+        std::fs::write(old_scope.dir.join("MEMORY.md"), "OLD_PRIVATE_MEMORY").unwrap();
+        std::fs::write(old_scope.dir.join("TASKS.md"), "## Backlog\n- [ ] OLD_PRIVATE_TASK\n").unwrap();
+        let old_thread = thread::allocate(&h.project, |t| t.owner = "hpc-demo".into()).unwrap();
+        h.project.update_coordinator(|c| {
             c.socket = h.socket.to_string_lossy().into_owned();
             c.agent = "claude".into();
+            c.agent_name = "hpc-demo".into();
             c.agent_session = "sess-42".into();
             c.cwd = h.dir.clone();
-        })
-        .unwrap();
-    h.runs.borrow_mut().push((0, format!("[{}]", h.child_agent("w5:p1", "", "sess-42"))));
-    h.open(true, false).unwrap();
-    assert_eq!(h.foreground()[0].args, ["--resume", "sess-42"]);
-    assert_eq!(h.project.coordinator().unwrap().agent_session, "sess-42");
+        }).unwrap();
+        h.runs.borrow_mut().push((0, format!("[{}]", h.child_agent("w5:p1", "", "sess-42"))));
+        h.open(true, false).unwrap();
+        assert_eq!(h.foreground()[0].args, ["--resume", "sess-42"]);
+        assert_eq!(h.project.coordinator().unwrap().agent_session, "sess-42");
+        assert_eq!(h.project.coordinator().unwrap().agent_name, "hpc-demo");
 
-    // The session is gone: claude exits at once, never detected, and a fresh
-    // one starts in its place.
-    *h.world.agents.borrow_mut() = "[]".into();
-    h.runs.borrow_mut().push((1, "[]".into()));
-    h.runs.borrow_mut().push((0, format!("[{}]", h.child_agent("w5:p1", "", "sess-9"))));
-    h.open(true, false).unwrap();
-    let runs = h.foreground();
-    assert_eq!(runs.len(), 3);
-    assert_eq!(runs[1].args, ["--resume", "sess-42"]);
-    assert!(runs[2].args.is_empty(), "{}", runs[2].display());
-    assert_eq!(h.project.coordinator().unwrap().agent_session, "sess-9");
+        // Failed resume starts an unrelated conversation: neither documents nor
+        // ownership follow it, even when the new agent reports no session id.
+        *h.world.agents.borrow_mut() = "[]".into();
+        h.runs.borrow_mut().push((1, "[]".into()));
+        h.runs.borrow_mut().push((0, format!("[{}]", h.child_agent("w5:p1", "", new_session))));
+        h.open(true, false).unwrap();
+        let runs = h.foreground();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].args, ["--resume", "sess-42"]);
+        assert!(runs[2].args.is_empty(), "{}", runs[2].display());
+        let fresh = h.project.coordinator().unwrap();
+        assert_eq!(fresh.agent_session, new_session);
+        assert_eq!(fresh.agent_name, "hpc-demo-1");
+        assert_eq!(h.world.runner.count("agent rename w5:p1 hpc-demo-1"), 1);
+        assert_eq!(thread::load(&h.project, &old_thread.id).unwrap().owner, "hpc-demo");
+        assert_eq!(old_scope.read("MEMORY.md").unwrap(), "OLD_PRIVATE_MEMORY");
+        assert_eq!(old_scope.read("TASKS.md").unwrap(), "## Backlog\n- [ ] OLD_PRIVATE_TASK\n");
+        let digest = coordinator::digest_for(&h.world.ctx(), &h.project, "hp", Some(&fresh.agent_name)).unwrap().0;
+        assert!(!digest.contains("OLD_PRIVATE_MEMORY") && !digest.contains("OLD_PRIVATE_TASK"));
+        assert!(crate::scope::Scope::existing(&h.project, &fresh.agent_name).unwrap().read("TASKS.md").unwrap().contains("## Backlog"));
+    }
+}
+
+#[test]
+fn failed_native_resume_via_agent_start_gets_a_fresh_scope_and_clears_old_session() {
+    for new_session in ["sess-new", ""] {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let old_scope = crate::scope::ensure(&project, "hpc-demo").unwrap();
+        std::fs::write(old_scope.dir.join("MEMORY.md"), "OLD_PRIVATE_MEMORY").unwrap();
+        std::fs::write(old_scope.dir.join("TASKS.md"), "## Backlog\n- [ ] OLD_PRIVATE_TASK\n").unwrap();
+        let old_thread = thread::allocate(&project, |t| t.owner = "hpc-demo".into()).unwrap();
+        project.update_coordinator(|c| {
+            c.agent = "claude".into();
+            c.profile = "claude".into();
+            c.agent_name = "hpc-demo".into();
+            c.agent_session = "sess-old".into();
+        }).unwrap();
+        world.runner.on("workspace create", ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1"}}}"#));
+        world.runner.on_fn(|c| c.display().contains("agent start") && c.args.iter().any(|a| a == "--resume"), |_| Ok(fail(1, r#"{"error":{"code":"session_not_found","message":"saved session missing"}}"#)));
+        let response = format!(r#"{{"result":{{"agent":{{"pane_id":"w3:p1","tab_id":"w3:t1","workspace_id":"w3","name":"hpc-demo-1","agent":"claude","agent_status":"idle","agent_session":{{"value":"{new_session}"}}}}}}}}"#);
+        world.runner.on("agent start", ok(&response));
+        let socket = PathBuf::from(project.coordinator().unwrap().socket);
+        let options = coordinator::OpenOptions { session: crate::paths::SessionFlags { socket: Some(socket), session: None }, rebind: false, profile: None, new: false, here: false };
+        coordinator::open(&world.ctx(), "demo", &options).unwrap();
+        let fresh = project.coordinator().unwrap();
+        assert_eq!(fresh.agent_name, "hpc-demo-1");
+        assert_eq!(fresh.agent_session, new_session);
+        let calls = world.runner.calls.borrow();
+        let starts: Vec<_> = calls.iter().filter(|c| c.display().contains("agent start")).collect();
+        assert_eq!(starts.len(), 2);
+        assert!(starts[0].args.iter().any(|a| a == "--resume"));
+        assert!(starts[1].display().contains("agent start hpc-demo-1"));
+        assert!(!starts[1].args.iter().any(|a| a == "--resume"));
+        drop(calls);
+        assert_eq!(thread::load(&project, &old_thread.id).unwrap().owner, "hpc-demo");
+        assert_eq!(old_scope.read("MEMORY.md").unwrap(), "OLD_PRIVATE_MEMORY");
+        assert_eq!(old_scope.read("TASKS.md").unwrap(), "## Backlog\n- [ ] OLD_PRIVATE_TASK\n");
+        let digest = coordinator::digest_for(&world.ctx(), &project, "hp", Some(&fresh.agent_name)).unwrap().0;
+        assert!(!digest.contains("OLD_PRIVATE_MEMORY") && !digest.contains("OLD_PRIVATE_TASK"));
+    }
 }
 
 #[test]
@@ -3262,8 +3378,12 @@ fn a_tab_thread_lands_in_a_project_threads_space_not_the_project_workspace() {
     h.world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
     h.world.runner.on("tab create", ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t2","pane_id":"w3:p2"}}}"#));
     h.world.runner.on("tab close", ok(r#"{"result":{}}"#));
-    let args = |title: &str| StartArgs { title: title.into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() };
-    let t = threads::start(&h.world.ctx(), "demo", args("Research")).unwrap();
+    let args = |title: &str| StartArgs { from_task: None, task_source: None, title: title.into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() };
+    h.world.script_inside_herdr(&[&h.socket.to_string_lossy()]);
+    h.world.procinfo_proves("w5:p1", 200, 9000, 500);
+    let env = live_pane_env(&h.world, "w5:p1");
+    let ctx = Ctx { env: &env, ..h.world.ctx() };
+    let t = threads::start(&ctx, "demo", args("Research")).unwrap();
     // (`Here` scripts every new workspace as w3, the project's own workspace.)
     let calls = h.world.runner.calls.borrow();
     let create = calls.iter().find(|c| c.display().contains("workspace create")).unwrap();
@@ -3282,7 +3402,7 @@ fn a_tab_thread_lands_in_a_project_threads_space_not_the_project_workspace() {
         pane_json("w3", "w3:t2", "w3:p2", &t.cwd)
     );
     h.world.runner.on("tab create", ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t3","pane_id":"w3:p3"}}}"#));
-    threads::start(&h.world.ctx(), "demo", args("More")).unwrap();
+    threads::start(&ctx, "demo", args("More")).unwrap();
     assert_eq!(h.world.runner.count("tab create --workspace w3"), 2);
     assert_eq!(h.world.runner.count("workspace create"), 1);
 }
@@ -3304,8 +3424,11 @@ fn a_recorded_threads_space_is_rejected_when_its_id_was_reused_after_a_restart()
         pane_json("w3", "w3:t1", "w3:p1", &h.dir)
     );
     h.world.runner.on("tab create", ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t2","pane_id":"w3:p2"}}}"#));
-    let args = |title: &str| StartArgs { title: title.into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() };
-    threads::start(&h.world.ctx(), "demo", args("Research")).unwrap();
+    let args = |title: &str| StartArgs { from_task: None, task_source: None, title: title.into(), repo: None, machine: None, profile: None, kind: Some(Kind::Tab), base: None, task: "Look.".into() };
+    h.world.script_inside_herdr(&[&h.socket.to_string_lossy()]);
+    h.world.procinfo_proves("w5:p1", 200, 9000, 500);
+    let env = live_pane_env(&h.world, "w5:p1");
+    threads::start(&Ctx { env: &env, ..h.world.ctx() }, "demo", args("Research")).unwrap();
     // It made a fresh Space instead of planting thread tabs in the home one.
     assert_eq!(h.world.runner.count("workspace create"), 1, "the home space was not reused");
     let calls = h.world.runner.calls.borrow();
@@ -3347,7 +3470,7 @@ fn a_failed_first_tab_creation_closes_its_new_space_before_restart() {
         .runner
         .on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
     let ctx = world.ctx();
-    let args = || StartArgs {
+    let args = || StartArgs { from_task: None, task_source: None,
         title: "Research".into(),
         repo: None,
         machine: None,
@@ -3423,7 +3546,7 @@ fn archive_recovers_a_root_only_threads_space_after_its_root_tab_close_failed() 
     threads::start(
         &ctx,
         "demo",
-        StartArgs {
+        StartArgs { from_task: None, task_source: None,
             title: "Research".into(),
             repo: None,
             machine: None,
@@ -3641,10 +3764,11 @@ fn adopt_replaces_a_recorded_primary_whose_pane_no_longer_exists() {
     world.runner.on("agent rename", ok(r#"{"result":{}}"#));
 
     adopt_in(&world, "demo", "w1:p1").unwrap();
-    // It takes the base family name, not hpc-demo-1, and replaces the record.
-    assert_eq!(world.runner.count("agent rename w1:p1 hpc-demo"), 1);
+    // The absent coordinator's name remains reserved: replacing its pane is
+    // not permission to inherit its documents or recorded thread ownership.
+    assert_eq!(world.runner.count("agent rename w1:p1 hpc-demo-1"), 1);
     let record = project.coordinator().unwrap();
-    assert_eq!((record.pane_id.as_str(), record.agent_name.as_str()), ("w1:p1", "hpc-demo"));
+    assert_eq!((record.pane_id.as_str(), record.agent_name.as_str()), ("w1:p1", "hpc-demo-1"));
 }
 
 #[test]
@@ -4542,6 +4666,7 @@ fn thread_assign_validates_the_thread_the_name_and_that_the_coordinator_is_live(
     assert!(threads::assign(&ctx, "demo", "t-9999", "hpc-demo").unwrap_err().to_string().contains("no thread `t-9999`"));
     assert!(threads::assign(&ctx, "demo", &t.id, "someone-else").unwrap_err().to_string().contains("is not a coordinator name"));
     // -2 is the right family but not live (only -0 and -1 are).
+    world.script_plain_terminal();
     assert!(threads::assign(&ctx, "demo", &t.id, "hpc-demo-2").unwrap_err().to_string().contains("no registered coordinator `hpc-demo-2` is live"));
     assert!(thread::load(&project, &t.id).unwrap().owner.is_empty(), "failed assigns change nothing");
 }
@@ -4661,6 +4786,7 @@ fn an_item_of_an_assigned_then_resolved_thread_displays_to_the_current_owner_onl
     })
     .unwrap();
     inbox::write_thread(&project, &t, "thread-state", "new report", "s", "").unwrap();
+    world.script_plain_terminal();
     threads::assign(&world.ctx(), "demo", &t.id, "hpc-demo-1").unwrap();
     t = thread::update(&project, &t.id, |t| t.status = Status::Resolved).unwrap();
 
@@ -4687,6 +4813,7 @@ fn assigning_a_thread_back_to_its_recorded_owner_is_idempotent_without_liveness(
     let ctx_b = Ctx { env: &env_b, ..world.ctx() };
     assert!(threads::assign(&ctx_b, "demo", &t.id, "hpc-demo").is_err(), "a foreign coordinator cannot impersonate an offline owner, even for a no-op");
     assert!(threads::assign(&ctx_b, "demo", &t.id, "hpc-demo-1").is_err(), "an offline owner is not an unassigned thread");
+    world.script_plain_terminal();
     threads::assign(&world.ctx(), "demo", &t.id, "hpc-demo").unwrap(); // human rescue stays idempotent without liveness
     assert_eq!(thread::load(&project, &t.id).unwrap().owner, "hpc-demo");
 }
@@ -4911,6 +5038,7 @@ fn thread_read_and_keys_reach_the_threads_pane_on_its_session_and_refuse_a_bare_
 fn thread_keys_reach_a_remote_thread_through_its_machine() {
     let (world, _project) = remote_world();
     let world = World { runner: FakeRunner::new(), ..world };
+    world.runner.on("pid=,ppid=,pgid=,comm=", ok(&world.ps_table.borrow()));
     world.runner.on("machine list --json", ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#));
     let cwd = "/home/me/wt";
     world.runner.on_fn(
@@ -5211,6 +5339,51 @@ fn rename_verifies_a_threads_space_and_keeps_its_id_when_relabeling_fails() {
 }
 
 #[test]
+fn project_rename_preserves_historical_scopes_for_explicit_human_read_only_inspection() {
+    let world = World::new();
+    let project = world.project("scratch", "a.sock");
+    let old_scope = crate::scope::ensure(&project, "hpc-scratch").unwrap();
+    std::fs::write(old_scope.dir.join("MEMORY.md"), "HISTORICAL_MEMORY").unwrap();
+    std::fs::write(old_scope.dir.join("TASKS.md"), "## Backlog\n- [ ] HISTORICAL_TASK\n").unwrap();
+    let old_thread = thread::allocate(&project, |t| { t.owner = "hpc-scratch".into(); t.status = Status::Resolved; }).unwrap();
+    let old_item = crate::inbox::write_thread(&project, &old_thread, "thread-state", "resolved", "OLD_REPORT", "").unwrap();
+    world.runner.on("workspace rename", ok(r#"{"result":{}}"#));
+    let out = crate::rename::run(&world.ctx(), &rename_args("scratch", "home", None, false)).unwrap();
+    assert!(out.left.iter().any(|s| s.contains("no automatic migration")));
+    let renamed = Project::load(&world.root, "home").unwrap();
+    let history = crate::scope::Scope::existing(&renamed, "hpc-scratch").unwrap();
+    assert_eq!(history.read("MEMORY.md").unwrap(), "HISTORICAL_MEMORY");
+    assert_eq!(history.read("TASKS.md").unwrap(), "## Backlog\n- [ ] HISTORICAL_TASK\n");
+    assert_eq!(thread::load(&renamed, &old_thread.id).unwrap().owner, "hpc-scratch");
+    assert_eq!(crate::inbox::unhandled(&renamed).iter().find(|i| i.id == old_item).unwrap().owner.as_deref(), Some("hpc-scratch"));
+    let current = crate::scope::ensure(&renamed, "hpc-home").unwrap();
+    std::fs::write(current.dir.join("MEMORY.md"), "CURRENT_MEMORY").unwrap();
+    let sources = crate::scope::sources(&renamed).unwrap().into_iter().map(|s| s.source).collect::<Vec<_>>();
+    assert_eq!(sources, ["shared", "hpc-home", "hpc-scratch"]);
+    let current_digest = coordinator::digest_for(&world.ctx(), &renamed, "hp", Some("hpc-home")).unwrap().0;
+    assert!(current_digest.contains("CURRENT_MEMORY"));
+    assert!(!current_digest.contains("HISTORICAL_MEMORY") && !current_digest.contains("HISTORICAL_TASK"));
+    // Historical selection is read only even without --peek, and never writes
+    // legacy or owner-specific seen buckets.
+    coordinator::context_selected(&world.ctx(), "home", false, false, Some("hpc-scratch")).unwrap();
+    assert!(crate::inbox::seen_union(&renamed).is_empty());
+    assert!(coordinator::context_selected(&world.ctx(), "home", true, false, Some("hpc-scratch-9")).is_err());
+    assert!(!renamed.dir().join("coordinators/hpc-scratch-9").exists());
+    assert!(crate::scope::Scope::coordinator(&renamed, "hpc-scratch").is_err());
+
+    let socket = renamed.coordinator().unwrap().socket;
+    world.script_inside_herdr(&[&socket]);
+    world.procinfo_proves("w1:p1", 200, 9000, 500);
+    *world.agents.borrow_mut() = format!("[{}]", agent_json("w1", "w1:t1", "w1:p1", &renamed.canonical_dir().to_string_lossy(), "hpc-home", "idle"));
+    let env = stripped_caller_env(&world, "9000");
+    let ctx = Ctx { env: &env, ..world.ctx() };
+    let refusal = coordinator::context_selected(&ctx, "home", true, false, Some("hpc-scratch")).unwrap_err().to_string();
+    assert!(refusal.contains("human-only"), "{refusal}");
+    assert_eq!(history.read("MEMORY.md").unwrap(), "HISTORICAL_MEMORY");
+    assert_eq!(history.read("TASKS.md").unwrap(), "## Backlog\n- [ ] HISTORICAL_TASK\n");
+}
+
+#[test]
 fn rename_moves_the_folder_and_every_reference_to_it() {
     let world = World::new();
     let project = world.project("scratch", "a.sock");
@@ -5387,7 +5560,7 @@ fn a_coordinator_renames_its_own_project_and_reopens_in_the_new_folder() {
     assert!(old.is_dir());
     let pending = crate::rename::pending(&world.root, "scratch").unwrap();
     assert!(pending.reopen && pending.to == "home");
-    let start = threads::start(&ctx, "scratch", StartArgs { title: "x".into(), repo: None, machine: None, profile: None, kind: None, base: None, task: "y".into() });
+    let start = threads::start(&ctx, "scratch", StartArgs { from_task: None, task_source: None, title: "x".into(), repo: None, machine: None, profile: None, kind: None, base: None, task: "y".into() });
     assert!(start.unwrap_err().to_string().contains("being renamed"));
 
     // While it works (finishing its reply), nothing happens.
@@ -5574,7 +5747,10 @@ fn worker_report_uses_current_owner_after_a_human_handoff() {
     let (world, _project, t, env) = worker_report_world("idle");
     let ctx = Ctx { env: &env, ..world.ctx() };
     coordinator::prompt(&ctx, "demo", "before handoff").unwrap();
+    let inside = world.ps_table.borrow().clone();
+    world.script_plain_terminal();
     threads::assign(&world.ctx(), "demo", &t.id, "hpc-demo").unwrap();
+    *world.ps_table.borrow_mut() = inside;
     coordinator::prompt(&ctx, "demo", "after handoff").unwrap();
     assert_eq!(world.runner.count("agent prompt w3:p1"), 1);
     assert_eq!(world.runner.count("agent prompt w1:p1"), 1);
@@ -5602,7 +5778,7 @@ fn a_coordinator_report_stays_with_its_sender_and_cannot_claim_foreign_work() {
 #[test]
 fn worker_report_cannot_reuse_a_pane_id_from_another_trusted_session() {
     let (world, project, _t, env) = worker_report_world("idle");
-    let project_socket = project.coordinator().unwrap().socket;
+    let project_socket = PathBuf::from(project.coordinator().unwrap().socket).canonicalize().unwrap().to_string_lossy().into_owned();
     let other_socket = world.home.path().join("other.sock");
     std::fs::write(&other_socket, b"").unwrap();
     world.script_inside_herdr(&[&project_socket, &other_socket.to_string_lossy()]);

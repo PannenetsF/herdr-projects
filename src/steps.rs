@@ -489,52 +489,46 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
     // thread items; the global key gets items about no thread.
     let mut queues: BTreeMap<String, Vec<inbox::Item>> = BTreeMap::new();
     for item in items {
-        if crate::thread::validate_id(&item.subject).is_ok() {
-            // An owner-less thread item is claimed manually, never nudged —
-            // except the one-time legacy-checkout migration note, which is
-            // project-wide by design (every real pre-pf.5 checkout thread is
-            // owner-less, so the notice would otherwise never leave
-            // `context`'s Unassigned area).
-            match inbox::effective_owner(&item, &threads) {
-                Some(owner) => queues.entry(owner).or_default().push(item),
-                None if item.event == LEGACY_CHECKOUT_EVENT => {
-                    queues.entry(GLOBAL_NUDGE.to_string()).or_default().push(item)
-                }
-                None => {}
-            }
-        } else {
-            queues.entry(GLOBAL_NUDGE.to_string()).or_default().push(item);
+        if let Some(key) = nudge_key(&item, &threads) {
+            queues.entry(key).or_default().push(item);
         }
     }
 
+    nudge_queues(project, state, settings, herdr, coordinators, primary_pane, now, queues)
+}
+
+fn nudge_queues(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinators: &[crate::coordinator::LivePane], primary_pane: &str, now: jiff::Timestamp, queues: BTreeMap<String, Vec<inbox::Item>>) -> Result<()> {
+    // A queue that vanished (handoff, handled items, unassignment) cannot retain
+    // an attempt that later revives against an unrelated screen.
+    state.nudge_attempts.retain(|key, _| queues.contains_key(key));
+    state.boxes.retain(|key, _| queues.contains_key(key));
+    state.nudged.retain(|key, _| queues.contains_key(key));
     if coordinators.is_empty() {
         // Every pin dies with its coordinators; hashes still move forward
         // below so nothing is replayed once one returns.
         state.nudge_sessions.clear();
     }
-    let global_seen = inbox::seen_union(project);
     // At most one freshly typed nudge per tick: a confirmed prompt already
     // blocks up to PROMPT_WAIT, and the rest go on the next tick. Screen
     // reconciliation of earlier sends is not a send and still runs.
     let mut sent_this_tick = false;
 
     for (key, queued) in queues {
-        // Owner keys are suppressed only by the owner's own bucket. The
-        // shared legacy baseline (pre-owner migrations and bare human
-        // `context` reads) must not silence an owner-specific nudge; the
-        // global key keeps the project-wide union.
-        let seen: BTreeSet<String> = if key == GLOBAL_NUDGE {
-            global_seen.clone()
-        } else {
-            inbox::seen_own(project, &key)
-        };
-        let unseen: Vec<inbox::Item> = queued.into_iter().filter(|i| !seen.contains(&i.id)).collect();
+        // Lock only this candidate queue's thread subjects, in a common order.
+        // Keep the guards through both a fresh prompt and reconciliation Enter.
+        let subjects: BTreeSet<&str> = queued.iter().map(|i| i.subject.as_str()).filter(|id| thread::validate_id(id).is_ok()).collect();
+        let _deliveries = subjects.iter().map(|id| threads::prompt_delivery_lock(project, id)).collect::<Result<Vec<_>>>()?;
+        let ids: BTreeSet<String> = queued.iter().map(|i| i.id.clone()).collect();
+        let unseen = locked_unseen(project, &key, &ids, &subjects)?;
         let hash = hash_ids(&unseen.iter().map(|i| i.id.clone()).collect());
         if unseen.is_empty() {
             state.boxes.remove(&key);
             state.nudged.remove(&key);
             state.nudge_attempts.remove(&key);
             continue;
+        }
+        if state.nudge_attempts.get(&key).is_some_and(|a| a.hash != hash) {
+            state.nudge_attempts.remove(&key);
         }
         if state.nudged.get(&key).is_some_and(|h| h == &hash) {
             // A confirmed set needs no lingering send record.
@@ -554,18 +548,14 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
         // the old primary-preferred, sticky choice across all coordinators.
         // Compute this before reconciliation too: a stale attempt must never
         // read or send Enter to a pane no longer hosting that coordinator.
-        let candidates: Vec<crate::coordinator::LivePane> = if key == GLOBAL_NUDGE {
-            coordinators.to_vec()
-        } else {
-            coordinators.iter().filter(|p| p.name == key).cloned().collect()
-        };
+        let candidates = fresh_nudge_candidates(project, herdr, coordinators, &key, now)?;
 
         // A send from an earlier tick may still be sitting on screen:
         // reconcile it before target selection and the empty-box gate, which
         // a typed-in-but-unconfirmed marker would otherwise block forever.
         if let Some(attempt) = state.nudge_attempts.get(&key).filter(|a| a.hash == hash) {
             match attempt_incarnation(attempt, &candidates) {
-                Incarnation::Same => match reconcile_nudge(state, herdr, &key, &hash)? {
+                Incarnation::Same => match reconcile_nudge(project, state, herdr, &key, &hash, &candidates, &ids, &subjects, now)? {
                     Delivery::Confirmed => {
                         state.nudge_attempts.remove(&key);
                         state.boxes.remove(&key);
@@ -573,6 +563,11 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
                         continue;
                     }
                     Delivery::Waiting => continue,
+                    Delivery::Obsolete => {
+                        state.nudge_attempts.remove(&key);
+                        state.boxes.remove(&key);
+                        continue;
+                    }
                     // The text was dropped: fall through and type it again,
                     // bounded by the attempt record.
                     Delivery::Retype => {}
@@ -633,6 +628,15 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
             text: line.clone(),
             attempts: attempt.attempts + 1,
         };
+        let fresh = fresh_nudge_candidates(project, herdr, &candidates, &key, now)?;
+        if attempt_incarnation(&attempt, &fresh) != Incarnation::Same
+            || crate::coordinator::nudge_target(&fresh, now, &pane.pane_id, &pane.agent_session).is_none_or(|p| p.pane_id != pane.pane_id)
+            || !queue_unchanged(project, &key, &hash, &ids, &subjects)?
+        {
+            state.nudge_attempts.remove(&key);
+            state.boxes.remove(&key);
+            continue;
+        }
         match herdr.agent_prompt_confirmed(&pane.pane_id, &line) {
             Ok(()) => {
                 // herdr itself saw the agent take it.
@@ -666,6 +670,45 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
         }
     }
     Ok(())
+}
+
+/// Re-read only subjects whose delivery locks are held. New queue subjects
+/// wait for the next tick rather than being delivered without their lock.
+fn locked_unseen(project: &Project, key: &str, ids: &BTreeSet<String>, subjects: &BTreeSet<&str>) -> Result<Vec<inbox::Item>> {
+    let current = subjects.iter().map(|id| thread::load(project, id)).collect::<Result<Vec<_>>>()?;
+    // A human's shared read never silences an owner's private queue.
+    let seen = if key == GLOBAL_NUDGE { inbox::seen_union(project) } else { inbox::seen_own(project, key) };
+    Ok(inbox::unhandled(project).into_iter().filter(|item| {
+        ids.contains(&item.id) && !seen.contains(&item.id) && nudge_key(item, &current).as_deref() == Some(key)
+    }).collect())
+}
+
+fn queue_unchanged(project: &Project, key: &str, hash: &str, ids: &BTreeSet<String>, subjects: &BTreeSet<&str>) -> Result<bool> {
+    Ok(hash_ids(&locked_unseen(project, key, ids, subjects)?.into_iter().map(|i| i.id).collect()) == hash)
+}
+
+fn nudge_key(item: &inbox::Item, threads: &[Thread]) -> Option<String> {
+    if thread::validate_id(&item.subject).is_err() {
+        return Some(GLOBAL_NUDGE.to_string());
+    }
+    let current = threads.iter().find(|t| t.id == item.subject)?;
+    if !current.owner.is_empty() {
+        Some(current.owner.clone())
+    } else {
+        (item.event == LEGACY_CHECKOUT_EVENT).then(|| GLOBAL_NUDGE.to_string())
+    }
+}
+
+fn fresh_nudge_candidates(project: &Project, herdr: &Herdr, previous: &[crate::coordinator::LivePane], key: &str, now: jiff::Timestamp) -> Result<Vec<crate::coordinator::LivePane>> {
+    let agents = herdr.agent_list()?;
+    // An idle timer belongs to an incarnation, not a reusable pane id.
+    let previous: Vec<_> = previous.iter().filter(|p| agents.iter().any(|a| {
+        a.pane_id == p.pane_id && a.name == p.name && a.agent == p.agent
+            && a.session_id() == p.agent_session && a.terminal_id == p.terminal_id
+    })).cloned().collect();
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    Ok(crate::coordinator::discover(&project.slug, &dir, &previous, &agents, &now.to_string())
+        .into_iter().filter(|p| key == GLOBAL_NUDGE || p.name == key).collect())
 }
 
 /// Whether the live coordinator is the same incarnation that received an
@@ -705,6 +748,8 @@ enum Delivery {
     /// The box is empty and the line is nowhere on screen: it was dropped,
     /// so typing it again is safe, within the attempt cap.
     Retype,
+    /// The recipient or unseen queue changed while inspecting the screen.
+    Obsolete,
 }
 
 fn squeeze(text: &str) -> String {
@@ -716,7 +761,7 @@ fn squeeze(text: &str) -> String {
 /// a line left in the box gets Enter (never a second copy), a foreign draft
 /// or an unreadable box waits, and an empty box with no line anywhere means
 /// the text was dropped and may be typed again.
-fn reconcile_nudge(state: &State, herdr: &Herdr, key: &str, hash: &str) -> Result<Delivery> {
+fn reconcile_nudge(project: &Project, state: &State, herdr: &Herdr, key: &str, hash: &str, candidates: &[crate::coordinator::LivePane], ids: &BTreeSet<String>, subjects: &BTreeSet<&str>, now: jiff::Timestamp) -> Result<Delivery> {
     let Some(attempt) = state.nudge_attempts.get(key) else {
         return Ok(Delivery::Retype);
     };
@@ -725,6 +770,10 @@ fn reconcile_nudge(state: &State, herdr: &Herdr, key: &str, hash: &str) -> Resul
     if crate::trust_screen::detect(&attempt.kind, &screen).is_some() {
         // Enter there would accept the trust dialog; leave the nudge waiting.
         return Ok(Delivery::Waiting);
+    }
+    let fresh = fresh_nudge_candidates(project, herdr, candidates, key, now)?;
+    if attempt_incarnation(attempt, &fresh) != Incarnation::Same || !queue_unchanged(project, key, hash, ids, subjects)? {
+        return Ok(Delivery::Obsolete);
     }
     let line = squeeze(&attempt.text);
     match crate::prompt_box::check(&attempt.kind, &screen) {
@@ -947,8 +996,8 @@ fn fire_pr_routines(ctx: &Ctx, project: &Project, t: &Thread, url: &str, events:
             continue;
         }
         let prompt = pr_routine_prompt(&r.name, &r.prompt, url, &hit, summary);
-        let (event, outcome) = match threads::prompt(ctx, &project.slug, &t.id, &prompt) {
-            Ok(state) => ("prompted its thread", format!("prompted {} (agent was {state}) about: {}", t.id, hit.join(", "))),
+        let (event, outcome) = match threads::prompt_internal(ctx, &project.slug, &t.id, &prompt, &t.owner) {
+            Ok(()) => ("prompted its thread", format!("prompted {} about: {}", t.id, hit.join(", "))),
             Err(error) => ("could not prompt its thread", format!("could not prompt {} about {}: {error:#}", t.id, hit.join(", "))),
         };
         errors.extend(inbox::write(project, "routine", &r.name, event, &format!("routine `{}` {outcome}", r.name), "").err());
@@ -975,9 +1024,10 @@ pub fn resolve_merged(ctx: &Ctx, project: &Project, state: &mut State, now: jiff
         }
         let head = state.prs.get(&t.id).map(|s| s.head_oid.clone()).unwrap_or_default();
         match resolve_after_copy(ctx, project, &t, "merged", head) {
-            Ok(_) => {
+            Ok(true) => {
                 state.merged_seen.remove(&t.id);
             }
+            Ok(false) => {}
             Err(error) => errors.push(error),
         }
     }
@@ -1018,20 +1068,69 @@ fn other_pr_open(ctx: &Ctx, project: &Project, t: &Thread) -> bool {
 /// thread is not resolved and the next tick tries again. `merged_head` is the
 /// merged pull request's head commit (empty when there is none).
 fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str, merged_head: String) -> Result<bool> {
-    let copied = threads::final_copy(ctx, project, t);
+    let _delivery = threads::prompt_delivery_lock(project, &t.id)?;
+    let current = thread::load(project, &t.id)?;
+    // Eligibility was computed from this exact snapshot. A handoff, new report,
+    // restart or progress update makes it stale; reconsider on the next tick.
+    if current != *t || current.status != Status::Open || current.prompt_pending {
+        return Ok(false);
+    }
+    // A follow-up prompt can make the live worker busy without changing the
+    // record yet. Query it under the delivery lock, not from the tick snapshot.
+    if !worker_may_resolve(ctx, project, &current, reason)? {
+        return Ok(false);
+    }
+    let copied = threads::final_copy(ctx, project, &current);
     if let CopyOutcome::Failed(error) = &copied.outcome {
         anyhow::bail!("{}: not resolved ({reason}) because the final copy failed: {error}", t.id);
     }
+    // The copy may take seconds. Progress/report writers do not use the
+    // delivery lock, and a live agent can resume independently of this CLI.
+    if thread::load(project, &t.id)? != current || !worker_may_resolve(ctx, project, &current, reason)? {
+        return Ok(false);
+    }
+    let mut changed = false;
     let resolved = thread::update(project, &t.id, |t| {
-        t.status = Status::Resolved;
-        t.resolved_reason = reason.to_string();
-        t.prompt_pending = false;
+        if *t == current {
+            t.status = Status::Resolved;
+            t.resolved_reason = reason.to_string();
+            t.prompt_pending = false;
+            changed = true;
+        }
     })?;
+    if !changed {
+        return Ok(false);
+    }
     let complete = copied.outcome == CopyOutcome::Complete;
     let notes = threads::clean(ctx, project, &resolved, &threads::Clean { keep_worktree: false, copy_complete: complete, merged_head });
     let why = if reason == "auto" { "it was idle for `auto_resolve_days` and was resolved automatically; `thread resolve --reopen` undoes it".to_string() } else { format!("resolved ({reason})") };
     inbox::write_thread(project, &resolved, "thread-state", "resolved", &format!("{}: {why}: {}", thread_label(t), notes.join("; ")), "")?;
     Ok(true)
+}
+
+fn worker_may_resolve(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) -> Result<bool> {
+    let Some(session) = project.coordinator().filter(|c| !c.socket.is_empty()) else {
+        return Ok(false); // an unavailable server is not an idle worker
+    };
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner).on_machine(&t.machine);
+    let agents = herdr.agent_list()?;
+    let panes = herdr.pane_list()?;
+    let now = jiff::Timestamp::now();
+    let live = thread::live_with_report(t, &agents, &panes, now, &ctx.root, &session.socket);
+    if live.agent_state.as_deref().is_some_and(|s| !crate::herdr::ready_state(s)) || live.self_working() || live.self_waiting() {
+        return Ok(false);
+    }
+    // For idle retention, a new unread report is work for the owner, not
+    // something the ticker should dispose of. Merge resolution retains its
+    // existing final-report semantics.
+    if reason == "merged" && other_pr_open(ctx, project, t) {
+        return Ok(false);
+    }
+    let mut current = t.clone();
+    if !t.is_remote() && let Some(hash) = thread::local_report_hash(t) {
+        current.report_hash = hash;
+    }
+    Ok(reason != "auto" || thread::classify(&current, &live, now).group == Group::Idle)
 }
 
 /// Step 4. Measured from the later of the last state change, the last report
@@ -1155,6 +1254,263 @@ mod tests {
 
     fn memory() -> Memory {
         Memory { started: jiff::Timestamp::now(), gh: Outage::default(), gh_login: None, outage_secs: DEFAULT_OUTAGE_SECS, tick: 0, machines: BTreeMap::new(), grouping: Default::default() }
+    }
+
+    struct NudgeWorld {
+        world: crate::scenarios::World,
+        project: Project,
+        threads: Vec<Thread>,
+        coordinators: Vec<crate::coordinator::LivePane>,
+        state: State,
+    }
+
+    impl NudgeWorld {
+        fn new() -> Self {
+            use crate::runner::fake::{FakeRunner, ok};
+            let world = crate::scenarios::World::new();
+            let world = crate::scenarios::World { runner: FakeRunner::new(), ..world };
+            let project = world.project("demo", "a.sock");
+            *world.agents.borrow_mut() = format!("[{}]", crate::scenarios::agent_json("w1", "w1:t1", "w1:p1", &project.canonical_dir().to_string_lossy(), "hpc-demo", "idle"));
+            let agents = world.agents.clone();
+            world.runner.on_fn(|c| c.display().contains("agent list"), move |_| Ok(ok(&format!(r#"{{"result":{{"agents":{}}}}}"#, agents.borrow()))));
+            let herdr = Herdr::new("herdr", project.coordinator().unwrap().socket, &world.runner);
+            let coordinators = fresh_nudge_candidates(&project, &herdr, &[], "hpc-demo", at("2026-01-01T00:00:00Z")).unwrap();
+            let threads = (0..2).map(|_| {
+                let t = thread::allocate(&project, |t| {
+                    t.status = Status::Open;
+                    t.owner = "hpc-demo".into();
+                    t.title = "Task".into();
+                }).unwrap();
+                inbox::write_thread(&project, &t, "report", "new report", "data", "").unwrap();
+                t
+            }).collect();
+            let mut state = State::default();
+            state.boxes.insert("hpc-demo".into(), BoxWait { pane: "w1:p1".into(), since: "2026-01-01T00:00:00Z".into() });
+            Self { world, project, threads, coordinators, state }
+        }
+
+        fn run(&mut self) {
+            let herdr = Herdr::new("herdr", self.project.coordinator().unwrap().socket, &self.world.runner);
+            let settings = Settings { nudge: true, ..Settings::default() };
+            nudge(&self.project, &mut self.state, &settings, &herdr, &self.coordinators, "w1:p1", jiff::Timestamp::now()).unwrap();
+        }
+
+        fn attempt(&mut self) -> String {
+            let items = inbox::unhandled(&self.project);
+            let text = nudge_text(&items);
+            self.state.nudge_attempts.insert("hpc-demo".into(), NudgeAttempt {
+                hash: hash_ids(&items.into_iter().map(|i| i.id).collect()),
+                pane: "w1:p1".into(), kind: "claude".into(), text: text.clone(), attempts: 1,
+                ..NudgeAttempt::default()
+            });
+            text
+        }
+    }
+
+    fn assert_delivery_locks(project: &Project, ids: &[String]) {
+        for id in ids {
+            let file = std::fs::File::options().write(true).open(project.state_dir().join(format!("{id}.prompt-delivery.lock"))).unwrap();
+            assert!(file.try_lock().is_err(), "{id} must stay locked through the external send");
+        }
+        let file = std::fs::File::options().write(true).open(project.state_dir().join("lock")).unwrap();
+        assert!(file.try_lock().is_ok(), "the project lock must not span an external command");
+    }
+
+    #[test]
+    fn nudge_locks_every_subject_through_the_prompt_without_a_global_lock() {
+        use crate::runner::fake::ok;
+        let mut f = NudgeWorld::new();
+        let project = f.project.clone();
+        let ids: Vec<_> = f.threads.iter().map(|t| t.id.clone()).collect();
+        f.world.runner.on("agent read", ok(&crate::scenarios::claude_screen(None)));
+        f.world.runner.on_fn(|c| c.display().contains("agent prompt"), move |_| {
+            assert_delivery_locks(&project, &ids);
+            Ok(ok(r#"{"result":{}}"#))
+        });
+        f.run();
+        assert_eq!(f.world.runner.count("agent prompt"), 1);
+        assert!(f.state.nudged.contains_key("hpc-demo"));
+        assert!(inbox::seen_own(&f.project, "hpc-demo").is_empty());
+    }
+
+    #[test]
+    fn nudge_reconciliation_holds_the_same_subject_locks_through_enter() {
+        use crate::runner::fake::ok;
+        let mut f = NudgeWorld::new();
+        let text = f.attempt();
+        let project = f.project.clone();
+        let ids: Vec<_> = f.threads.iter().map(|t| t.id.clone()).collect();
+        f.world.runner.on("agent read", ok(&crate::scenarios::claude_screen(Some(&text))));
+        f.world.runner.on_fn(|c| c.display().contains("agent send-keys"), move |_| {
+            assert_delivery_locks(&project, &ids);
+            Ok(ok(r#"{"result":{}}"#))
+        });
+        f.run();
+        assert_eq!(f.world.runner.count("agent send-keys"), 1);
+        assert_eq!(f.world.runner.count("agent prompt"), 0);
+        assert!(!f.state.nudged.contains_key("hpc-demo"));
+    }
+
+    #[test]
+    fn a_handoff_between_queue_snapshot_and_lock_invalidates_the_old_attempt() {
+        use crate::runner::fake::ok;
+        let mut f = NudgeWorld::new();
+        let text = f.attempt();
+        let queues = [("hpc-demo".to_string(), inbox::unhandled(&f.project))].into();
+        thread::update(&f.project, &f.threads[0].id, |t| t.owner = "hpc-demo-1".into()).unwrap();
+        f.world.runner.on("agent read", ok(&crate::scenarios::claude_screen(Some(&text))));
+        let herdr = Herdr::new("herdr", f.project.coordinator().unwrap().socket, &f.world.runner);
+        nudge_queues(&f.project, &mut f.state, &Settings { nudge: true, ..Settings::default() }, &herdr, &f.coordinators, "w1:p1", jiff::Timestamp::now(), queues).unwrap();
+        assert!(f.state.nudge_attempts.is_empty(), "the old combined payload must never receive Enter");
+        assert_eq!(f.world.runner.count("agent send-keys"), 0);
+        assert_eq!(f.world.runner.count("agent prompt"), 0);
+        assert!(f.state.nudged.is_empty());
+        assert_eq!(inbox::unhandled(&f.project).len(), 2);
+    }
+
+    #[test]
+    fn nudge_rechecks_seen_items_after_reading_the_screen() {
+        use crate::runner::fake::ok;
+        for reconcile in [false, true] {
+            let mut f = NudgeWorld::new();
+            let text = reconcile.then(|| f.attempt());
+            let project = f.project.clone();
+            f.world.runner.on_fn(|c| c.display().contains("agent read"), move |_| {
+                let ids = inbox::unhandled(&project).into_iter().map(|i| i.id).collect::<Vec<_>>();
+                inbox::mark_seen(&project, Some("hpc-demo"), &ids).unwrap();
+                Ok(ok(&crate::scenarios::claude_screen(text.as_deref())))
+            });
+            f.run();
+            assert_eq!(f.world.runner.count("agent prompt"), 0);
+            assert_eq!(f.world.runner.count("agent send-keys"), 0);
+            assert!(f.state.nudge_attempts.is_empty());
+            assert!(f.state.nudged.is_empty());
+        }
+    }
+
+    #[test]
+    fn nudge_rechecks_the_target_incarnation_after_reading_the_screen() {
+        use crate::runner::fake::ok;
+        for reconcile in [false, true] {
+            let mut f = NudgeWorld::new();
+            let text = reconcile.then(|| f.attempt());
+            let agents = f.world.agents.clone();
+            f.world.runner.on_fn(|c| c.display().contains("agent read"), move |_| {
+                *agents.borrow_mut() = "[]".into();
+                Ok(ok(&crate::scenarios::claude_screen(text.as_deref())))
+            });
+            f.run();
+            assert_eq!(f.world.runner.count("agent prompt"), 0);
+            assert_eq!(f.world.runner.count("agent send-keys"), 0);
+            assert!(f.state.nudge_attempts.is_empty());
+            assert!(f.state.nudged.is_empty());
+        }
+    }
+
+    #[test]
+    fn new_unlocked_queue_subjects_are_deferred_and_not_marked_delivered() {
+        use crate::runner::fake::ok;
+        let mut f = NudgeWorld::new();
+        let queues = [("hpc-demo".to_string(), inbox::unhandled(&f.project))].into();
+        let later = thread::allocate(&f.project, |t| { t.owner = "hpc-demo".into(); t.status = Status::Open; }).unwrap();
+        inbox::write_thread(&f.project, &later, "report", "new report", "later", "").unwrap();
+        f.world.runner.on("agent read", ok(&crate::scenarios::claude_screen(None)));
+        f.world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", f.project.coordinator().unwrap().socket, &f.world.runner);
+        nudge_queues(&f.project, &mut f.state, &Settings { nudge: true, ..Settings::default() }, &herdr, &f.coordinators, "w1:p1", jiff::Timestamp::now(), queues).unwrap();
+        let calls = f.world.runner.calls.borrow();
+        let sent = calls.iter().find(|c| c.display().contains("agent prompt")).unwrap().display();
+        assert!(sent.contains("t-0001") && sent.contains("t-0002"));
+        assert!(!sent.contains(&later.id));
+        let all_hash = hash_ids(&inbox::unhandled(&f.project).into_iter().map(|i| i.id).collect());
+        assert_ne!(f.state.nudged.get("hpc-demo"), Some(&all_hash));
+        assert!(inbox::seen_own(&f.project, "hpc-demo").is_empty());
+    }
+
+    #[test]
+    fn automatic_resolution_rechecks_the_record_before_any_external_effect() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let t = world.thread(&project, world.home.path(), |_| {});
+        thread::update(&project, &t.id, |t| t.owner = "hpc-demo-1".into()).unwrap();
+        assert!(!resolve_after_copy(&world.ctx(), &project, &t, "merged", String::new()).unwrap());
+        assert_eq!(world.runner.count("agent list"), 0);
+        assert_eq!(thread::load(&project, &t.id).unwrap().status, Status::Open);
+    }
+
+    #[test]
+    fn automatic_resolution_reads_fresh_busy_worker_under_the_control_lock() {
+        use crate::runner::fake::{FakeRunner, ok};
+        for machine in ["", "remote"] {
+            let world = crate::scenarios::World::new();
+            let world = crate::scenarios::World { runner: FakeRunner::new(), ..world };
+            let project = world.project("demo", "a.sock");
+            let t = world.thread(&project, world.home.path(), |t| {
+                t.last_state = "done".into(); t.last_group = "ready-for-review".into();
+                t.pr_state = "MERGED".into(); t.percent = Some(100); t.machine = machine.into();
+            });
+            let locked_project = project.clone();
+            let id = t.id.clone();
+            let agent = crate::scenarios::agent_json("w2", "w2:t1", "w2:p1", &t.cwd, &t.agent_name, "working");
+            world.runner.on_fn(|c| c.display().contains("agent list"), move |_| {
+                assert_delivery_locks(&locked_project, std::slice::from_ref(&id));
+                Ok(ok(&format!(r#"{{"result":{{"agents":[{agent}]}}}}"#)))
+            });
+            world.runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
+            assert!(!resolve_after_copy(&world.ctx(), &project, &t, "merged", String::new()).unwrap());
+            assert_eq!(thread::load(&project, &t.id).unwrap(), t);
+            assert_eq!(world.runner.count("rsync"), 0);
+            assert_eq!(world.runner.count("worktree remove"), 0);
+            if !machine.is_empty() {
+                assert!(world.runner.calls.borrow().iter().filter(|c| c.display().contains("agent list")).all(|c| c.display().contains("--machine remote")));
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_resolution_rechecks_a_worker_that_resumes_during_the_copy() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let world = crate::scenarios::World::new();
+        let world = crate::scenarios::World { runner: FakeRunner::new(), ..world };
+        let project = world.project("demo", "a.sock");
+        let t = world.thread(&project, world.home.path(), |_| {});
+        let count = std::cell::Cell::new(0);
+        let cwd = t.cwd.clone();
+        let name = t.agent_name.clone();
+        world.runner.on_fn(|c| c.display().contains("agent list"), move |_| {
+            count.set(count.get() + 1);
+            let state = if count.get() == 1 { "done" } else { "working" };
+            let agent = crate::scenarios::agent_json("w2", "w2:t1", "w2:p1", &cwd, &name, state);
+            Ok(ok(&format!(r#"{{"result":{{"agents":[{agent}]}}}}"#)))
+        });
+        world.runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
+        assert!(!resolve_after_copy(&world.ctx(), &project, &t, "merged", String::new()).unwrap());
+        assert_eq!(world.runner.count("agent list"), 2);
+        assert_eq!(thread::load(&project, &t.id).unwrap().status, Status::Open);
+        assert_eq!(world.runner.count("worktree remove"), 0);
+    }
+
+    #[test]
+    fn internal_routine_prompt_keeps_ownerless_automation_without_caller_privilege() {
+        use crate::runner::fake::ok;
+        for owner in ["", "hpc-demo"] {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            let t = world.thread(&project, world.home.path(), |t| t.owner = owner.into());
+            *world.agents.borrow_mut() = format!("[{}]", crate::scenarios::agent_json("w2", "w2:t1", "w2:p1", &t.cwd, &t.agent_name, "idle"));
+            let locked_project = project.clone();
+            let id = t.id.clone();
+            world.runner.on_fn(|c| c.display().contains("agent prompt"), move |_| {
+                assert_delivery_locks(&locked_project, std::slice::from_ref(&id));
+                Ok(ok(r#"{"result":{}}"#))
+            });
+            threads::prompt_internal(&world.ctx(), &project.slug, &t.id, "routine follow-up", owner).unwrap();
+            assert_eq!(world.runner.count("agent prompt"), 1);
+            assert_eq!(world.runner.count("process-info"), 0, "automation must not ask whether its daemon is Human");
+            thread::update(&project, &t.id, |t| t.owner = "hpc-demo-1".into()).unwrap();
+            assert!(threads::prompt_internal(&world.ctx(), &project.slug, &t.id, "stale follow-up", owner).is_err());
+            assert_eq!(world.runner.count("agent prompt"), 1);
+        }
     }
 
     #[test]

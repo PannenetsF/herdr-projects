@@ -127,7 +127,11 @@ pub fn find(ctx: &Ctx, project: &Project) -> Vec<Orphan> {
             && !t.pane_id.is_empty()
             && thread::live_state(t, &view.agents, &view.panes, now).pane_exists
         {
-            orphans.push(Orphan::Tab { id: t.id.clone(), tab: t.tab_id.clone() });
+            let tab = view.panes.iter().find(|p| thread::pane_matches(t, p)).map(|p| p.tab_id.clone())
+                .or_else(|| view.agents.iter().find(|a| thread::agent_matches(t, a)).map(|a| a.tab_id.clone()));
+            if let Some(tab) = tab.filter(|tab| !tab.is_empty()) {
+                orphans.push(Orphan::Tab { id: t.id.clone(), tab });
+            }
         }
         if t.kind == Kind::Worktree
             && threads::worktree_gone(t)
@@ -155,7 +159,53 @@ pub fn find(ctx: &Ctx, project: &Project) -> Vec<Orphan> {
     orphans
 }
 
-fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan) -> Result<()> {
+fn related_threads(project: &Project, orphan: &Orphan) -> Vec<String> {
+    let mut ids: Vec<_> = match orphan {
+        Orphan::Tab { id, .. } | Orphan::Workspace { id, .. } | Orphan::Folder { id, .. } => vec![id.clone()],
+        Orphan::Worktree { repo, path, branch, thread: owner, .. } => {
+            let mut ids: Vec<_> = thread::list(project).into_iter()
+                .filter(|t| t.worktree_path == *path || (t.repo == *repo && t.branch == *branch))
+                .map(|t| t.id).collect();
+            ids.extend(owner.iter().cloned());
+            ids
+        }
+        Orphan::Branch { repo, branch } => thread::list(project).into_iter()
+            .filter(|t| t.repo == *repo && t.branch == *branch).map(|t| t.id).collect(),
+        // A shared Space can hold several threads; block reopen on all of its
+        // project's existing records while rechecking whether it is empty.
+        Orphan::Space(_) => thread::list(project).into_iter().map(|t| t.id).collect(),
+        Orphan::DoneItems { .. } => Vec::new(),
+    };
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn authorize(caller: &crate::coordinator::Caller, records: &[Thread], shared: bool) -> Result<()> {
+    match caller {
+        crate::coordinator::Caller::Human => Ok(()),
+        crate::coordinator::Caller::Coordinator { name, .. } if !shared && !records.is_empty()
+            && records.iter().all(|t| !t.owner.is_empty() && t.owner == *name) => Ok(()),
+        _ => bail!("sweep requires the current owner of every affected thread; shared or unassigned resources require a terminal outside Herdr"),
+    }
+}
+
+fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan, caller: &crate::coordinator::Caller) -> Result<()> {
+    let ids = related_threads(project, orphan);
+    let _locks = ids.iter().map(|id| threads::prompt_delivery_lock(project, id)).collect::<Result<Vec<_>>>()?;
+    let records = ids.iter().map(|id| thread::load(project, id)).collect::<Result<Vec<_>>>()?;
+    let shared = matches!(orphan, Orphan::Space(_) | Orphan::DoneItems { .. }) || records.is_empty();
+    authorize(caller, &records, shared)?;
+    if !matches!(orphan, Orphan::Space(_) | Orphan::DoneItems { .. })
+        && records.iter().any(|t| t.status != Status::Resolved)
+    {
+        bail!("a thread was reopened; not removing its resources");
+    }
+    // Discovery and human confirmation happen before the locks. Recheck the
+    // exact resource (including pane/workspace/PR evidence), not just its id.
+    if related_threads(project, orphan) != ids || !find(ctx, project).contains(orphan) {
+        bail!("cleanup candidate changed; not removing stale resources");
+    }
     match orphan {
         Orphan::Worktree { repo, path, workspace, thread: owner, .. } => {
             if let Some(id) = owner {
@@ -165,7 +215,13 @@ fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan) -> Result<()> {
                     bail!("not everything in it could be copied home first");
                 }
             }
+            if !find(ctx, project).contains(orphan) {
+                bail!("worktree changed while its final files were copied");
+            }
             if let (Some(workspace), Some(view)) = (workspace, threads::session_view(ctx, project)) {
+                if !view.panes.iter().any(|p| p.workspace_id == *workspace && p.cwd == *path) {
+                    bail!("worktree workspace changed; not removing it");
+                }
                 return view.herdr.worktree_remove(workspace).map_err(|e| anyhow::anyhow!("{e}"));
             }
             git(ctx, repo, &["worktree", "remove", path]).ok_or_else(|| anyhow::anyhow!("git refused to remove {path} (uncommitted changes?)"))?;
@@ -173,12 +229,22 @@ fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan) -> Result<()> {
             Ok(())
         }
         Orphan::Branch { repo, branch } => git(ctx, repo, &["branch", "-D", branch]).map(|_| ()).ok_or_else(|| anyhow::anyhow!("git refused to delete {branch}")),
-        Orphan::Tab { tab, .. } => {
+        Orphan::Tab { id, tab } => {
+            let t = thread::load(project, id)?;
             let view = threads::session_view(ctx, project).ok_or_else(|| anyhow::anyhow!("the session is not reachable"))?;
+            let matching = view.panes.iter().any(|p| thread::pane_matches(&t, p) && p.tab_id == *tab)
+                || view.agents.iter().any(|a| thread::agent_matches(&t, a) && a.tab_id == *tab);
+            if !matching {
+                bail!("thread tab changed; not closing it");
+            }
             view.herdr.call(&["tab", "close", tab], crate::herdr::CALL_TIMEOUT).map(|_| ()).map_err(|e| anyhow::anyhow!("{e}"))
         }
         Orphan::Workspace { id, workspace } => {
+            let t = thread::load(project, id)?;
             let view = threads::session_view(ctx, project).ok_or_else(|| anyhow::anyhow!("the session is not reachable"))?;
+            if !threads::worktree_gone(&t) || threads::own_workspace(&t, &view.panes).as_ref() != Some(workspace) {
+                bail!("thread workspace changed; not closing it");
+            }
             view.herdr.call(&["workspace", "close", workspace], crate::herdr::CALL_TIMEOUT).map_err(|e| anyhow::anyhow!("{e}"))?;
             thread::update(project, id, |t| t.worktree_path.clear())?;
             Ok(())
@@ -198,6 +264,10 @@ fn remove(ctx: &Ctx, project: &Project, orphan: &Orphan) -> Result<()> {
 /// `sweep <slug> [--dry-run] [--yes]`.
 pub fn run(ctx: &Ctx, slug: &str, dry_run: bool, yes: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
+    let caller = if dry_run { None } else { Some(crate::coordinator::caller(ctx, &project)) };
+    if caller.as_ref().is_some_and(|caller| !matches!(caller, crate::coordinator::Caller::Human | crate::coordinator::Caller::Coordinator { .. })) {
+        bail!("sweep requires a verified coordinator or a terminal outside Herdr");
+    }
     let orphans = find(ctx, &project);
     if orphans.is_empty() {
         println!("nothing to clean in `{slug}`");
@@ -225,7 +295,7 @@ pub fn run(ctx: &Ctx, slug: &str, dry_run: bool, yes: bool) -> Result<()> {
     }
     let mut failed = 0;
     for orphan in &orphans {
-        match remove(ctx, &project, orphan) {
+        match remove(ctx, &project, orphan, caller.as_ref().expect("mutating sweep has a caller")) {
             Ok(()) => println!("removed: {}", orphan.describe()),
             Err(error) => {
                 failed += 1;
@@ -240,6 +310,111 @@ pub fn run(ctx: &Ctx, slug: &str, dry_run: bool, yes: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved_tab(world: &crate::scenarios::World, project: &Project) -> Orphan {
+        let t = world.thread(project, &world.home.path().join("tab"), |t| {
+            t.status = Status::Resolved;
+            t.kind = Kind::Tab;
+        });
+        *world.panes.borrow_mut() = format!("[{}]", crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", &t.cwd));
+        Orphan::Tab { id: t.id, tab: t.tab_id }
+    }
+
+    fn owner(name: &str) -> crate::coordinator::Caller {
+        crate::coordinator::Caller::Coordinator { name: name.into(), pane: "w1:p1".into() }
+    }
+
+    #[test]
+    fn cleanup_refuses_foreign_unassigned_and_unverified_callers() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let orphan = resolved_tab(&world, &project);
+        for caller in [owner("hpc-demo-1"), crate::coordinator::Caller::Unverified { pane: String::new() }] {
+            assert!(remove(&world.ctx(), &project, &orphan, &caller).is_err());
+        }
+        thread::update(&project, "t-0001", |t| t.owner.clear()).unwrap();
+        assert!(remove(&world.ctx(), &project, &orphan, &owner("hpc-demo")).is_err());
+        assert_eq!(world.runner.count("tab close"), 0);
+        assert!(authorize(&owner("hpc-demo"), &[], true).is_err());
+        assert!(authorize(&crate::coordinator::Caller::Human, &[], true).is_ok());
+    }
+
+    #[test]
+    fn cleanup_rechecks_reopen_and_pane_replacement() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let orphan = resolved_tab(&world, &project);
+        assert!(find(&world.ctx(), &project).contains(&orphan));
+        thread::update(&project, "t-0001", |t| t.status = Status::Open).unwrap();
+        assert!(remove(&world.ctx(), &project, &orphan, &owner("hpc-demo")).is_err());
+        thread::update(&project, "t-0001", |t| t.status = Status::Resolved).unwrap();
+        *world.panes.borrow_mut() = format!("[{}]", crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", "/replacement"));
+        assert!(remove(&world.ctx(), &project, &orphan, &owner("hpc-demo")).is_err());
+        assert_eq!(world.runner.count("tab close"), 0);
+    }
+
+    #[test]
+    fn cleanup_holds_thread_lock_not_project_lock_through_close() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let orphan = resolved_tab(&world, &project);
+        let state = project.state_dir();
+        world.runner.on_fn(|cmd| cmd.display().contains("tab close"), move |_| {
+            let lock = std::fs::File::options().write(true).open(state.join("t-0001.prompt-delivery.lock")).unwrap();
+            assert!(lock.try_lock().is_err());
+            let global = std::fs::File::options().write(true).open(state.join("lock")).unwrap();
+            assert!(global.try_lock().is_ok());
+            Ok(crate::runner::fake::ok(r#"{"result":{}}"#))
+        });
+        remove(&world.ctx(), &project, &orphan, &owner("hpc-demo")).unwrap();
+        remove(&world.ctx(), &project, &orphan, &crate::coordinator::Caller::Human).unwrap();
+        assert_eq!(world.runner.count("tab close"), 2);
+    }
+
+    #[test]
+    fn waiting_cleanup_rechecks_handoff_and_reopen_after_lock_acquisition() {
+        use std::sync::mpsc;
+        for reopen in [true, false] {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            let orphan = resolved_tab(&world, &project);
+            let held = threads::prompt_delivery_lock(&project, "t-0001").unwrap();
+            let root = world.root.clone();
+            let home = world.home.path().to_path_buf();
+            let (arrived_tx, arrived_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let project = Project::load(&root, "demo").unwrap();
+                let env = crate::paths::Env::for_test(&home, &[]);
+                let runner = crate::runner::fake::FakeRunner::new();
+                let ctx = Ctx { env: &env, root, config_dir: home.join("cfg"), runner: &runner, detached_ticker: false };
+                arrived_tx.send(()).unwrap();
+                let result = remove(&ctx, &project, &orphan, &owner("hpc-demo"));
+                done_tx.send((result.map_err(|e| e.to_string()), runner.calls.borrow().len())).unwrap();
+            });
+            arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+            thread::update(&project, "t-0001", |t| {
+                if reopen { t.status = Status::Open; } else { t.owner = "hpc-demo-1".into(); }
+            }).unwrap();
+            drop(held);
+            let (result, effects) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(result.is_err());
+            assert_eq!(effects, 0);
+            waiter.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn mutating_sweep_denies_unknown_identity_but_dry_run_stays_read_only() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        resolved_tab(&world, &project);
+        world.ps_table.borrow_mut().clear();
+        assert!(run(&world.ctx(), "demo", false, true).is_err());
+        run(&world.ctx(), "demo", true, false).unwrap();
+        assert_eq!(world.runner.count("tab close"), 0);
+    }
 
     #[test]
     fn porcelain_worktrees_are_parsed() {

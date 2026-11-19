@@ -95,6 +95,12 @@ enum Command {
         /// Print without recording the inbox items as seen
         #[arg(long)]
         peek: bool,
+        /// Also inspect legacy/shared root documents (data, not authorization)
+        #[arg(long)]
+        include_shared: bool,
+        /// Inspect this coordinator's scope; only from a real human terminal
+        #[arg(long, value_name = "NAME")]
+        coordinator: Option<String>,
     },
     /// Who TASKS.md tasks may be assigned to: this project's thread profiles, and other machines with their profiles
     Assignable {
@@ -303,6 +309,21 @@ enum Command {
 
 #[derive(Subcommand)]
 enum InboxCommand {
+    /// Read a page of eligible items without marking them seen
+    List {
+        slug: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long)]
+        include_unassigned: bool,
+    },
+    /// Read one eligible item's details without marking it seen
+    Show {
+        slug: String,
+        id: String,
+        #[arg(long)]
+        include_unassigned: bool,
+    },
     /// Move handled items to inbox/done/
     Done {
         slug: String,
@@ -358,6 +379,9 @@ enum ThreadCommand {
         /// Delegating this TASKS.md task (its title as written there): its notes are added to the task, and its owner gives --profile and --machine
         #[arg(long, value_name = "TITLE")]
         from_task: Option<String>,
+        /// Task source: your registered name (default), or explicit shared; humans may select another coordinator
+        #[arg(long, value_name = "NAME|shared", requires = "from_task")]
+        task_source: Option<String>,
     },
     /// Bring back a thread whose pane is gone or whose start failed
     Restart {
@@ -747,12 +771,17 @@ pub fn run() -> Result<()> {
                 coordinator::prompt(&ctx, &slug, &text)
             }
         },
-        Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),
+        Command::Context { slug, peek, include_shared, coordinator } => {
+            if !include_shared && coordinator.is_none() { coordinator::context(&ctx, &slug, peek) }
+            else { coordinator::context_selected(&ctx, &slug, peek, include_shared, coordinator.as_deref()) }
+        }
         Command::Assignable { slug, refresh, check } => crate::assign::run(&ctx, &slug, refresh, check.as_deref()),
         Command::Overview { slug, wait } => overview::run(&ctx, slug.as_deref(), wait),
         Command::Focus { slug } => overview::focus(&ctx, slug.as_deref()),
         Command::Unfocus { session } => overview::unfocus(&ctx, &session.into()),
         Command::Inbox { command } => match command {
+            InboxCommand::List { slug, offset, include_unassigned } => coordinator::inspect_inbox(&ctx, &slug, None, offset, include_unassigned),
+            InboxCommand::Show { slug, id, include_unassigned } => coordinator::inspect_inbox(&ctx, &slug, Some(&id), 0, include_unassigned),
             InboxCommand::Done { slug, ids, all } => {
                 let moved = coordinator::inbox_done(&ctx, &slug, &ids, all)?;
                 println!("{moved} item(s) moved to inbox/done");
@@ -760,22 +789,10 @@ pub fn run() -> Result<()> {
             }
         },
         Command::Thread { command } => match command {
-            ThreadCommand::Start { slug, title, repo, mut machine, mut profile, kind, base, task_file, from_task } => {
-                let mut task = read_text(&task_file)?;
-                if let Some(from) = from_task {
-                    // The task's owner picks the profile and machine.
-                    let project = Project::load(&ctx.root, &slug)?;
-                    let tasks_md = crate::tasks::read(&project.dir());
-                    let found = crate::tasks::find(&tasks_md, &from)?;
-                    let config = crate::profiles::load(&ctx.config_dir)?;
-                    if found.owner.is_person(|p| config.get(p).is_some()) {
-                        bail!("\"{}\" belongs to {}, a person; people's tasks are never delegated. Change its owner in TASKS.md first if the user asks", found.title, found.owner);
-                    }
-                    (profile, machine) = crate::tasks::launch_for(&found, profile, machine)?;
-                    task = crate::tasks::delegated(&tasks_md, &from, &task)?;
-                }
+            ThreadCommand::Start { slug, title, repo, machine, profile, kind, base, task_file, from_task, task_source } => {
+                let task = read_text(&task_file)?;
                 let kind = kind.as_deref().map(crate::thread::Kind::parse).transpose()?;
-                let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, profile, kind, base, task })?;
+                let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, profile, kind, base, task, from_task, task_source })?;
                 println!("{}", serde_json::json!({ "id": thread.id, "kind": thread.kind, "profile": thread.profile, "agent": thread.agent, "branch": thread.branch, "pane_id": thread.pane_id }));
                 Ok(())
             }

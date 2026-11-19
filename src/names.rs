@@ -31,7 +31,7 @@ pub fn is_coordinator_name(slug: &str, name: &str) -> bool {
         return true;
     }
     let prefix = format!("hpc-{}-", head(slug, 22));
-    name.strip_prefix(&prefix).is_some_and(|suffix| suffix.parse::<u32>().is_ok_and(|n| n >= 1))
+    is_valid(name) && name.strip_prefix(&prefix).is_some_and(|suffix| suffix.parse::<u32>().is_ok_and(|n| n >= 1 && coordinator(slug, n) == name))
 }
 
 /// `hp-<slug truncated to 21>-<id>` (`t-0009` is 6 characters).
