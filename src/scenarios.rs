@@ -4685,7 +4685,9 @@ fn assigning_a_thread_back_to_its_recorded_owner_is_idempotent_without_liveness(
     })
     .unwrap();
     let ctx_b = Ctx { env: &env_b, ..world.ctx() };
-    threads::assign(&ctx_b, "demo", &t.id, "hpc-demo").unwrap(); // no "not live" error
+    assert!(threads::assign(&ctx_b, "demo", &t.id, "hpc-demo").is_err(), "a foreign coordinator cannot impersonate an offline owner, even for a no-op");
+    assert!(threads::assign(&ctx_b, "demo", &t.id, "hpc-demo-1").is_err(), "an offline owner is not an unassigned thread");
+    threads::assign(&world.ctx(), "demo", &t.id, "hpc-demo").unwrap(); // human rescue stays idempotent without liveness
     assert_eq!(thread::load(&project, &t.id).unwrap().owner, "hpc-demo");
 }
 
@@ -5475,6 +5477,154 @@ fn a_pending_rename_closes_a_busy_agent_after_the_wait_and_reports_a_failure() {
     assert!(log.contains("stopped") && log.contains(&t.id), "{log}");
     assert!(!path.exists() && project.dir().is_dir());
     assert!(crate::inbox::unhandled(&project).iter().any(|i| i.event == "rename failed"));
+}
+
+fn worker_report_world(owner_state: &str) -> (World, Project, Thread, Env) {
+    let world = World::new();
+    let project = world.project("demo", "herdr.sock");
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let t = world.thread(&project, Path::new("/wt/worker"), |t| t.owner = "hpc-demo-1".into());
+    *world.agents.borrow_mut() = format!("[{},{},{}]",
+        agent_json("w1", "w1:t1", "w1:p1", &dir, "hpc-demo", "idle"),
+        agent_json("w3", "w3:t1", "w3:p1", &dir, "hpc-demo-1", owner_state),
+        agent_json("w2", "w2:t1", "w2:p1", &t.cwd, &t.agent_name, "working"));
+    world.script_inside_herdr(&[&project.coordinator().unwrap().socket]);
+    world.procinfo_proves("w2:p1", 200, 9000, 500);
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let env = live_pane_env(&world, "w2:p1");
+    (world, project, t, env)
+}
+
+#[test]
+fn worker_report_reaches_its_owner_not_the_primary_and_keeps_source_identity() {
+    let (world, _project, t, env) = worker_report_world("working");
+    let ctx = Ctx { env: &env, ..world.ctx() };
+    coordinator::prompt(&ctx, "demo", "PREPARING: storage blocked").unwrap();
+    assert_eq!(world.runner.count("agent prompt w3:p1"), 1);
+    assert_eq!(world.runner.count("agent prompt w1:p1"), 0);
+    let calls = world.runner.calls.borrow();
+    let text = prompt_text(calls.iter().find(|c| c.display().contains("agent prompt")).unwrap());
+    assert!(text.starts_with("[herdr-projects agent message]\n"));
+    assert!(text.contains(&format!("\"thread\":\"{}\"", t.id)));
+    assert!(text.contains("\"owner\":\"hpc-demo-1\""));
+    assert!(text.contains(&t.agent_name));
+    assert!(text.contains("not a new human request or authorization"));
+    assert!(text.ends_with("PREPARING: storage blocked"));
+}
+
+#[test]
+fn worker_report_never_falls_back_when_owner_is_unavailable_or_unassigned() {
+    for state in ["blocked", "unknown", "missing", "unassigned", "duplicate", "foreign-directory"] {
+        let (world, project, t, env) = worker_report_world(state);
+        let mut agents: Vec<serde_json::Value> = serde_json::from_str(&world.agents.borrow()).unwrap();
+        match state {
+            "missing" => { agents.remove(1); }
+            "unassigned" => { thread::update(&project, &t.id, |t| t.owner.clear()).unwrap(); }
+            "duplicate" => { agents[1]["agent_status"] = "idle".into(); agents.push(agents[1].clone()); }
+            "foreign-directory" => { agents[1]["agent_status"] = "idle".into(); agents[1]["cwd"] = "/another-project".into(); }
+            _ => {}
+        }
+        *world.agents.borrow_mut() = serde_json::to_string(&agents).unwrap();
+        let ctx = Ctx { env: &env, ..world.ctx() };
+        assert!(coordinator::prompt(&ctx, "demo", "status").is_err(), "{state}");
+        assert_eq!(world.runner.count("agent prompt"), 0, "{state}");
+    }
+}
+
+#[test]
+fn adopted_worker_report_requires_its_recorded_name_and_kind() {
+    for name in ["custom-worker", ""] {
+        let (world, project, t, env) = worker_report_world("idle");
+        thread::update(&project, &t.id, |t| { t.kind = Kind::Adopted; t.agent_name = name.into(); }).unwrap();
+        let mut agents: Vec<serde_json::Value> = serde_json::from_str(&world.agents.borrow()).unwrap();
+        agents[2]["name"] = name.into();
+        *world.agents.borrow_mut() = serde_json::to_string(&agents).unwrap();
+        let ctx = Ctx { env: &env, ..world.ctx() };
+        coordinator::prompt(&ctx, "demo", "adopted worker status").unwrap();
+        assert_eq!(world.runner.count("agent prompt w3:p1"), 1);
+        agents[2]["agent"] = "codex".into();
+        *world.agents.borrow_mut() = serde_json::to_string(&agents).unwrap();
+        assert!(coordinator::prompt(&ctx, "demo", "replacement process").is_err());
+        assert_eq!(world.runner.count("agent prompt"), 1, "a different harness in the pane is not the adopted worker");
+    }
+}
+
+#[test]
+fn worker_report_rejects_foreign_unnamed_or_reused_panes() {
+    for change in ["name", "cwd", "tab", "unregistered", "resolved"] {
+        let (world, project, t, env) = worker_report_world("idle");
+        let mut agents: Vec<serde_json::Value> = serde_json::from_str(&world.agents.borrow()).unwrap();
+        match change {
+            "name" => agents[2]["name"] = "hp-other-t-0001".into(),
+            "cwd" => agents[2]["cwd"] = "/other-task".into(),
+            "tab" => agents[2]["tab_id"] = "w2:t9".into(),
+            "unregistered" => agents[2]["name"] = "".into(),
+            "resolved" => { thread::update(&project, &t.id, |t| t.status = Status::Resolved).unwrap(); }
+            _ => unreachable!(),
+        }
+        *world.agents.borrow_mut() = serde_json::to_string(&agents).unwrap();
+        let ctx = Ctx { env: &env, ..world.ctx() };
+        assert!(coordinator::prompt(&ctx, "demo", "status").is_err(), "{change}");
+        assert_eq!(world.runner.count("agent prompt"), 0, "{change}");
+    }
+}
+
+#[test]
+fn worker_report_uses_current_owner_after_a_human_handoff() {
+    let (world, _project, t, env) = worker_report_world("idle");
+    let ctx = Ctx { env: &env, ..world.ctx() };
+    coordinator::prompt(&ctx, "demo", "before handoff").unwrap();
+    threads::assign(&world.ctx(), "demo", &t.id, "hpc-demo").unwrap();
+    coordinator::prompt(&ctx, "demo", "after handoff").unwrap();
+    assert_eq!(world.runner.count("agent prompt w3:p1"), 1);
+    assert_eq!(world.runner.count("agent prompt w1:p1"), 1);
+    let calls = world.runner.calls.borrow();
+    let last = calls.iter().rev().find(|c| c.display().contains("agent prompt")).unwrap();
+    assert!(prompt_text(last).contains("\"owner\":\"hpc-demo\""));
+}
+
+#[test]
+fn a_coordinator_report_stays_with_its_sender_and_cannot_claim_foreign_work() {
+    let (world, project, _env_a, env_b) = two_coordinator_world();
+    let t = thread::allocate(&project, |t| { t.status = Status::Open; t.owner = "hpc-demo".into(); }).unwrap();
+    let ctx = Ctx { env: &env_b, ..world.ctx() };
+    coordinator::prompt(&ctx, "demo", "update").unwrap();
+    assert_eq!(world.runner.count("agent prompt w2:p1"), 1);
+    assert_eq!(world.runner.count("agent prompt w1:p1"), 0);
+    assert!(threads::prompt(&ctx, "demo", &t.id, "do more").is_err());
+    assert!(threads::assign(&ctx, "demo", &t.id, "hpc-demo-1").is_err());
+    assert_eq!(thread::load(&project, &t.id).unwrap().owner, "hpc-demo");
+    // The actual owner can hand off, then the new owner can reassert it.
+    threads::assign(&Ctx { env: &_env_a, ..world.ctx() }, "demo", &t.id, "hpc-demo-1").unwrap();
+    threads::assign(&ctx, "demo", &t.id, "hpc-demo-1").unwrap();
+}
+
+#[test]
+fn worker_report_cannot_reuse_a_pane_id_from_another_trusted_session() {
+    let (world, project, _t, env) = worker_report_world("idle");
+    let project_socket = project.coordinator().unwrap().socket;
+    let other_socket = world.home.path().join("other.sock");
+    std::fs::write(&other_socket, b"").unwrap();
+    world.script_inside_herdr(&[&project_socket, &other_socket.to_string_lossy()]);
+    // Replace the default identity rules: the process exists only on the
+    // other server, whose pane id happens to equal this project's worker.
+    world.identity_enabled.set(false);
+    world.runner.on("pid=,ppid=,pgid=,comm=", ok(&world.ps_table.borrow()));
+    world.runner.on("session list", ok(&format!(r#"{{"sessions":{}}}"#, world.sessions.borrow())));
+    let other_process = world.procinfo.borrow()[0].1.clone();
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("pane process-info"),
+        move |cmd| {
+            if cmd.env.iter().any(|(k, v)| k == "HERDR_SOCKET_PATH" && v == &project_socket) {
+                Ok(fail(1, "no matching process here"))
+            } else {
+                Ok(ok(&other_process))
+            }
+        },
+    );
+    let ctx = Ctx { env: &env, ..world.ctx() };
+    assert!(coordinator::prompt(&ctx, "demo", "status").is_err());
+    assert_eq!(world.runner.count("agent prompt"), 0);
 }
 
 #[test]

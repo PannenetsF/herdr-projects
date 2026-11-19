@@ -351,6 +351,8 @@ pub fn launch_prompt(slug: &str, id: &str) -> String {
 pub struct BriefInput<'a> {
     pub project_name: &'a str,
     pub slug: &'a str,
+    pub thread_id: &'a str,
+    pub owner: &'a str,
     pub goal: &'a str,
     pub repos: &'a [project::Repo],
     /// The project's `uploads/` folder on the home machine.
@@ -390,6 +392,7 @@ fn brief_header(input: &BriefInput) -> String {
     out.push_str(&format!("- Uploads, files from the user: `{}`{uploads_note}\n", input.uploads_path));
     out.push_str(&format!("- Library, files for the user: `{}`\n", input.library_path));
     out.push_str(&format!("- Report: `{}`\n", input.report_path));
+    out.push_str(&format!("- Thread: `{}`\n- Owner at briefing: {} (delivery uses the current thread record, not this snapshot)\n", input.thread_id, if input.owner.is_empty() { "unassigned" } else { input.owner }));
     out
 }
 
@@ -398,6 +401,9 @@ pub fn compose_brief(input: &BriefInput) -> String {
     brief.push('\n');
     brief.push_str(include_str!("../skill/THREAD.md").trim_end());
     brief.push_str("\n\n");
+    if !input.report_prefix.is_empty() {
+        brief.push_str(&format!("For an urgent status beyond the report file, use `{} coordinator prompt {} --text-file -` with the report on stdin. This command identifies your thread and sends only to its current owner; if refused, keep the report file updated and wait. Never select another coordinator or change ownership.\n\n", input.report_prefix, input.slug));
+    }
     if input.restart {
         brief.push_str(
             "**A previous attempt at this task exists on this branch.** Read its report at the report path below first, look at what is already on the branch, and continue from there.\n\n",
@@ -472,6 +478,8 @@ pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) 
     Ok(compose_brief(&BriefInput {
         project_name: &project_name,
         slug: &project.slug,
+        thread_id: &thread.id,
+        owner: &thread.owner,
         goal: &settings.goal,
         repos: &settings.repos,
         uploads_path: &uploads,
@@ -1377,6 +1385,8 @@ mod tests {
         let input = BriefInput {
             project_name: "Demo",
             slug: "demo",
+            thread_id: "t-0001",
+            owner: "hpc-demo-1",
             goal: "Ship it",
             repos: &repos,
             uploads_path: "/root/demo/uploads",
@@ -1403,6 +1413,10 @@ mod tests {
         assert!(pos("alpha fact") < pos("# Progress"));
         assert!(pos("/bin/hp --root /r report --percent 25") < pos("Do the thing."));
         assert!(pos("Do the thing.") < pos("# Paths"));
+        assert!(brief.contains("- Thread: `t-0001`"));
+        assert!(brief.contains("Owner at briefing: hpc-demo-1"));
+        assert!(brief.contains("/bin/hp --root /r coordinator prompt demo --text-file -"));
+        assert!(brief.contains("delivery uses the current thread record"));
         assert!(brief.contains("gamma fact"));
         assert!(brief.contains("Not inlined because project memory is over 32000 characters: memory/b.md."));
         assert!(!brief.contains(&"x".repeat(100)));
@@ -1415,6 +1429,9 @@ mod tests {
         assert!(!fresh.contains("previous attempt"));
         assert!(fresh.contains("- Goal: (none set)\n- Repos: (none)\n"));
         assert!(fresh.contains("on the home machine; not copied"));
+        assert!(!fresh.contains("coordinator prompt"));
+        let unassigned = compose_brief(&BriefInput { owner: "", ..input });
+        assert!(unassigned.contains("Owner at briefing: unassigned"));
     }
 
     #[test]

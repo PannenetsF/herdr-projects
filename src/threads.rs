@@ -691,8 +691,8 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
 /// predicate: agents queue a message that arrives while they work.
 pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     let (project, record) = validate_prompt_target(ctx, slug, id, text)?;
-    require_owner(ctx, &project, &record, "post a prompt")?;
-    deliver_prompt(ctx, &project, &record, text, None)
+    let owner = authorize_owner(coordinator::caller(ctx, &project), &project, &record, "post a prompt")?;
+    deliver_prompt(ctx, &project, &record, text, owner.as_deref())
 }
 
 pub(crate) fn validate_prompt_target(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<(Project, Thread)> {
@@ -710,11 +710,11 @@ pub(crate) fn validate_prompt_target(ctx: &Ctx, slug: &str, id: &str, text: &str
     Ok((project, record))
 }
 
-/// Serializes scheduled delivery with reassignment without holding the project
+/// Serializes owner-bound delivery with reassignment without holding the project
 /// lock across Herdr. The side effect and the owner change have a definite
 /// order: either reassignment wins and delivery revalidation refuses, or the
 /// authorized prompt finishes before the new owner takes over.
-fn prompt_delivery_lock(project: &Project, id: &str) -> Result<std::fs::File> {
+pub(crate) fn prompt_delivery_lock(project: &Project, id: &str) -> Result<std::fs::File> {
     thread::validate_id(id)?;
     let path = project.state_dir().join(format!("{id}.prompt-delivery.lock"));
     let file = std::fs::File::options().create(true).truncate(false).write(true).open(&path)?;
@@ -725,7 +725,7 @@ fn prompt_delivery_lock(project: &Project, id: &str) -> Result<std::fs::File> {
     Ok(file)
 }
 
-fn lock_scheduled_delivery(project: &Project, stale: &Thread, owner: &str) -> Result<std::fs::File> {
+fn lock_owned_delivery(project: &Project, stale: &Thread, owner: &str) -> Result<std::fs::File> {
     let lock = prompt_delivery_lock(project, &stale.id)?;
     let current = thread::load(project, &stale.id)?;
     if current.status == Status::Resolved {
@@ -735,13 +735,13 @@ fn lock_scheduled_delivery(project: &Project, stale: &Thread, owner: &str) -> Re
         bail!("{} has not received its brief yet", stale.id);
     }
     if current.owner.is_empty() {
-        bail!("scheduled prompt: {} is unassigned; its original owner no longer owns it", stale.id);
+        bail!("prompt: {} is unassigned; its original owner no longer owns it", stale.id);
     }
     if current.owner != owner {
-        bail!("scheduled prompt: {} is owned by coordinator `{}`, not the scheduling coordinator `{owner}`", stale.id, current.owner);
+        bail!("prompt: {} is owned by coordinator `{}`, not the authorizing coordinator `{owner}`", stale.id, current.owner);
     }
     if current.pane_id != stale.pane_id || current.machine != stale.machine {
-        bail!("scheduled prompt: {} changed pane while delivery was being prepared; not sending to a stale pane", stale.id);
+        bail!("prompt: {} changed pane while delivery was being prepared; not sending to a stale pane", stale.id);
     }
     Ok(lock)
 }
@@ -759,7 +759,7 @@ pub fn scheduled_prompt(ctx: &Ctx, slug: &str, id: &str, owner: &str, text: &str
     deliver_prompt(ctx, &project, &record, text, Some(owner))
 }
 
-fn deliver_prompt(ctx: &Ctx, project: &Project, record: &Thread, text: &str, scheduled_owner: Option<&str>) -> Result<String> {
+fn deliver_prompt(ctx: &Ctx, project: &Project, record: &Thread, text: &str, delivery_owner: Option<&str>) -> Result<String> {
     let id = &record.id;
     let slug = &project.slug;
     let view = require_session(ctx, project)?;
@@ -781,8 +781,8 @@ fn deliver_prompt(ctx: &Ctx, project: &Project, record: &Thread, text: &str, sch
     }
     // Reassignment uses this same per-thread lock. Re-read after acquiring it
     // so the earlier Herdr calls cannot leave a stale owner authorizing text.
-    let _delivery = scheduled_owner
-        .map(|owner| lock_scheduled_delivery(project, record, owner))
+    let _delivery = delivery_owner
+        .map(|owner| lock_owned_delivery(project, record, owner))
         .transpose()?;
     // Confirmed only once herdr sees the agent start on it. A try that was
     // typed but not confirmed is never typed again: it may sit in the box.
@@ -851,18 +851,49 @@ fn authorize_owner(caller: coordinator::Caller, project: &Project, record: &Thre
                     record.id
                 )
             } else {
-                bail!("{action}: {} is owned by coordinator `{}`; only that coordinator may drive it (claim it with `hp thread assign {} {} --coordinator <your-name>`)", record.id, record.owner, project.slug, record.id)
+                bail!("{action}: {} is owned by coordinator `{}`; only that coordinator may drive it. Ask its owner to hand it off, or the user to reassign it from a terminal outside Herdr", record.id, record.owner)
             }
         }
     }
 }
 
-/// `thread assign <id> --coordinator <name>`: the one way an owner-less (or
-/// any) thread changes owner. A registered coordinator of this project, a
-/// person's shell, or another registered coordinator may run it; the target
-/// name must be a live registered coordinator of this project. Assigning
-/// also moves the thread's already-written inbox items, since their routing
-/// follows the live record.
+/// Only a person may override another coordinator's ownership. A coordinator
+/// may hand off its own thread or claim an unassigned thread for itself; an
+/// absent owner never turns an owned thread into unassigned work.
+fn authorize_assignment(caller: &coordinator::Caller, project: &Project, record: &Thread, target: &str) -> Result<()> {
+    match caller {
+        coordinator::Caller::Human => Ok(()),
+        coordinator::Caller::Stranger { pane } => {
+            let prefix = coordinator::current_prefix(&project.root)?;
+            Err(coordinator::stranger_refusal(&prefix, &project.slug, pane))
+        }
+        coordinator::Caller::Unverified { pane } => Err(coordinator::unverified_refusal(&project.slug, pane)),
+        coordinator::Caller::Coordinator { name, .. } => {
+            if record.owner == *name || (record.owner.is_empty() && target == name) {
+                Ok(())
+            } else if record.owner.is_empty() {
+                bail!("assign {}: an unassigned thread may only be claimed for yourself (`{name}`); ask the user to assign it to `{target}`", record.id)
+            } else {
+                bail!("assign {}: owned by coordinator `{}`; only its owner may hand it off. An unavailable owner does not permit takeover; ask the user to reassign it from a terminal outside Herdr", record.id, record.owner)
+            }
+        }
+    }
+}
+
+/// Recheck the current record after acquiring the same lock used by scheduled
+/// delivery. A caller authorized before a competing handoff must not overwrite
+/// its new owner, including when merely re-asserting that new owner's name.
+fn lock_assignment(project: &Project, id: &str, caller: &coordinator::Caller, target: &str) -> Result<(std::fs::File, Thread)> {
+    let lock = prompt_delivery_lock(project, id)?;
+    let current = thread::load(project, id)?;
+    authorize_assignment(caller, project, &current, target)?;
+    Ok((lock, current))
+}
+
+/// `thread assign <id> --coordinator <name>`: a human rescue, an owner's
+/// explicit handoff, or an unassigned self-claim. A new owner must be a live
+/// registered coordinator of this project. Already-written inbox items follow
+/// the updated owner too.
 pub fn assign(ctx: &Ctx, slug: &str, id: &str, coordinator_name: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     thread::validate_id(id)?;
@@ -870,35 +901,23 @@ pub fn assign(ctx: &Ctx, slug: &str, id: &str, coordinator_name: &str) -> Result
     if !crate::names::is_coordinator_name(slug, coordinator_name) {
         bail!("`{coordinator_name}` is not a coordinator name of `{slug}` (the `hpc-{slug}` family; `open --new` or `coordinator adopt` allocates one)");
     }
-    match coordinator::caller(ctx, &project) {
-        coordinator::Caller::Stranger { pane } => {
-            let prefix = coordinator::current_prefix(&ctx.root)?;
-            return Err(coordinator::stranger_refusal(&prefix, slug, &pane));
-        }
-        coordinator::Caller::Unverified { pane } => {
-            return Err(coordinator::unverified_refusal(slug, &pane));
-        }
-        coordinator::Caller::Human | coordinator::Caller::Coordinator { .. } => {}
-    }
-    // Idempotent before the liveness requirement: re-asserting the recorded
-    // owner must succeed even when that coordinator is momentarily gone.
-    if record.owner == coordinator_name {
+    let caller = coordinator::caller(ctx, &project);
+    authorize_assignment(&caller, &project, &record, coordinator_name)?;
+    let (_delivery, current) = lock_assignment(&project, id, &caller, coordinator_name)?;
+    // Only an authorized caller gets the idempotent success, even when the
+    // recorded owner is absent. Keep the delivery lock through the live-target
+    // check; no project lock is held across Herdr.
+    if current.owner == coordinator_name {
         println!("{id} is already owned by `{coordinator_name}`");
         return Ok(());
     }
-    // Only a registered, LIVE coordinator can receive new work: nudges route
-    // to a live pane.
     let view = require_session(ctx, &project)?;
     let dir = project.canonical_dir().to_string_lossy().into_owned();
     if !view.agents.iter().any(|a| a.name == coordinator_name && coordinator::is_coordinator(slug, &dir, a)) {
         bail!("no registered coordinator `{coordinator_name}` is live in `{slug}`; open or adopt one first (`herdr agent list` shows names)");
     }
-    let _delivery = prompt_delivery_lock(&project, id)?;
     let current = thread::load(&project, id)?;
-    if current.owner == coordinator_name {
-        println!("{id} is already owned by `{coordinator_name}`");
-        return Ok(());
-    }
+    authorize_assignment(&caller, &project, &current, coordinator_name)?;
     let previous = if current.owner.is_empty() { "unassigned".to_string() } else { format!("`{}`", current.owner) };
     thread::update(&project, id, |t| t.owner = coordinator_name.to_string())?;
     println!("{id} reassigned from {previous} to `{coordinator_name}`; its open inbox items route with it");
@@ -1604,8 +1623,94 @@ mod tests {
         assert_eq!(prompt_state(&t, &[agent("idle")]).unwrap(), "idle");
     }
 
+    fn coordinator_caller(name: &str) -> coordinator::Caller {
+        coordinator::Caller::Coordinator { name: name.into(), pane: "w1:p1".into() }
+    }
+
     #[test]
-    fn scheduled_delivery_revalidates_owner_under_its_lock() {
+    fn assignment_allows_only_the_owner_a_human_or_an_unassigned_self_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let owned = Thread { owner: "hpc-demo".into(), ..worktree_thread() };
+        let unassigned = Thread { owner: String::new(), ..owned.clone() };
+        let owner = coordinator_caller("hpc-demo");
+        let other = coordinator_caller("hpc-demo-1");
+
+        // The owner may explicitly hand off, or re-assert its own ownership.
+        assert!(authorize_assignment(&owner, &project, &owned, "hpc-demo-1").is_ok());
+        assert!(authorize_assignment(&owner, &project, &owned, "hpc-demo").is_ok());
+        // Neither a takeover nor an unrelated caller's idempotent-looking
+        // request may pass the owner gate.
+        for target in ["hpc-demo", "hpc-demo-1", "hpc-demo-2"] {
+            assert!(authorize_assignment(&other, &project, &owned, target).is_err());
+            assert!(authorize_assignment(&coordinator::Caller::Human, &project, &owned, target).is_ok());
+        }
+        assert!(authorize_assignment(&other, &project, &unassigned, "hpc-demo-1").is_ok());
+        assert!(authorize_assignment(&other, &project, &unassigned, "hpc-demo").is_err());
+        assert!(authorize_assignment(&coordinator::Caller::Human, &project, &unassigned, "hpc-demo").is_ok());
+        for caller in [coordinator::Caller::Stranger { pane: "w2:p1".into() }, coordinator::Caller::Unverified { pane: "w2:p1".into() }] {
+            assert!(authorize_assignment(&caller, &project, &owned, "hpc-demo").is_err());
+            assert!(authorize_assignment(&caller, &project, &unassigned, "hpc-demo").is_err());
+        }
+    }
+
+    #[test]
+    fn assignment_never_treats_an_unavailable_owner_as_unassigned() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let t = thread::allocate(&project, |t| t.owner = "hpc-demo".into()).unwrap();
+        // There is no coordinator record or live session at all. Ownership
+        // still denies takeover, before any destination-liveness lookup.
+        assert!(project.coordinator().is_none());
+        let error = lock_assignment(&project, &t.id, &coordinator_caller("hpc-demo-1"), "hpc-demo-1").unwrap_err().to_string();
+        assert!(error.contains("unavailable owner does not permit takeover"), "{error}");
+        assert_eq!(thread::load(&project, &t.id).unwrap().owner, "hpc-demo");
+        // An authorized no-op does not need a live destination, and a human
+        // can authorize recovery to a new one (assign checks that new target).
+        drop(lock_assignment(&project, &t.id, &coordinator_caller("hpc-demo"), "hpc-demo").unwrap());
+        drop(lock_assignment(&project, &t.id, &coordinator::Caller::Human, "hpc-demo-1").unwrap());
+    }
+
+    #[test]
+    fn assignment_rechecks_a_stale_owner_under_the_delivery_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let stale = thread::allocate(&project, |t| t.owner = "hpc-demo".into()).unwrap();
+        let caller = coordinator_caller("hpc-demo");
+        assert!(authorize_assignment(&caller, &project, &stale, "hpc-demo-1").is_ok());
+        thread::update(&project, &stale.id, |t| t.owner = "hpc-demo-2".into()).unwrap();
+        // A concurrent handoff invalidates both the intended write and a
+        // no-op that names the new owner: authorization precedes idempotence.
+        for target in ["hpc-demo-1", "hpc-demo-2"] {
+            assert!(lock_assignment(&project, &stale.id, &caller, target).is_err());
+        }
+        assert_eq!(thread::load(&project, &stale.id).unwrap().owner, "hpc-demo-2");
+    }
+
+    #[test]
+    fn assignment_rechecks_an_unassigned_claim_after_another_claim_wins() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let stale = thread::allocate(&project, |_| {}).unwrap();
+        let caller = coordinator_caller("hpc-demo");
+        assert!(authorize_assignment(&caller, &project, &stale, "hpc-demo").is_ok());
+        thread::update(&project, &stale.id, |t| t.owner = "hpc-demo-1".into()).unwrap();
+        assert!(lock_assignment(&project, &stale.id, &caller, "hpc-demo").is_err());
+        assert_eq!(thread::load(&project, &stale.id).unwrap().owner, "hpc-demo-1");
+    }
+
+    #[test]
+    fn an_owner_refusal_does_not_suggest_taking_someone_elses_thread() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let t = Thread { owner: "hpc-demo".into(), ..worktree_thread() };
+        let error = authorize_owner(coordinator_caller("hpc-demo-1"), &project, &t, "post a prompt").unwrap_err().to_string();
+        assert!(error.contains("Ask its owner to hand it off"), "{error}");
+        assert!(!error.contains("claim it"), "{error}");
+    }
+
+    #[test]
+    fn owned_delivery_revalidates_owner_under_its_lock() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let thread = thread::allocate(&project, |t| {
@@ -1616,10 +1721,10 @@ mod tests {
         .unwrap();
         let stale = thread::load(&project, &thread.id).unwrap();
         thread::update(&project, &thread.id, |t| t.owner = "hpc-demo-1".into()).unwrap();
-        let error = lock_scheduled_delivery(&project, &stale, "hpc-demo").unwrap_err().to_string();
-        assert!(error.contains("not the scheduling coordinator"), "{error}");
+        let error = lock_owned_delivery(&project, &stale, "hpc-demo").unwrap_err().to_string();
+        assert!(error.contains("not the authorizing coordinator"), "{error}");
         let current = thread::load(&project, &thread.id).unwrap();
-        let lock = lock_scheduled_delivery(&project, &current, "hpc-demo-1").unwrap();
+        let lock = lock_owned_delivery(&project, &current, "hpc-demo-1").unwrap();
         drop(lock);
     }
 

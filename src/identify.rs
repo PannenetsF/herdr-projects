@@ -46,6 +46,20 @@ const IDENTITY_BUDGET: Duration = Duration::from_millis(900);
 
 /// Pane identity, fully proven by process facts.
 pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
+    identify_in_session(ctx, project, marked, None)
+}
+
+/// Constrain a proven caller to the session whose pane ids the command uses.
+/// A pane on another trusted server must not impersonate a same-id local pane.
+pub(crate) fn identify_in_session(ctx: &Ctx, project: &Project, marked: bool, socket: Option<&Path>) -> Caller {
+    let expected = socket.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+    let scoped = |caller: Caller, actual: &Path| {
+        if expected.as_ref().is_some_and(|p| *p != actual.canonicalize().unwrap_or_else(|_| actual.to_path_buf())) {
+            Caller::Unverified { pane: String::new() }
+        } else {
+            caller
+        }
+    };
     let fail = |marked: bool| -> Caller {
         if marked {
             Caller::Unverified { pane: String::new() }
@@ -99,7 +113,7 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
             if let Some(caller) =
                 proven_identity(&herdr, project, info.get("process_info"), &facts, remaining(&deadline))
             {
-                return caller;
+                return scoped(caller, &socket);
             }
         }
         // Marker hint for an odd subshell that kept the injected pane id.
@@ -115,7 +129,7 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
                         &facts,
                         remaining(&deadline),
                     ) {
-                        return caller;
+                        return scoped(caller, &socket);
                     }
                 }
             }
@@ -142,7 +156,7 @@ pub(crate) fn identify(ctx: &Ctx, project: &Project, marked: bool) -> Caller {
                 &facts,
                 remaining(&deadline),
             ) {
-                return caller;
+                return scoped(caller, &socket);
             }
         }
     }
