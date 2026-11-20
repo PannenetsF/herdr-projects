@@ -89,7 +89,7 @@ enum Command {
         #[command(subcommand)]
         command: CoordinatorCommand,
     },
-    /// Print the digest the coordinator reads at the start of every turn
+    /// Print the coordinator's digest when a requested Project operation needs it
     Context {
         slug: String,
         /// Print without recording the inbox items as seen

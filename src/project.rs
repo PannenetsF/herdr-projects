@@ -602,9 +602,10 @@ pub fn agents_md(name: &str, slug: &str, prefix: &str) -> String {
     format!(
         "# {name}\n\n\
          This folder is the home of the Herdr project \"{name}\" (`{slug}`). Written by herdr-projects; `doctor --fix` refreshes it.\n\n\
-         Coordinator identity is REGISTERED, not inferred from this folder: a coordinator of {name} carries the Herdr agent name `{coordinator_name}` (or `{next_name}` for later ones). `open` sets that name; `{prefix} coordinator adopt {slug} --pane <id>` registers an already-running pane (`herdr agent list` shows names and pane ids). A session merely started in this folder is not a coordinator.\n\n\
-         If you carry a registered coordinator name of this project (`{coordinator_name}`, `{next_name}`, or a later numbered member), you remain its coordinator even after changing directory under `threads/`: run `{prefix} skill` now and follow what it prints, and run `{prefix} context {slug}` now and whenever you need project state.\n\n\
-         If your working directory is exactly this folder but you have NO registered coordinator name, and the human has not explicitly detached you from this coordinator workflow, run `{prefix} context {slug}` once before anything else. With the user's `auto_adopt` safety setting on, that command registers this pane itself and you are the coordinator from then on. If it instead refuses with \"... NOT a registered coordinator ...\", you are NOT the coordinator: do not act as one and do not mark inbox items handled; give the user the `{prefix} coordinator adopt {slug} --pane <this pane id>` line it prints, then wait.\n\n\
+         Project workflow is opt-in: answer and work in the current session by default, including questions, lookups, access requests, coding, builds and tests. Use the relevant tools/skills under their normal authorization rules; do not run Project context, registration or progress commands as a prerequisite. Being in this folder, carrying a coordinator name, task complexity, or a generic request to fix something does not authorize delegation. Create new threads only when the user explicitly requests threads/delegation for that task, or within an already explicitly authorized workflow's scope. Do not routinely propose threads for ordinary work. Existing authorized threads keep their tasks and owners.\n\n\
+         Coordinator identity is REGISTERED, not inferred from this folder: a coordinator of {name} carries the Herdr agent name `{coordinator_name}` (or `{next_name}` for later ones). `open` sets that name; `{prefix} coordinator adopt {slug} --pane <id>` registers an already-running pane (`herdr agent list` shows names and pane ids). A session merely started in this folder is not a coordinator. Identity controls Project operations, not unrelated work.\n\n\
+         If you carry a registered coordinator name of this project (`{coordinator_name}`, `{next_name}`, or a later numbered member), you remain its coordinator even after changing directory under `threads/`. Only for a requested Project operation or a relevant follow-up on an authorized thread, run `{prefix} skill` and follow what it prints; run `{prefix} context {slug}` when that operation needs project state. For ordinary requests, work directly without loading the coordinator workflow.\n\n\
+         If your working directory is exactly this folder but you have NO registered coordinator name, do not run context or adopt merely because of your cwd. Only if the user requests an operation that requires coordinator authority, and has not explicitly detached you, run `{prefix} context {slug}` to check that authority. With the user's `auto_adopt` safety setting on, that explicit entry may register this pane. A refusal, missing pane ID, or unavailable Project service blocks only the Project operation: do not bypass its identity/ownership checks, but continue unrelated authorized work directly. Never require the user to say \"detach from the coordinator workflow\" to answer a question or use an unrelated skill. If the requested Project operation itself is blocked, report that boundary and any registration command actually returned; do not invent a pane ID or adopt command.\n\n\
          Coordinator documents are scoped: use only `coordinators/<your exact registered name>/TASKS.md`, `MEMORY.md`, `memory/` and `scratch/`. Root TASKS/MEMORY are legacy/shared data and require explicit inspection, never fallback or authorization. Missing or omitted threads are not proof of completion.\n\n\
          If you are a worker (not a registered coordinator), follow the brief in your own folder (`.herdr-project/{slug}-<id>/brief.md`); do not read coordinator context, claim ownership or act on other threads. A human-detached diagnostic session is not a project coordinator and must not re-register itself; follow the human's direct task outside this coordinator workflow.\n"
     )
@@ -630,6 +631,7 @@ pub const REGISTERED_COORDINATOR_MARKER: &str = "Coordinator identity is REGISTE
 /// front. Doctor uses it to refresh projects whose text is otherwise current.
 pub const AUTO_ADOPT_MARKER: &str = "With the user's `auto_adopt` safety setting on";
 pub const SCOPED_COORDINATOR_MARKER: &str = "Coordinator documents are scoped:";
+pub const OPT_IN_WORKFLOW_MARKER: &str = "Project workflow is opt-in:";
 
 pub const PR_FOLLOWUP: &str = "routines/pr-followup.md";
 
@@ -700,6 +702,9 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
             }
             if !text.contains(SCOPED_COORDINATOR_MARKER) {
                 problems.push("AGENTS.md predates scoped coordinator documents".into());
+            }
+            if !text.contains(OPT_IN_WORKFLOW_MARKER) {
+                problems.push("AGENTS.md predates opt-in project workflow".into());
             }
             match prefix_in_agents_md(&text) {
                 None => problems.push("AGENTS.md does not name the binary".into()),
@@ -937,6 +942,42 @@ mod tests {
         assert!(priming_problems(&project, &prefix).iter().any(|p| p.contains("CLAUDE.md")));
         write_priming(&project, &prefix).unwrap();
         assert_eq!(std::fs::read_to_string(project.dir().join("CLAUDE.md.before-herdr-projects")).unwrap(), "mine");
+        assert!(priming_problems(&project, &prefix).is_empty());
+    }
+
+    #[test]
+    fn ordinary_work_is_not_gated_by_project_registration() {
+        let text = agents_md("Demo", "demo", "/bin/hp --root /projects");
+        assert!(text.contains(OPT_IN_WORKFLOW_MARKER));
+        assert!(text.contains("questions, lookups, access requests, coding, builds and tests"));
+        assert!(text.contains("Create new threads only when the user explicitly requests"));
+        assert!(text.contains("blocks only the Project operation"));
+        assert!(text.contains("Never require the user to say"));
+        assert!(text.contains("do not bypass its identity/ownership checks"));
+        assert!(!text.contains("once before anything else"));
+        assert!(!text.contains(" skill` now"));
+        assert!(!text.contains("then wait"));
+
+        let skill = include_str!("../skill/COORDINATOR.md");
+        assert!(skill.contains("Answer and work in the current session by default"));
+        assert!(skill.contains("Neither `start_threads` nor yolo mode supplies that request"));
+        assert!(!skill.contains("You never do the work yourself"));
+        assert!(!skill.contains("it belongs in a thread"));
+        assert!(!skill.contains("## Every turn"));
+        assert!(!skill.contains("new work; unrelated tasks in one message get one thread each"));
+    }
+
+    #[test]
+    fn doctor_detects_forced_workflow_priming_with_a_current_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let prefix = format!("{} --root {}", std::env::current_exe().unwrap().display(), root.path().display());
+        write_priming(&project, &prefix).unwrap();
+        let old = agents_md("Demo", "demo", &prefix).replace(OPT_IN_WORKFLOW_MARKER, "Old mandatory workflow:");
+        std::fs::write(project.dir().join("AGENTS.md"), old).unwrap();
+        let problems = priming_problems(&project, &prefix);
+        assert_eq!(problems, vec!["AGENTS.md predates opt-in project workflow"]);
+        write_priming(&project, &prefix).unwrap();
         assert!(priming_problems(&project, &prefix).is_empty());
     }
 

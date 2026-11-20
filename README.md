@@ -2,7 +2,7 @@
 
 <h3 align="center">Run a whole project across your coding agents without handing each one its task or keeping track of who is doing what</h3>
 
-<p align="center">Herdr Projects lets you run a larger piece of work in <a href="https://herdr.dev">Herdr</a> when one agent isn't enough and managing five by hand is a job in itself. You talk to one coordinator agent. It starts a separate agent for each task on its own branch, gives every one of them the same goal, instructions and memory, and Herdr's own sidebar shows you which threads need you, which are ready for review and which are still working.</p>
+<p align="center">Herdr Projects lets you run a larger piece of work in <a href="https://herdr.dev">Herdr</a> when one agent isn't enough and managing five by hand is a job in itself. You talk to one agent and work in place by default. When you explicitly request delegation, it starts separate threads with scoped briefs, and Herdr's own sidebar shows which threads need you, which are ready for review and which are still working.</p>
 
 <p align="center"><a href="https://github.com/eliasstravik/herdr-projects/blob/main/assets/herdr-projects-launch.mp4"><img src="assets/herdr-projects-launch.webp" width="88%" alt="Animation: you tell a coordinator what you want, it starts three threads that each work on their own branch, and an overview groups them as ready for review, waiting on you, and working" /></a></p>
 
@@ -14,7 +14,7 @@
 
 ## Keep one conversation going while the work happens in parallel
 
-The coordinator never does the work itself, so it's always free to answer you. Each task runs in its own thread: a separate agent in its own git worktree and branch, or in its own folder when there's no repository. You read reports and answer the threads that need you instead of briefing every agent yourself.
+Work stays in the current conversation by default, including questions, lookups, access requests and code changes. Only when you explicitly request delegation does the coordinator create threads: separate agents in their own git worktrees and branches, or their own folders when there's no repository. Existing authorized threads keep running; being in a project folder or carrying a coordinator name does not make unrelated work a Project operation.
 
 ## Choose between briefing each agent by hand, one long agent session, a cloud projects product, or a coordinator in Herdr
 
@@ -40,7 +40,7 @@ Each thread's sidebar row shows its id and title, and a line under it with what 
 
 ### ⚡ Stop briefing every agent yourself
 
-Say what you want once. The coordinator proposes threads and waits for your go-ahead, then each thread starts from a brief with the project's goal, your standing instructions, the project's memory and its task, on the agent you pick (Claude Code, Codex, OpenCode or any other kind Herdr runs). Lessons a thread reports under `## Remember` flow back into memory for the next one.
+Explicitly ask to delegate a task or start threads when you want parallel agents. A generic request to fix or investigate something stays in the current session; the coordinator does not routinely propose delegation. Each authorized thread starts from a brief with the project's goal, standing instructions, its owner's scoped memory and its task, on the agent you pick. Lessons a thread reports under `## Remember` can inform that owner's later work.
 
 ### 💬 Know when a thread needs an answer
 
@@ -52,7 +52,7 @@ Agents report their own progress, so a thread that asked you something shows `ne
 <tr>
 <td align="center" valign="top" width="33%"><h3>1️⃣</h3><b>Install and configure</b><br /><sub>Run <code>herdr plugin install eliasstravik/herdr-projects</code>, then <code>herdr-projects configure</code> once for the sidebar rows, the popup key, the progress hooks and the <code>/autoproject</code> skill.</sub></td>
 <td align="center" valign="top" width="33%"><h3>2️⃣</h3><b>Create and open a project</b><br /><sub>Run <code>herdr plugin action invoke new --plugin herdr-projects</code>, or <code>herdr-projects new "Billing" --repo ~/dev/app</code> then <code>herdr-projects open billing</code>. A coordinator agent starts in the project's folder and primes itself from its <code>AGENTS.md</code>.</sub></td>
-<td align="center" valign="top" width="33%"><h3>3️⃣</h3><b>Tell it what you want</b><br /><sub>Describe the work in the coordinator's pane. It suggests threads, you say go ahead, and the sidebar shows each thread's state as it works.</sub></td>
+<td align="center" valign="top" width="33%"><h3>3️⃣</h3><b>Tell it what you want</b><br /><sub>Describe the work in the coordinator's pane to work in place. Explicitly ask for threads when you want delegation; the sidebar then shows each authorized thread's state.</sub></td>
 </tr>
 </table>
 
@@ -60,7 +60,7 @@ Agents report their own progress, so a thread that asked you something shows `ne
 
 <table align="center">
 <tr>
-<td align="center" valign="top"><sub>For developers who run coding agents in Herdr on macOS or Linux</sub><br /><h2>Free</h2><div align="left">&nbsp;&nbsp;&nbsp;✓&nbsp; A coordinator that delegates and never does the work itself<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on their own worktree and branch, or in a tab<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Shared instructions and memory in every brief<br />&nbsp;&nbsp;&nbsp;✓&nbsp; What needs you, in the sidebar, the tab bar and one popup<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Pull request follow-up, routines, cleanup after a merge<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on your saved SSH machines, reports copied home</div></td>
+<td align="center" valign="top"><sub>For developers who run coding agents in Herdr on macOS or Linux</sub><br /><h2>Free</h2><div align="left">&nbsp;&nbsp;&nbsp;✓&nbsp; Work in place by default; delegate only when requested<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on their own worktree and branch, or in a tab<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Shared instructions and memory in every brief<br />&nbsp;&nbsp;&nbsp;✓&nbsp; What needs you, in the sidebar, the tab bar and one popup<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Pull request follow-up, routines, cleanup after a merge<br />&nbsp;&nbsp;&nbsp;✓&nbsp; Threads on your saved SSH machines, reports copied home</div></td>
 </tr>
 <tr>
 <td align="center"><a href="https://github.com/eliasstravik/herdr-projects/blob/main/docs/getting-started.md"><img src="assets/buttons/open-your-first-project.svg" alt="Open your first project" /></a></td>
@@ -107,7 +107,7 @@ The command checks the Herdr version, the tools it calls, the ticker, and each p
 
 ### What permissions does the coordinator need?
 
-It runs the `herdr-projects` binary every turn, so you'll want to allow-list it in your agent **by subcommand, never the bare binary**. Allow reading and steering (`skill`, `context`, `report`, `inbox done`, `thread list`, `thread prompt`, `thread next`, `thread read`, `thread keys` and the like) and leave `thread resolve`, `sweep`, `delete`, `rename`, `routine approve` and `configure` on your agent's normal permission prompt. Leave `thread start` off the list too unless you've set `start_threads = "auto"`: then every thread start is a real confirmation. [Operations](docs/operations.md#the-allow-list-for-your-coordinator) has the exact patterns.
+Project commands are needed only for requested Project operations and relevant authorized-thread follow-ups, not ordinary questions or unrelated skills. If you allow-list them, do it **by subcommand, never the bare binary**. An identity refusal blocks only the Project operation; unrelated authorized work does not require a detachment confirmation. Allow reading and steering (`skill`, `context`, `report`, `inbox done`, `thread list`, `thread prompt`, `thread next`, `thread read`, `thread keys` and the like) and leave `thread resolve`, `sweep`, `delete`, `rename`, `routine approve` and `configure` on your agent's normal permission prompt. Leave `thread start` off the list too unless you've set `start_threads = "auto"`: then every thread start is a real confirmation. [Operations](docs/operations.md#the-allow-list-for-your-coordinator) has the exact patterns.
 
 ### Does the plugin send my project to a hosted service?
 
@@ -131,11 +131,11 @@ Not on its own. A coordinator is a **registered** agent — one carrying a proje
 
 ### What if the safety settings aren't enough?
 
-They are soft. By default the coordinator proposes threads and waits (until you turn on yolo mode in the popup), thread agents keep their normal permission prompts, which the coordinator answers for plainly in-task actions and brings to you otherwise (it may choose their model, never their launch flags), and routines may not run shell commands until you enable them and approve each command in a terminal. But agents have a shell: one that runs with skip-permission arguments can edit those files, a thread can prompt the coordinator pretending to be you, an approved routine command covers its text and not the scripts it calls, and whatever reaches memory is repeated in every later brief. [Operations](docs/operations.md#what-the-safety-settings-do-and-dont-stop) says plainly what each guard stops and what it doesn't.
+They are soft. Ordinary work stays in place; new threads require explicit delegation. Within that authorized scope, `start_threads` and yolo control confirmation behavior. Thread agents keep their normal permission prompts, which the coordinator answers for plainly in-task actions and brings to you otherwise (it may choose their model, never their launch flags), and routines may not run shell commands until you enable them and approve each command in a terminal. But agents have a shell: one that runs with skip-permission arguments can edit those files, a thread can prompt the coordinator pretending to be you, an approved routine command covers its text and not the scripts it calls, and whatever reaches memory is repeated in every later brief. [Operations](docs/operations.md#what-the-safety-settings-do-and-dont-stop) says plainly what each guard stops and what it doesn't.
 
 ### What does it cost?
 
-Herdr Projects is free and [MIT licensed](LICENSE). Your agent CLI's usual usage charges still apply: every thread is a full agent session, and the coordinator spends tokens each turn reading its digest.
+Herdr Projects is free and [MIT licensed](LICENSE). Your agent CLI's usual usage charges still apply: every authorized thread is a full agent session, and the coordinator reads its digest only when a requested Project operation or relevant thread follow-up needs it.
 
 ## Open your first project in three steps
 

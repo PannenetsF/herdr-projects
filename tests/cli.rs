@@ -91,7 +91,9 @@ fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
     let text = String::from_utf8(out.stdout).unwrap();
     let prefix = text.lines().next().unwrap().strip_prefix("Commands: ").unwrap();
     // Fixed shape `<binary> --root <root>`, with the spaced root shell-quoted.
-    assert_eq!(prefix, format!("{BIN} --root '{root_arg}'"));
+    // current_exe resolves symlinks on Linux; Cargo may retain a build-path alias.
+    let binary = Path::new(BIN).canonicalize().unwrap();
+    assert_eq!(prefix, format!("{} --root '{root_arg}'", shell_escape(binary.to_str().unwrap())));
 
     // The printed prefix works as typed, from a bare shell.
     let listed = Command::new("/bin/sh")
@@ -271,7 +273,68 @@ fn stub_herdr(home: &Path) -> String {
 }
 
 #[test]
-fn hook_events_reset_a_terminal_done_record_while_guarded_events_keep_it() {
+fn ordinary_questions_and_access_requests_do_not_enter_project_workflow() {
+    let home = tempfile::tempdir().unwrap();
+    let help = hp(home.path(), &["context", "--help"]);
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("when a requested Project operation needs it"));
+    assert!(!help.contains("every turn"));
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    let stub = stub_herdr(home.path());
+    let socket = home.path().join("s.sock").to_string_lossy().into_owned();
+    let envs = [
+        ("HERDR_ENV", "1"),
+        ("HERDR_PANE_ID", "w1:p1"),
+        ("HERDR_SOCKET_PATH", socket.as_str()),
+        ("HERDR_BIN_PATH", stub.as_str()),
+    ];
+    let run = |args: &[&str], stdin: Option<&str>| hp_with(home.path(), &envs, args, stdin);
+    let start = r#"{"hook_event_name":"SessionStart","source":"clear","session_id":"s1"}"#;
+    let out = run(&["--root", root_arg, "hook", "--agent", "claude"], Some(start));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let guidance = payload["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(guidance.contains("Project workflow is opt-in"));
+    assert!(guidance.contains("never require a detachment phrase"));
+    assert!(!guidance.contains(" report --"));
+
+    for prompt in ["宿主机 driver 比 cuda/compat 新怎么办", "bytedcli orthus 2001:db8::20 申请权限"] {
+        let event = serde_json::json!({"hook_event_name":"UserPromptSubmit", "session_id":"s1", "prompt":prompt}).to_string();
+        let out = run(&["--root", root_arg, "hook", "--agent", "claude"], Some(&event));
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty(), "{prompt}: {}", String::from_utf8_lossy(&out.stdout));
+        let event = r#"{"hook_event_name":"PostToolUse","session_id":"s1","tool_input":{"command":"bytedcli --help"}}"#;
+        let out = run(&["--root", root_arg, "hook", "--agent", "claude"], Some(event));
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty());
+    }
+    let out = run(&["--root", root_arg, "progress", "--pane", "w1:p1"], None);
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["reminders_enabled"], false);
+    assert_eq!(record["reported_at"], 0);
+    // The hook creates only its progress record, never a project or thread.
+    let entries: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(entries, vec![std::ffi::OsString::from(".progress")]);
+
+    // Existing workers can still explicitly report; a new ordinary prompt
+    // disables reminders without erasing that live task's status.
+    let out = run(&["--root", root_arg, "report", "--percent", "40", "--activity", "Testing"], None);
+    assert!(out.status.success());
+    let out = run(&["--root", root_arg, "progress", "--pane", "w1:p1"], None);
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["reminders_enabled"], true);
+    let prompt = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"解释一下 CUDA"}"#;
+    assert!(run(&["--root", root_arg, "hook", "--agent", "claude"], Some(prompt)).stdout.is_empty());
+    let out = run(&["--root", root_arg, "progress", "--pane", "w1:p1"], None);
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["reminders_enabled"], false);
+    assert_eq!(record["percent"], 40);
+}
+
+#[test]
+fn only_a_new_prompt_retires_done_and_tools_never_enable_reporting() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
     let root_arg = root.to_str().unwrap();
@@ -302,11 +365,15 @@ fn hook_events_reset_a_terminal_done_record_while_guarded_events_keep_it() {
     assert!(!after.contains("100"), "{after}");
     assert!(after.contains("\"percent\": null"));
 
-    // Re-arm Done; real top-level tool work clears it again via PostToolUse.
+    assert!(out.stdout.is_empty(), "a new prompt must not require a progress report");
+    assert!(after.contains("\"reminders_enabled\": false"));
+
+    // Real top-level tools alone do not reopen a completed tracked task.
     assert!(run(&["--root", root_arg, "report", "--percent", "100", "--activity", "Done"], None).status.success());
     let tool = r#"{"hook_event_name":"PostToolUse","session_id":"s1","tool_input":{"command":"ls"}}"#;
     assert!(run(&["--root", root_arg, "hook", "--agent", "claude"], Some(tool)).status.success());
-    assert!(percent().contains("\"percent\": null"));
+    assert!(percent().contains("\"percent\": 100"));
+    assert!(percent().contains("\"reminders_enabled\": false"));
 
     // Guard 1: a subagent's tool event never touches the top-level record.
     assert!(run(&["--root", root_arg, "report", "--percent", "100", "--activity", "Done"], None).status.success());

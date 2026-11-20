@@ -66,7 +66,7 @@ herdr-projects open billing
 
 Type in the coordinator's pane, for example: "Add a billing page: API endpoint, the page itself, and end-to-end tests."
 
-On a new project it restates the goal, lists the repos, and asks for the first piece of work. It proposes threads and waits until you name the ones to start (or say "all"). Tell it how you like threads run ("workers use codex", "at most two at a time") and it remembers.
+That request stays in the current session. To delegate instead, explicitly say "start threads for the API, page and tests" or ask for a delegation proposal. A fresh project, a coordinator name, and task complexity do not automatically trigger threads. Ordinary questions and unrelated skills do not require `context`, registration or progress reporting. Tell the coordinator how you like authorized threads run ("workers use codex", "at most two at a time") and it remembers.
 
 Everything about the project can be changed in chat: goal, instructions, repos, settings, tasks, routines, memory. You never need to edit a file.
 

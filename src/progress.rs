@@ -36,6 +36,8 @@ pub struct Record {
     pub reported_at: i64,
     /// Unix seconds of the last reminder the hook injected.
     pub reminded_at: i64,
+    /// Armed only by an explicit report in the current turn, never by a hook.
+    pub reminders_enabled: bool,
     pub session_started_at: i64,
     /// The harness's own session id from the last SessionStart: Copilot CLI
     /// runs a subagent's hooks under another id with no other marker.
@@ -170,6 +172,7 @@ pub fn report(ctx: &Ctx, percent: Option<u8>, activity: &str) -> Result<()> {
     record.activity = activity.clone();
     record.percent = percent;
     record.reported_at = now();
+    record.reminders_enabled = percent != Some(100);
     save(&ctx.root, &record)?;
     println!("recorded: {}{activity}", percent.map(|p| format!("{p}% · ")).unwrap_or_default());
     Ok(())
@@ -195,16 +198,21 @@ pub fn print(ctx: &Ctx, pane: Option<&str>) -> Result<()> {
 
 /// The instructions the SessionStart hook injects, with the exact command.
 pub fn instructions(prefix: &str, pane_id: &str) -> String {
-    format!("# Progress (herdr-projects)\n\n{}", guidance(prefix, Some(pane_id)))
+    format!(
+        "# Project workflow is opt-in\n\n\
+         In this pane ({pane_id}), answer and work directly by default. Ordinary questions, lookups, access requests and coding do not require Project context, registration, delegation or progress reporting. Create threads only on the user's explicit delegation request for this task or within an already explicitly authorized workflow. Cwd and coordinator identity do not supply that request.\n\n\
+         Existing authorized threads keep their tasks and owners; assigned workers follow their own brief. A Project refusal blocks only that Project operation, not unrelated authorized work; never require a detachment phrase to continue ordinary work. Use normal tool/skill authorization rules.\n\n\
+         Project command prefix, only when actually needed: `{prefix}`."
+    )
 }
 
-/// The body of the progress instructions. Hooks inject it at session start;
-/// every other agent reads it in its thread brief or the coordinator skill,
-/// so any harness that can run a shell command reports.
+/// Scoped progress instructions for thread briefs and the coordinator skill.
+/// SessionStart injects only the opt-in routing instructions above.
 pub fn guidance(prefix: &str, pane_id: Option<&str>) -> String {
     let pane = pane_id.map(|id| format!("this pane ({id})")).unwrap_or_else(|| "this pane".into());
     format!(
-        "Report the progress of the user's whole current task through `{prefix} report`. This is your estimate, not a timer or a count of tools. Reporting failures must never stop the actual work: give one short diagnostic and continue, without retries.\n\n\
+        "Progress reporting applies only while executing an assigned thread, coordinating a relevant authorized thread workflow, or when the user explicitly requests progress tracking. For ordinary in-place work, skip reporting; this guidance is not a prerequisite to answering or using tools. Never register a coordinator or load context just to report.\n\n\
+         Within that reporting scope, report the progress of the user's current task through `{prefix} report`. This is your estimate, not a timer or a count of tools. Reporting failures must never stop the actual work: give one short diagnostic and continue, without retries.\n\n\
          Report a rough percentage in five-point increments and a two-to-four-word activity, such as `Reading code`, `Testing changes` or `Waiting for you`:\n\n\
          `{prefix} report --percent 25 --activity 'Reading code'`\n\
          `{prefix} report --unknown --activity 'Assessing task'`\n\n\
@@ -215,7 +223,7 @@ pub fn guidance(prefix: &str, pane_id: Option<&str>) -> String {
 }
 
 pub fn reminder(prefix: &str) -> String {
-    format!("Progress check-in is due if this is a natural boundary: `{prefix} report --percent N --activity '...'`. Reassess the current task; do not invent progress. Report `Waiting for you` before a question to the user.")
+    format!("If still executing the same assigned thread, authorized thread workflow or user-requested progress tracking, a check-in is due at a natural boundary: `{prefix} report --percent N --activity '...'`. Otherwise skip it and continue ordinary work directly. Do not invent progress or load Project context to satisfy this reminder.")
 }
 
 /// Events the reporter reacts to: the top-level agent's own SessionStart,
@@ -249,6 +257,9 @@ pub fn respond(record: &mut Record, kind: &str, prefix: &str, now: i64) -> Optio
             Some(instructions(prefix, &record.pane_id))
         }
         "UserPromptSubmit" => {
+            // A new prompt may be an unrelated question. Keep a live status,
+            // but require a fresh explicit report before reminding again.
+            record.reminders_enabled = false;
             record.reminded_at = now;
             // The user answered: an old "Waiting for you" no longer holds.
             if record.activity == WAITING {
@@ -265,20 +276,15 @@ pub fn respond(record: &mut Record, kind: &str, prefix: &str, now: i64) -> Optio
                 record.percent = None;
                 record.reported_at = 0;
             }
-            Some(format!("Before task tools or a blocking question, check whether this request starts new work; if so report a fresh estimate. Then report before waiting for the user, for example `{prefix} report --unknown --activity 'Waiting for you'`."))
+            None
         }
         "PostToolUse" => {
-            // Actual new tool work after a terminal Done report proves the
-            // task is no longer finished: clear the completed record so
-            // reminders resume. Passive message receipt is not a tool event,
-            // so it can never trigger this.
-            if record.percent == Some(100) {
-                record.activity.clear();
-                record.percent = None;
-                record.reported_at = 0;
-            }
-            let done = record.percent == Some(100);
-            let due = now - record.reminded_at >= REMIND_SECS && !done && (record.reported_at == 0 || now - record.reported_at >= REMIND_SECS);
+            // Tools alone do not opt into Project reporting or reopen a task.
+            let due = record.reminders_enabled
+                && record.reported_at > 0
+                && !record.done()
+                && now - record.reminded_at >= REMIND_SECS
+                && now - record.reported_at >= REMIND_SECS;
             if due {
                 record.reminded_at = now;
                 Some(reminder(prefix))
@@ -428,8 +434,11 @@ mod tests {
     fn session_start_injects_instructions_and_resets_the_record() {
         let mut record = Record { pane_id: "w1:p1".into(), activity: "Old".into(), percent: Some(50), reported_at: 5, ..Record::default() };
         let text = respond(&mut record, "SessionStart", "/p/hp --root /r", 1000).unwrap();
-        assert!(text.contains("/p/hp --root /r report --percent 25"));
+        assert!(text.contains("Project workflow is opt-in"));
+        assert!(text.contains("`/p/hp --root /r`"));
+        assert!(!text.contains(" report --"));
         assert!(text.contains("(w1:p1)"));
+        assert!(!record.reminders_enabled);
         assert_eq!(record.activity, "");
         assert_eq!(record.percent, None);
         assert_eq!(record.reported_at, 0);
@@ -437,8 +446,12 @@ mod tests {
     }
 
     #[test]
-    fn reminders_are_throttled_to_once_a_minute_and_done_re_arms_on_new_tool_work() {
+    fn reminders_require_an_explicit_report_and_never_rearm_from_tools() {
         let mut record = Record { reminded_at: 1000, ..Record::default() };
+        assert!(respond(&mut record, "PostToolUse", "hp", 1061).is_none());
+        assert!(respond(&mut record, "PostToolUse", "hp", 9000).is_none());
+        record.reminders_enabled = true;
+        record.reported_at = 1000;
         assert!(respond(&mut record, "PostToolUse", "hp", 1030).is_none());
         assert!(respond(&mut record, "PostToolUse", "hp", 1061).is_some());
         assert_eq!(record.reminded_at, 1061);
@@ -446,15 +459,13 @@ mod tests {
         record.reported_at = 1100;
         assert!(respond(&mut record, "PostToolUse", "hp", 1130).is_none());
         assert!(respond(&mut record, "PostToolUse", "hp", 1200).is_some());
-        // A terminal Done record: the next PostToolUse proves real new work,
-        // clears the completed record and lets reminders fire again instead
-        // of staying suppressed for the whole follow-up request.
-        let mut done = Record { reminded_at: 1000, activity: DONE.into(), percent: Some(100), reported_at: 8000, ..Record::default() };
-        assert!(respond(&mut done, "PostToolUse", "hp", 9000).is_some());
-        assert_eq!(done.percent, None);
-        assert_eq!(done.reported_at, 0);
-        assert_eq!(done.activity, "");
-        assert!(!done.done());
+        // Tools after completion do not authorize a new tracked task.
+        let mut done = Record { reminded_at: 1000, activity: DONE.into(), percent: Some(100), reported_at: 8000, reminders_enabled: true, ..Record::default() };
+        assert!(respond(&mut done, "PostToolUse", "hp", 9000).is_none());
+        assert_eq!(done.percent, Some(100));
+        assert_eq!(done.reported_at, 8000);
+        assert_eq!(done.activity, DONE);
+        assert!(done.done());
         assert!(respond(&mut done, "Stop", "hp", 9002).is_none());
     }
 
@@ -471,17 +482,43 @@ mod tests {
 
         // A non-terminal report survives: passively receiving a message is
         // not new work, and the next real report overwrites it anyway.
-        let mut active = Record { reminded_at: 400, activity: "Reading code".into(), percent: Some(50), reported_at: 500, ..Record::default() };
-        respond(&mut active, "UserPromptSubmit", "hp", 600);
+        let mut active = Record { reminded_at: 400, activity: "Reading code".into(), percent: Some(50), reported_at: 500, reminders_enabled: true, ..Record::default() };
+        assert!(respond(&mut active, "UserPromptSubmit", "hp", 600).is_none());
         assert_eq!(active.percent, Some(50));
         assert_eq!(active.reported_at, 500);
         assert_eq!(active.activity, "Reading code");
+        assert!(!active.reminders_enabled);
+        assert!(respond(&mut active, "PostToolUse", "hp", 9000).is_none());
 
         // The Waiting reset is unchanged in shape (percent is not its concern).
         let mut asked = Record { activity: WAITING.into(), percent: Some(40), reported_at: 5, reminded_at: 1, ..Record::default() };
         respond(&mut asked, "UserPromptSubmit", "hp", 10);
         assert!(!asked.waiting(), "an answer clears the old question");
         assert_eq!(asked.reported_at, 0);
+    }
+
+    #[test]
+    fn ordinary_requests_and_clear_never_enable_reporting() {
+        for prompt in ["宿主机 driver 比 cuda/compat 新怎么办", "bytedcli orthus 2001:db8::20 申请权限", "帮我修一下代码"] {
+            let mut record = Record::default();
+            let text = respond(&mut record, "SessionStart", "hp", 1).unwrap();
+            assert!(!text.contains(" report --"));
+            let event = normalize(crate::setup::harness("claude").unwrap(), json!({"hook_event_name":"UserPromptSubmit", "prompt": prompt}));
+            assert!(respond(&mut record, event["hook_event_name"].as_str().unwrap(), "hp", 2).is_none());
+            for time in [70, 140, 3600] {
+                assert!(respond(&mut record, "PostToolUse", "hp", time).is_none(), "{prompt}");
+            }
+            assert!(!record.reminders_enabled);
+            assert_eq!(record.reported_at, 0);
+        }
+    }
+
+    #[test]
+    fn legacy_progress_records_do_not_implicitly_opt_in() {
+        let mut record: Record = serde_json::from_value(json!({"reported_at": 10, "percent": 50, "activity": "Old task"})).unwrap();
+        assert!(!record.reminders_enabled);
+        assert!(respond(&mut record, "PostToolUse", "hp", 1000).is_none());
+        assert_eq!(record.percent, Some(50));
     }
 
     #[test]
@@ -528,7 +565,8 @@ mod tests {
     fn guidance_names_the_command_and_the_pane_when_known() {
         assert!(guidance("/p/hp --root /r", None).contains("top-level agent in this pane reports"));
         assert!(guidance("/p/hp --root /r", Some("w2:p3")).contains("this pane (w2:p3)"));
-        assert!(instructions("hp", "w1:p1").starts_with("# Progress (herdr-projects)\n\nReport the progress"));
+        assert!(instructions("hp", "w1:p1").starts_with("# Project workflow is opt-in"));
+        assert!(guidance("hp", None).contains("For ordinary in-place work, skip reporting"));
     }
 
     #[test]
